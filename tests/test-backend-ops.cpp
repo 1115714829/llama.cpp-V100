@@ -3236,6 +3236,54 @@ struct test_cpy : public test_case {
     }
 };
 
+// GGML_OP_CPY
+// A run of same-layout CPYs with only view nodes in between (view, view, cpy, repeated), which
+// the CUDA backend collapses into a single kernel launch. Mirrors the recurrent state snapshot
+// writes done for each position of a rolled-back sequence.
+struct test_cpy_batch : public test_case {
+    const int64_t C;
+    const int64_t K;
+    const int64_t n_tok;
+
+    std::string vars() override {
+        return VARS_TO_STR3(C, K, n_tok);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CPY_BATCH";
+    }
+
+    test_cpy_batch(int64_t C = 64, int64_t K = 2, int64_t n_tok = 8)
+        : C(C), K(K), n_tok(n_tok) {}
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_tok + 3, C, 1);
+        ggml_set_name(a, "a");
+        ggml_tensor * s = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3 * C, 1, K);
+        ggml_set_name(s, "s");
+
+        ggml_tensor * out = nullptr;
+        for (int64_t t = K; t >= 1; --t) {
+            ggml_tensor * src = ggml_view_3d(ctx, a, 3, C, 1, a->nb[1], a->nb[2], t * sizeof(float));
+            ggml_set_name(src, "src_view");
+            ggml_tensor * dst = ggml_view_2d(ctx, s, 3 * C, 1, s->nb[1], (K - t) * s->nb[2]);
+            ggml_set_name(dst, "dst_view");
+            ggml_tensor * cpy = ggml_cpy(ctx, src, dst);
+            ggml_set_name(cpy, "cpy");
+            if (mode == MODE_TEST) {
+                ggml_build_forward_expand(gf, cpy);
+            }
+            // fold right to left, so the graph puts all cpys before the concats
+            out = out == nullptr ? cpy : ggml_concat(ctx, cpy, out, 1);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_CONT
 // permute = {0, 0, 0, 0} means no permutation: the source is transposed (or
 // view-sliced). A non-identity permute applies ggml_permute before ggml_cont.
@@ -9798,6 +9846,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {128, 2, 3, 1}, {128, 2, 3, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {128, 4, 3, 1})); // strided dst
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {128, 2, 3, 1}, {128, 2, 3, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {128, 4, 3, 1})); // strided dst
 
+    // CPY_BATCH - consecutive same-layout CPYs, one kernel launch instead of one per copy
+    for (int64_t C : {64, 2560}) {
+        for (int64_t K : {2, 8}) {
+            test_cases.emplace_back(new test_cpy_batch(C, K, 8));
+        }
+    }
+
     // CPY - different src/dst shapes (reshaping via CPY)
     // Use permutations of {3, 5, 7, 32}. Total elements: 3*5*7*32 = 3360.
     // Each src permutation is tested against canonical sorted and reverse dst (skip self).
@@ -11495,6 +11550,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {768*1024, 256, 1, 1}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {0, 0, 0, 0}, true));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {768, 1024, 256, 1}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {0, 0, 0, 0}, true));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_BF16, GGML_TYPE_BF16, {768, 1024, 256, 1}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {0, 0, 0, 0}, true));
+
+    // CPY_BATCH - consecutive same-layout CPYs, one kernel launch instead of one per copy
+    test_cases.emplace_back(new test_cpy_batch(2560, 8, 8));
 
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {4096, 4096, 5, 1}, false, false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {12888, 256, 5, 1}, false, false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
