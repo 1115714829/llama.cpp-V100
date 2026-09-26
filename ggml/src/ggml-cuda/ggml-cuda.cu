@@ -3,6 +3,7 @@
 #include "ggml-backend-impl.h"
 
 #include "ggml-cuda/allreduce.cuh"
+#include "ggml-cuda/allreduce-push.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
@@ -961,19 +962,21 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
 // eagerly during comm_init so any init failure surfaces at startup rather
 // than mid-run.
 struct ggml_backend_cuda_comm_context {
-    using try_allreduce_fn = bool(*)(ggml_backend_cuda_comm_context *, struct ggml_tensor **);
+    using try_allreduce_fn = bool(*)(ggml_backend_cuda_comm_context *, struct ggml_tensor **, bool exact);
 
     std::vector<ggml_backend_t> backends;
     std::vector<int>            dev_ids;
 
     // Set by the init chain (comm_init_{nccl, internal, none}) to one of
     // try_allreduce_{nccl, internal, butterfly}.  nccl needs `comms`,
-    // internal needs `ar_pipeline`, butterfly needs nothing.  Per-call
+    // internal needs `ar_pipeline`, butterfly needs nothing.  `exact` asks
+    // for a lossless reduction (e.g. for tensors that hold ids).  Per-call
     // failures return false; the meta backend's generic implementation then
     // handles that call.
     try_allreduce_fn            try_allreduce = nullptr;
 
     ggml_cuda_ar_pipeline *     ar_pipeline = nullptr;
+    ggml_cuda_ar_push *         ar_push     = nullptr;
 
 #ifdef GGML_USE_NCCL
     std::vector<ncclComm_t>     comms;
@@ -986,14 +989,16 @@ struct ggml_backend_cuda_comm_context {
         }
 #endif // GGML_USE_NCCL
         ggml_cuda_ar_pipeline_free(ar_pipeline);
+        ggml_cuda_ar_push_free(ar_push);
     }
 };
 
 #ifdef GGML_USE_NCCL
 // AllReduce via NCCL. Reduces as FP32 for small tensors and BF16 for large
-// tensors (bandwidth-bound), then converts back to FP32.
+// tensors (bandwidth-bound), then converts back to FP32. `exact` forces the
+// FP32 path regardless of size.
 static bool ggml_backend_cuda_comm_allreduce_nccl(
-        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors, bool exact) {
     const int64_t ne = ggml_nelements(tensors[0]);
     // FIXME the input of llm_graph_context::build_in_out_ids can produce a tensor with 0 elements if n_outputs == 0
     // This then causes a crash in this function
@@ -1011,7 +1016,9 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
 
     // For small tensors, simply reduce them as FP32.
     // The following heuristic for how "small" a tensor should be is based on RTX 4090s connected via 16x PCIe 4.0.
-    if ((n_backends <= 2 && ne < 32768) || (n_backends == 3 && ne < 131072) || (n_backends >= 4 && ne < 262144)) {
+    // exact skips both the heuristic and the BF16 compression, whose format
+    // cannot represent every value (e.g. large token ids).
+    if (exact || (n_backends <= 2 && ne < 32768) || (n_backends == 3 && ne < 131072) || (n_backends >= 4 && ne < 262144)) {
         for (size_t i = 0; i < n_backends; ++i) {
             if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                 ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
@@ -1068,8 +1075,9 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
 
 // Run the internal AR pipeline.  Returns false on unsupported / failed input
 // -- the caller decides whether to abort (env-forced) or fall back silently.
+// `exact` is ignored: for F32 this path is exact anyway.
 static bool ggml_backend_cuda_comm_allreduce_internal(
-        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors, bool /*exact*/) {
     GGML_ASSERT(comm_ctx->ar_pipeline != nullptr);
 
     const size_t n_backends = comm_ctx->backends.size();
@@ -1123,18 +1131,18 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
 
 #ifdef GGML_USE_NCCL
 static bool ggml_backend_cuda_comm_try_allreduce_nccl(
-        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
-    return ggml_backend_cuda_comm_allreduce_nccl(comm_ctx, tensors);
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors, bool exact) {
+    return ggml_backend_cuda_comm_allreduce_nccl(comm_ctx, tensors, exact);
 }
 #endif // GGML_USE_NCCL
 
 static bool ggml_backend_cuda_comm_try_allreduce_internal(
-        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
-    return ggml_backend_cuda_comm_allreduce_internal(comm_ctx, tensors);
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors, bool exact) {
+    return ggml_backend_cuda_comm_allreduce_internal(comm_ctx, tensors, exact);
 }
 
 static bool ggml_backend_cuda_comm_try_allreduce_butterfly(
-        ggml_backend_cuda_comm_context *, struct ggml_tensor **) {
+        ggml_backend_cuda_comm_context *, struct ggml_tensor **, bool) {
     return false;
 }
 
@@ -1239,17 +1247,39 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
         }
     }
 
+    // Opportunistic low-latency path in front of the backend selected above.
+    // It handles only small aligned F32 tensors and leaves everything else to
+    // that backend.
+    if (env == nullptr || std::string(env) != "none") {
+        ret->ar_push = ggml_cuda_ar_push_init(ret->dev_ids.data(), ret->dev_ids.size());
+    }
+
     return ret;
 }
 
 // Top-level dispatch -- calls the function pointer chosen by comm_init.
 // Returns false to let the meta-backend's butterfly run.
-static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct ggml_tensor ** tensors) {
+static bool ggml_backend_cuda_comm_allreduce_tensor_impl(
+        void * comm_ctx_v, struct ggml_tensor ** tensors, bool exact) {
     if (comm_ctx_v == nullptr) {
         return false;
     }
     auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
-    return comm_ctx->try_allreduce(comm_ctx, tensors);
+    if (comm_ctx->ar_push != nullptr &&
+        ggml_cuda_ar_push_allreduce(comm_ctx->ar_push, comm_ctx->backends.data(), tensors, exact)) {
+        return true;
+    }
+    return comm_ctx->try_allreduce(comm_ctx, tensors, exact);
+}
+
+static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct ggml_tensor ** tensors) {
+    return ggml_backend_cuda_comm_allreduce_tensor_impl(comm_ctx_v, tensors, false);
+}
+
+// Exact variant, for collectives whose payload must survive the reduction
+// bitwise (the meta backend's TOP_K/GET_ROWS candidate buffers).
+static bool ggml_backend_cuda_comm_allreduce_tensor_exact(void * comm_ctx_v, struct ggml_tensor ** tensors) {
+    return ggml_backend_cuda_comm_allreduce_tensor_impl(comm_ctx_v, tensors, true);
 }
 
 // host buffer type
@@ -5771,6 +5801,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
+    }
+    if (strcmp(name, "ggml_backend_comm_allreduce_tensor_exact") == 0) {
+        return (void *)ggml_backend_cuda_comm_allreduce_tensor_exact;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;
