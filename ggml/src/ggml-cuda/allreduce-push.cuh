@@ -30,3 +30,19 @@ bool ggml_cuda_ar_push_allreduce(
     ggml_backend_t    * backends,
     ggml_tensor       ** tensors,
     bool                exact);
+
+// Admission check for a single rank's tensor, shared with ggml_cuda_ar_push_allreduce.
+bool ggml_cuda_ar_push_can(
+    const ggml_cuda_ar_push * ar,
+    const ggml_tensor       * t,
+    bool                      exact);
+
+// Per-rank variant for callers that enqueue each rank from its own thread.
+// Enqueues rank's part of the reduction on backends[rank]; returns false for
+// inputs that ggml_cuda_ar_push_can rejects.
+bool ggml_cuda_ar_push_allreduce_rank(
+    ggml_cuda_ar_push * ar,
+    ggml_backend_t      backend,
+    size_t              rank,
+    ggml_tensor       * t,
+    bool                exact);

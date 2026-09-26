@@ -354,6 +354,97 @@ void ggml_cuda_ar_push_free(ggml_cuda_ar_push * ar) {
     delete ar;
 }
 
+// Admission checks for one rank's tensor, shared by the all-rank and the per-rank
+// entry points. On success n_packs is the pack count for the launch.
+static bool ggml_cuda_ar_push_can_impl(const ggml_tensor * t, bool exact, int & n_packs) {
+    if (t == nullptr ||
+        t->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguously_allocated(t) ||
+        ((uintptr_t) t->data & 0xF) != 0) {
+        return false;
+    }
+
+    const int64_t ne = ggml_nelements(t);
+    const size_t nbytes = (size_t) ne * sizeof(float);
+    if (nbytes > GGML_CUDA_AR_PUSH_MAX_BYTES) {
+        return false;
+    }
+
+    if (exact) {
+        if (nbytes % 16 != 0) {
+            return false;
+        }
+        n_packs = (int) (nbytes / 16);
+    } else {
+        if (ne % 8 != 0) {
+            return false;
+        }
+        n_packs = (int) (ne / 8);
+    }
+    return true;
+}
+
+bool ggml_cuda_ar_push_can(const ggml_cuda_ar_push * ar, const ggml_tensor * t, bool exact) {
+    if (ar == nullptr) {
+        return false;
+    }
+    int n_packs;
+    return ggml_cuda_ar_push_can_impl(t, exact, n_packs);
+}
+
+// Enqueue one rank's part of the reduction. No synchronization: the kernel
+// spins on the peer ranks, so waiting for one rank here would deadlock the
+// whole collective.
+static void ggml_cuda_ar_push_launch_rank(
+        ggml_cuda_ar_push * ar, ggml_backend_t backend, size_t rank, ggml_tensor * t, bool exact, int n_packs) {
+    GGML_ASSERT(rank < ar->n);
+    ggml_backend_cuda_context * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    GGML_ASSERT(cuda_ctx->device == ar->devices[rank]);
+    ggml_cuda_set_device(cuda_ctx->device);
+
+    if ((t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        CUDA_CHECK(cudaMemsetAsync(t->data, 0, ggml_nbytes(t), cuda_ctx->stream()));
+    }
+
+    ggml_cuda_ar_push_ptrs bufs = {};
+    for (size_t i = 0; i < ar->n; ++i) {
+        bufs.ptrs[i] = ar->bufs[i];
+    }
+
+    const float * input  = static_cast<const float *>(t->data);
+    float       * output = static_cast<float *>(t->data);
+
+    switch (ar->n) {
+        case 2: ggml_cuda_ar_push_launch<2>(bufs, input, output, (int) rank, n_packs, exact, cuda_ctx->stream()); break;
+        case 3: ggml_cuda_ar_push_launch<3>(bufs, input, output, (int) rank, n_packs, exact, cuda_ctx->stream()); break;
+        case 4: ggml_cuda_ar_push_launch<4>(bufs, input, output, (int) rank, n_packs, exact, cuda_ctx->stream()); break;
+        case 5: ggml_cuda_ar_push_launch<5>(bufs, input, output, (int) rank, n_packs, exact, cuda_ctx->stream()); break;
+        case 6: ggml_cuda_ar_push_launch<6>(bufs, input, output, (int) rank, n_packs, exact, cuda_ctx->stream()); break;
+        case 7: ggml_cuda_ar_push_launch<7>(bufs, input, output, (int) rank, n_packs, exact, cuda_ctx->stream()); break;
+        case 8: ggml_cuda_ar_push_launch<8>(bufs, input, output, (int) rank, n_packs, exact, cuda_ctx->stream()); break;
+        default: GGML_ABORT("unsupported number of ranks: %zu", ar->n);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+bool ggml_cuda_ar_push_allreduce_rank(
+        ggml_cuda_ar_push * ar, ggml_backend_t backend, size_t rank, ggml_tensor * t, bool exact) {
+    GGML_ASSERT(ar != nullptr);
+    GGML_ASSERT(rank < ar->n);
+
+    if (t != nullptr && ggml_nelements(t) == 0) {
+        return true;
+    }
+
+    int n_packs = 0;
+    if (!ggml_cuda_ar_push_can_impl(t, exact, n_packs)) {
+        return false;
+    }
+
+    ggml_cuda_ar_push_launch_rank(ar, backend, rank, t, exact, n_packs);
+    return true;
+}
+
 bool ggml_cuda_ar_push_allreduce(
         ggml_cuda_ar_push * ar,
         ggml_backend_t   * backends,
@@ -371,64 +462,21 @@ bool ggml_cuda_ar_push_allreduce(
         return true;
     }
 
+    // Check every rank before launching any of them, so an unsupported input
+    // cannot leave the collective half-enqueued.
+    int n_packs = 0;
     for (size_t i = 0; i < n; ++i) {
         if (tensors[i] == nullptr ||
-            tensors[i]->type != GGML_TYPE_F32 ||
             ggml_nelements(tensors[i]) != ne ||
-            !ggml_is_contiguously_allocated(tensors[i]) ||
-            ((uintptr_t) tensors[i]->data & 0xF) != 0) {
+            !ggml_cuda_ar_push_can_impl(tensors[i], exact, n_packs)) {
             return false;
         }
-    }
-
-    const size_t nbytes = (size_t) ne * sizeof(float);
-    if (nbytes > GGML_CUDA_AR_PUSH_MAX_BYTES) {
-        return false;
-    }
-
-    int n_packs;
-    if (exact) {
-        if (nbytes % 16 != 0) {
-            return false;
-        }
-        n_packs = (int) (nbytes / 16);
-    } else {
-        if (ne % 8 != 0) {
-            return false;
-        }
-        n_packs = (int) (ne / 8);
-    }
-
-    ggml_cuda_ar_push_ptrs bufs = {};
-    for (size_t i = 0; i < n; ++i) {
-        bufs.ptrs[i] = ar->bufs[i];
     }
 
     // No synchronization in this loop: the kernel spins on the peer ranks, so
     // waiting for one rank here would deadlock the whole collective.
     for (size_t i = 0; i < n; ++i) {
-        ggml_backend_cuda_context * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
-        GGML_ASSERT(cuda_ctx->device == ar->devices[i]);
-        ggml_cuda_set_device(cuda_ctx->device);
-
-        if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
-            CUDA_CHECK(cudaMemsetAsync(tensors[i]->data, 0, nbytes, cuda_ctx->stream()));
-        }
-
-        const float * input  = static_cast<const float *>(tensors[i]->data);
-        float       * output = static_cast<float *>(tensors[i]->data);
-
-        switch (n) {
-            case 2: ggml_cuda_ar_push_launch<2>(bufs, input, output, (int) i, n_packs, exact, cuda_ctx->stream()); break;
-            case 3: ggml_cuda_ar_push_launch<3>(bufs, input, output, (int) i, n_packs, exact, cuda_ctx->stream()); break;
-            case 4: ggml_cuda_ar_push_launch<4>(bufs, input, output, (int) i, n_packs, exact, cuda_ctx->stream()); break;
-            case 5: ggml_cuda_ar_push_launch<5>(bufs, input, output, (int) i, n_packs, exact, cuda_ctx->stream()); break;
-            case 6: ggml_cuda_ar_push_launch<6>(bufs, input, output, (int) i, n_packs, exact, cuda_ctx->stream()); break;
-            case 7: ggml_cuda_ar_push_launch<7>(bufs, input, output, (int) i, n_packs, exact, cuda_ctx->stream()); break;
-            case 8: ggml_cuda_ar_push_launch<8>(bufs, input, output, (int) i, n_packs, exact, cuda_ctx->stream()); break;
-            default: GGML_ABORT("unsupported number of ranks: %zu", n);
-        }
-        CUDA_CHECK(cudaGetLastError());
+        ggml_cuda_ar_push_launch_rank(ar, backends[i], i, tensors[i], exact, n_packs);
     }
 
     return true;
@@ -454,6 +502,30 @@ bool ggml_cuda_ar_push_allreduce(
     GGML_UNUSED(ar);
     GGML_UNUSED(backends);
     GGML_UNUSED(tensors);
+    GGML_UNUSED(exact);
+    return false;
+}
+
+bool ggml_cuda_ar_push_can(
+        const ggml_cuda_ar_push * ar,
+        const ggml_tensor       * t,
+        bool                      exact) {
+    GGML_UNUSED(ar);
+    GGML_UNUSED(t);
+    GGML_UNUSED(exact);
+    return false;
+}
+
+bool ggml_cuda_ar_push_allreduce_rank(
+        ggml_cuda_ar_push * ar,
+        ggml_backend_t      backend,
+        size_t              rank,
+        ggml_tensor       * t,
+        bool                exact) {
+    GGML_UNUSED(ar);
+    GGML_UNUSED(backend);
+    GGML_UNUSED(rank);
+    GGML_UNUSED(t);
     GGML_UNUSED(exact);
     return false;
 }

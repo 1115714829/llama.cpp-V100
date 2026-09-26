@@ -209,6 +209,14 @@ extern "C" {
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
     typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
 
+    // Per-rank all-reduce, for callers that drive every rank from its own thread: enqueue rank's
+    // part of the reduction of `tensor` on that rank's backend. Every rank must call it for the
+    // same sequence of collectives. `can` gets the tensors of all ranks and reports (without
+    // enqueueing anything) whether the per-rank calls handle this collective, all ranks taking
+    // the same route.
+    typedef bool   (*ggml_backend_comm_allreduce_rank_can_t)(void * comm_ctx, struct ggml_tensor ** tensors, bool exact);
+    typedef bool   (*ggml_backend_comm_allreduce_rank_t)    (void * comm_ctx, size_t rank, struct ggml_tensor * tensor, bool exact);
+
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
     // Set the number of threads for the backend

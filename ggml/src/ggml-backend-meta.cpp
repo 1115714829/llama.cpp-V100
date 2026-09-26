@@ -6,16 +6,21 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cfloat>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -2022,6 +2027,7 @@ struct ggml_backend_meta_cgraph_config {
 struct ggml_backend_meta_plan {
     uint64_t uid         = 0; // UID of the graph this plan was built for, 0 = invalid
     size_t   n_subgraphs = 0;
+    int      n_runs      = 0; // completed executions since the plan was built
 
     std::vector<std::vector<ggml_backend_meta_cgraph_config>> cgraphs; // per backend
     std::vector<std::vector<ggml_tensor *>>                   nodes;   // per backend
@@ -2036,11 +2042,203 @@ struct ggml_backend_meta_plan {
     void clear() {
         uid         = 0;
         n_subgraphs = 0;
+        n_runs      = 0;
         collects.clear();
         ctx_collect.clear();
         buf_collect.clear();
         slots.clear();
         // cgraphs and nodes keep their capacity and are overwritten on rebuild
+    }
+};
+
+// One launcher thread per backend: with a single thread the launch overhead of every
+// subgraph of every rank is serialized on the host and can keep the GPUs idle. The
+// push AllReduce synchronizes on the GPU, so ranks may be driven independently as
+// long as each submits the same collective sequence. The main thread waits for the
+// enqueues before returning because the caller may use the same streams right after.
+struct ggml_backend_meta_launchers {
+    std::vector<ggml_backend_t> backends;
+    void *                                  comm_ctx           = nullptr;
+    ggml_backend_comm_allreduce_rank_can_t  allreduce_rank_can = nullptr;
+    ggml_backend_comm_allreduce_rank_t      allreduce_rank     = nullptr;
+
+    std::vector<std::thread> threads;
+
+    // Dispatch protocol: the main thread publishes a plan and then bumps `job`,
+    // the workers run their launch sequence and bump `n_done`.
+    std::atomic<uint64_t>   job{0};
+    std::atomic<int>        n_done{0};
+    std::atomic<bool>       stop{false};
+    std::mutex              mutex;
+    std::condition_variable cv;
+
+    // Written by the main thread before `job` is bumped, read by the workers.
+    ggml_backend_meta_plan * plan = nullptr;
+
+    // After enqueueing its part of a collective a worker waits until every rank has enqueued its
+    // part. Otherwise a worker blocked in the driver (a lock holder that waits for its GPU, e.g.
+    // during cudaGraphInstantiate) can keep a peer from enqueueing its part while the parts that
+    // are already running spin on that peer, which deadlocked on V100.
+    std::atomic<int>  bar_count{0};
+    std::atomic<int>  bar_gen{0};
+    std::atomic<bool> failed{false};
+
+    std::vector<ggml_status> statuses;
+
+    ggml_backend_meta_launchers(std::vector<ggml_backend_t> backends,
+            void * comm_ctx,
+            ggml_backend_comm_allreduce_rank_can_t allreduce_rank_can,
+            ggml_backend_comm_allreduce_rank_t allreduce_rank) :
+        backends(std::move(backends)), comm_ctx(comm_ctx),
+        allreduce_rank_can(allreduce_rank_can), allreduce_rank(allreduce_rank),
+        statuses(this->backends.size(), GGML_STATUS_SUCCESS) {
+        threads.reserve(this->backends.size());
+        for (size_t j = 0; j < this->backends.size(); j++) {
+            threads.emplace_back(&ggml_backend_meta_launchers::worker, this, j);
+        }
+    }
+
+    ~ggml_backend_meta_launchers() {
+        stop.store(true, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            cv.notify_all();
+        }
+        for (std::thread & t : threads) {
+            t.join();
+        }
+    }
+
+    // Rank j's worker: spin for a while so a burst of jobs does not pay a
+    // futex wakeup each time, then sleep on the condition variable.
+    void worker(size_t j) {
+        // `job` starts at 0: a job published before this thread got here must not be skipped
+        uint64_t seen = 0;
+        while (true) {
+            uint64_t cur = job.load(std::memory_order_acquire);
+            if (cur == seen && !stop.load(std::memory_order_acquire)) {
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2);
+                int i_spin = 0;
+                while (cur == seen && !stop.load(std::memory_order_relaxed) && std::chrono::steady_clock::now() < deadline) {
+                    if ((++i_spin & 63) == 0) {
+                        std::this_thread::yield();
+                    }
+                    cur = job.load(std::memory_order_acquire);
+                }
+            }
+            if (cur == seen) {
+                std::unique_lock<std::mutex> lock(mutex);
+                while (job.load(std::memory_order_acquire) == seen && !stop.load(std::memory_order_acquire)) {
+                    cv.wait(lock);
+                }
+                cur = job.load(std::memory_order_acquire);
+            }
+            if (stop.load(std::memory_order_acquire)) {
+                // The destructor cannot race with a job: the main thread waits
+                // for n_done before it returns from a dispatch.
+                return;
+            }
+
+            seen = cur;
+            statuses[j] = launch_rank(j);
+            if (statuses[j] != GGML_STATUS_SUCCESS) {
+                failed.store(true, std::memory_order_relaxed);
+            }
+            n_done.fetch_add(1, std::memory_order_release);
+        }
+    }
+
+    // Returns false if another worker failed and will not arrive.
+    bool barrier() {
+        const int gen = bar_gen.load(std::memory_order_acquire);
+        if (bar_count.fetch_add(1, std::memory_order_acq_rel) == (int) backends.size() - 1) {
+            bar_count.store(0, std::memory_order_relaxed);
+            bar_gen.fetch_add(1, std::memory_order_release);
+            return true;
+        }
+        while (bar_gen.load(std::memory_order_acquire) == gen) {
+            if (failed.load(std::memory_order_relaxed)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Rank j's launch sequence, the same work the single-threaded path does for rank j.
+    ggml_status launch_rank(size_t j) {
+        const ggml_backend_meta_plan * p = plan;
+        const size_t n_backends = backends.size();
+        ggml_backend_t backend = backends[j];
+
+        for (size_t i = 0; i < p->n_subgraphs; i++) {
+            if (p->cgraphs[j][i].cgraph_main->n_nodes > 0) {
+                const ggml_status status = ggml_backend_graph_compute_async(backend, p->cgraphs[j][i].cgraph_main);
+                if (status != GGML_STATUS_SUCCESS) {
+                    return status;
+                }
+            }
+
+            const ggml_backend_meta_collect & collect = p->collects[i];
+            if (collect.kind != GGML_BACKEND_META_COLLECT_ALLREDUCE) {
+                if (collect.local[j].graph != nullptr) {
+                    const ggml_status status = ggml_backend_graph_compute_async(backend, collect.local[j].graph);
+                    if (status != GGML_STATUS_SUCCESS) {
+                        return status;
+                    }
+                }
+                if (n_backends > 1) {
+                    if (!allreduce_rank(comm_ctx, j, collect.reduce[j], true) || !barrier()) {
+                        return GGML_STATUS_FAILED;
+                    }
+                }
+                if (collect.kind == GGML_BACKEND_META_COLLECT_TOPK) {
+                    const ggml_status status = ggml_backend_graph_compute_async(backend, collect.merge[j].graph);
+                    if (status != GGML_STATUS_SUCCESS) {
+                        return status;
+                    }
+                }
+            } else if (n_backends > 1 && i < p->n_subgraphs - 1) {
+                if (!allreduce_rank(comm_ctx, j, collect.reduce[j], false) || !barrier()) {
+                    return GGML_STATUS_FAILED;
+                }
+            }
+        }
+        return GGML_STATUS_SUCCESS;
+    }
+
+    bool can(ggml_tensor ** tensors, bool exact) const {
+        return allreduce_rank_can(comm_ctx, tensors, exact);
+    }
+
+    ggml_status compute(ggml_backend_meta_plan * p) {
+        plan = p;
+        for (ggml_status & s : statuses) {
+            s = GGML_STATUS_SUCCESS;
+        }
+        n_done.store(0, std::memory_order_relaxed);
+        bar_count.store(0, std::memory_order_relaxed);
+        failed.store(false, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            job.fetch_add(1, std::memory_order_release);
+        }
+        cv.notify_all();
+
+        // Wait for the enqueues only, not for the GPU work: the caller may read
+        // or synchronize the same streams right after this returns.
+        int i_spin = 0;
+        while (n_done.load(std::memory_order_acquire) != (int) backends.size()) {
+            if ((++i_spin & 63) == 0) {
+                std::this_thread::yield();
+            }
+        }
+
+        for (size_t j = 0; j < backends.size(); j++) {
+            if (statuses[j] != GGML_STATUS_SUCCESS) {
+                return statuses[j];
+            }
+        }
+        return GGML_STATUS_SUCCESS;
     }
 };
 
@@ -2068,6 +2266,8 @@ struct ggml_backend_meta_context {
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce_exact = nullptr;
+
+    std::unique_ptr<ggml_backend_meta_launchers> launchers;
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
@@ -2104,10 +2304,26 @@ struct ggml_backend_meta_context {
             comm_allreduce_exact = (ggml_backend_comm_allreduce_tensor_t)
                 ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
                     ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor_exact");
+
+            ggml_backend_comm_allreduce_rank_can_t comm_allreduce_rank_can = (ggml_backend_comm_allreduce_rank_can_t)
+                ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
+                    ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_rank_can");
+            ggml_backend_comm_allreduce_rank_t comm_allreduce_rank = (ggml_backend_comm_allreduce_rank_t)
+                ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
+                    ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_rank");
+
+            // Optional: per-rank launcher threads. The plan is only executed
+            // this way when every collective in it can be driven per rank.
+            if (n_devs > 1 && comm_allreduce_rank_can != nullptr && comm_allreduce_rank != nullptr) {
+                launchers = std::make_unique<ggml_backend_meta_launchers>(
+                    simple_backends, comm_ctx, comm_allreduce_rank_can, comm_allreduce_rank);
+            }
         }
     }
 
     ~ggml_backend_meta_context() {
+        // Stop the launcher threads before the comm context they use is freed.
+        launchers.reset();
         if (comm_ctx != nullptr) {
             ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
                 ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_configs[0].backend)), "ggml_backend_comm_free");
@@ -2908,6 +3124,33 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
     GGML_ASSERT(p != nullptr);
 
+    // Prefer the per-rank launcher threads when every collective of this plan can be
+    // driven per rank. The check is cheap and done on every call because the plan can
+    // change between calls. The first runs of a plan stay on this thread: they capture and
+    // instantiate the CUDA graphs, load kernels and grow the memory pools, i.e. driver calls
+    // that can wait for the GPU while holding driver locks (see ggml_backend_meta_launchers).
+    if (backend_ctx->launchers != nullptr && p->n_runs >= 2) {
+        bool can_launch = true;
+        for (size_t i = 0; i < p->n_subgraphs && can_launch; i++) {
+            const ggml_backend_meta_collect & collect = p->collects[i];
+            const bool do_reduce = collect.kind != GGML_BACKEND_META_COLLECT_ALLREDUCE
+                ? n_backends > 1
+                : n_backends > 1 && i < p->n_subgraphs - 1;
+            if (!do_reduce) {
+                continue;
+            }
+            const bool exact = collect.kind != GGML_BACKEND_META_COLLECT_ALLREDUCE;
+            can_launch = backend_ctx->launchers->can(p->collects[i].reduce.data(), exact);
+        }
+        if (can_launch) {
+            const ggml_status status = backend_ctx->launchers->compute(p);
+            if (status == GGML_STATUS_SUCCESS) {
+                p->n_runs++;
+            }
+            return status;
+        }
+    }
+
     for (size_t i = 0; i < p->n_subgraphs; i++) {
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
@@ -2956,6 +3199,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
     }
+    p->n_runs++;
     return GGML_STATUS_SUCCESS;
 }
 
