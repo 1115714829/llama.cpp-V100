@@ -10734,6 +10734,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // DFlash2 draft: per-GPU top-k over a vocab slice, 8 rows at a time
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {62080,  8, 1, 1}, 16));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {62080,  8, 1, 1}, 32));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, 1, 1, 1}, 16));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {62080,  8, 1, 1}, 16, true));
 
     for (int k : {1, 2, 3, 7, 15}) {
@@ -11666,6 +11670,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {200000, 16, 1, 1}));
 
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2, 1, 1, 1}, 1));
+    // DFlash2 draft: per-GPU top-k over a vocab slice, 8 rows at a time
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {62080,  8, 1, 1}, 16));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {62080,  8, 1, 1}, 32));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, 1, 1, 1}, 16));
     // widths around the tiling threshold
     for (auto cols : {4096, 8192, 12288, 16384, 24576, 32768, 65536, 131072}) {
         for (auto nrows : {1, 16}) {
