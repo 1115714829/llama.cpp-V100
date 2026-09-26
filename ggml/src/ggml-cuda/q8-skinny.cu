@@ -434,6 +434,12 @@ void ggml_cuda_q8_skinny_repack_inplace(ggml_backend_cuda_context & ctx, ggml_te
 }
 
 void ggml_cuda_q8_skinny_prepass(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph) {
+    // Skipping the scan is safe: a weight that is missed stays on the regular path and only
+    // loses the acceleration, the result is still correct. A new model gets a new context.
+    if (ctx.q8_skinny_idle_scans >= 1024) {
+        return;
+    }
+
     // candidates: Q8_0 weights used as MUL_MAT src0; none in steady state
     std::vector<ggml_tensor *> candidates;
     for (int i = 0; i < cgraph->n_nodes; ++i) {
@@ -450,8 +456,10 @@ void ggml_cuda_q8_skinny_prepass(ggml_backend_cuda_context & ctx, ggml_cgraph * 
         }
     }
     if (candidates.empty()) {
+        ++ctx.q8_skinny_idle_scans;
         return;
     }
+    ctx.q8_skinny_idle_scans = 0;
 
     // repacking cannot be recorded into a CUDA graph; the capture is checked only here so that
     // the steady state costs no CUDA API call
