@@ -2,6 +2,7 @@
 
 #include "llama.h"
 #include "common.h"
+#include "sampling.h"
 
 struct common_speculative;
 
@@ -69,6 +70,14 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // rejection sampling (draft-dflash with a selector lattice only)
+    bool     use_rejection = false;
+    float    temp          = 0.0f;
+    uint32_t seed          = 0;
+
+    // proposal distribution of each token in `result`, enabled with use_rejection
+    std::vector<common_sampler_draft_q> * result_q = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
