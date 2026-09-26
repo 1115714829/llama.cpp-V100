@@ -386,6 +386,23 @@ public:
         return seq_pos[seq_id].rbegin()->first;
     }
 
+    // the indices of all cells of sequence seq_id with position in [p0, p1)
+    // note: the result is a snapshot, the caller must collect it before modifying the cells
+    std::vector<uint32_t> seq_pos_range(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        std::vector<uint32_t> res;
+
+        const auto & sp = seq_pos[seq_id];
+
+        for (auto it = sp.lower_bound({ p0, 0 }); it != sp.end() && it->first < p1; ++it) {
+            res.push_back(it->second);
+        }
+
+        return res;
+    }
+
     // note: call only if the cell is not empty
     llama_pos pos_get(uint32_t i) const {
         assert(i < pos.size());
