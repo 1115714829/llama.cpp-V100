@@ -3343,6 +3343,48 @@ struct test_cont : public test_case {
     }
 };
 
+// GGML_OP_CONT + GGML_OP_UNARY(SIGMOID) + GGML_OP_MUL with the gate taken from a strided view
+struct test_cont_sigmoid_mul : public test_case {
+    const int64_t head_dim;
+    const int64_t n_head;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CONT_SIGMOID_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(head_dim, n_head, n_tokens);
+    }
+
+    test_cont_sigmoid_mul(int64_t head_dim = 256, int64_t n_head = 24, int64_t n_tokens = 1)
+        : head_dim(head_dim), n_head(n_head), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // joint Q and gate projection, the gate is the second half of every row
+        ggml_tensor * qg = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*head_dim, n_head, n_tokens);
+        ggml_set_name(qg, "qg");
+
+        ggml_tensor * attn = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_dim*n_head, n_tokens);
+        ggml_set_name(attn, "attn");
+
+        ggml_tensor * gate = ggml_view_3d(ctx, qg, head_dim, n_head, n_tokens,
+            ggml_element_size(qg) * 2 * head_dim,
+            ggml_element_size(qg) * 2 * head_dim * n_head,
+            ggml_element_size(qg) * head_dim);
+        gate = ggml_cont_2d(ctx, gate, head_dim * n_head, n_tokens);
+        gate = ggml_sigmoid(ctx, gate);
+
+        ggml_tensor * out = ggml_mul(ctx, attn, gate);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_ADD
 // GGML_OP_SUB
 // GGML_OP_MUL
@@ -3906,6 +3948,59 @@ struct test_rms_norm_mul_add : public test_case {
 
     bool grad_precise() override {
         return true;
+    }
+};
+
+// GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_UNARY(SILU) + GGML_OP_MUL
+struct test_rms_norm_mul_silu_mul : public test_case {
+    const std::array<int64_t, 4> ne;
+    const float eps;
+    const bool gate_view; // gate is a non-contiguous view
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_GATED";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, eps, gate_view);
+    }
+
+    test_rms_norm_mul_silu_mul(std::array<int64_t, 4> ne = {128, 12, 1, 1}, float eps = 1e-6f, bool gate_view = false)
+        : ne(ne), eps(eps), gate_view(gate_view) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * z = nullptr;
+        if (gate_view) {
+            ggml_tensor * gate_src = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2*ne[0], 2*ne[1], 2*ne[2], 2*ne[3]);
+            ggml_set_name(gate_src, "gate_src");
+            z = ggml_view_4d(ctx, gate_src, ne[0], ne[1], ne[2], ne[3],
+                    gate_src->nb[1], gate_src->nb[2], gate_src->nb[3], sizeof(float));
+        } else {
+            z = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
+        }
+        ggml_set_name(z, "z");
+
+        ggml_tensor * norm = ggml_rms_norm(ctx, a, eps);
+        norm = ggml_mul(ctx, norm, w);
+        ggml_tensor * out = ggml_mul(ctx, norm, ggml_silu(ctx, z));
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -10.f, 10.f);
+        }
     }
 };
 
@@ -10073,6 +10168,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // attention gate: sigmoid of a strided view, fused into the mul
+    for (int64_t n_tokens : { 1, 8 }) {
+        test_cases.emplace_back(new test_cont_sigmoid_mul(256, 24, n_tokens));
+    }
+
     auto add_test_bin_bcast = [&](ggml_type type, std::array<int64_t, 4> ne, std::array<int, 4> nr, bool perm1 = false, bool src_overlap = false) {
         for (auto op : {ggml_add, ggml_sub, ggml_mul, ggml_div}) {
             test_cases.emplace_back(new test_bin_bcast(op, type, ne, nr, 1, perm1, src_overlap));
@@ -10221,6 +10321,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 3, 2 }, 1e-6f, false, false, true, false, true));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 1536, 1, 1, 1 }, 1e-6f, false, false, false, true));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 1, 1 }, 1e-6f, false, false, false, true));
+
+    // gated norm at the output of the GDN layers
+    for (int64_t n_tokens : { 1, 8 }) {
+        test_cases.emplace_back(new test_rms_norm_mul_silu_mul({ 128, 12, n_tokens, 1 }, 1e-6f, false));
+        test_cases.emplace_back(new test_rms_norm_mul_silu_mul({ 128, 12, n_tokens, 1 }, 1e-6f, true));
+    }
 
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}));
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}, 1e-6f, false, true));

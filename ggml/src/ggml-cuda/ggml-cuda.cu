@@ -2772,6 +2772,35 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
            t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
 }
 
+// index of the first node after idx that is not a view or a no-op, or -1
+static int ggml_cuda_next_real_node(const ggml_cgraph * cgraph, int idx) {
+    for (int i = idx + 1; i < cgraph->n_nodes; ++i) {
+        if (!ggml_cuda_is_view_or_noop(cgraph->nodes[i])) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+// true if t is already computed when the node at node_idx runs, so a fused kernel placed there
+// can read it. Views resolve to their source; leaves (weights and inputs) are always ready.
+static bool ggml_cuda_tensor_ready_before(const ggml_cgraph * cgraph, const ggml_tensor * t, int node_idx) {
+    while (t->view_src != nullptr) {
+        t = t->view_src;
+    }
+    if (t->op == GGML_OP_NONE) {
+        return true;
+    }
+    for (int i = 0; i < node_idx; ++i) {
+        if (cgraph->nodes[i] == t) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
@@ -2979,6 +3008,201 @@ static bool ggml_cuda_add_rms_norm_ranges_ok(const ggml_tensor * add, const ggml
         }
     }
     return !overlap(mul, add) && !overlap(weight, add) && !overlap(weight, mul);
+}
+
+// Memory check for a fused output: the kernel reads each element before writing it, so the output
+// may alias an input exactly; any other overlap is rejected. Same convention as
+// ggml_cuda_add_rms_norm_ranges_ok.
+static bool ggml_cuda_fused_output_ranges_ok(const ggml_tensor * out, std::initializer_list<const ggml_tensor *> inputs) {
+    for (const ggml_tensor * in : inputs) {
+        const uintptr_t out0 = (uintptr_t) out->data;
+        const uintptr_t in0  = (uintptr_t) in->data;
+        if (out0 >= in0 + ggml_nbytes(in) || in0 >= out0 + ggml_nbytes(out)) {
+            continue;
+        }
+        const bool same = out->data == in->data && ggml_are_same_shape(out, in) && ggml_are_same_stride(out, in);
+        if (!same) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+struct ggml_cuda_rms_norm_gated_match {
+    ggml_tensor * rms_norm = nullptr;
+    ggml_tensor * mul      = nullptr;
+    ggml_tensor * silu     = nullptr;
+    ggml_tensor * mul2     = nullptr;
+    int           last     = 0;
+};
+
+// match RMS_NORM -> MUL -> UNARY(SILU) -> MUL, the gated norm at the output of the GDN layers.
+// Views may separate the nodes of the chain.
+static bool ggml_cuda_match_rms_norm_mul_silu_mul(
+        const ggml_cgraph * cgraph, int node_idx, ggml_cuda_rms_norm_gated_match & match) {
+    const int i0 = node_idx;
+    const int i1 = ggml_cuda_next_real_node(cgraph, i0);
+    const int i2 = i1 < 0 ? -1 : ggml_cuda_next_real_node(cgraph, i1);
+    const int i3 = i2 < 0 ? -1 : ggml_cuda_next_real_node(cgraph, i2);
+    if (i3 < 0) {
+        return false;
+    }
+
+    const ggml_tensor * rms_norm = cgraph->nodes[i0];
+    const ggml_tensor * mul      = cgraph->nodes[i1];
+    const ggml_tensor * silu     = cgraph->nodes[i2];
+    const ggml_tensor * mul2     = cgraph->nodes[i3];
+
+    if (rms_norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL || silu->op != GGML_OP_UNARY ||
+        ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU || mul2->op != GGML_OP_MUL) {
+        return false;
+    }
+
+    const ggml_tensor * x    = rms_norm->src[0];
+    const ggml_tensor * gate = silu->src[0];
+    if (x == nullptr || gate == nullptr) {
+        return false;
+    }
+
+    // one operand of the first mul is the norm output, the other one is the broadcast weight
+    if ((mul->src[0] == rms_norm) == (mul->src[1] == rms_norm)) {
+        return false;
+    }
+    const ggml_tensor * weight = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+
+    // the kernel reads all operands element-wise
+    for (const ggml_tensor * t : { x, rms_norm, mul, weight, gate, silu, mul2 }) {
+        if (t->type != GGML_TYPE_F32 || t->nb[0] != ggml_type_size(GGML_TYPE_F32)) {
+            return false;
+        }
+    }
+
+    // one operand of the second mul is the silu output, the other one is the first mul output.
+    // A view is accepted only when it does not change the element mapping.
+    auto resolve_identity_view = [](const ggml_tensor * t) -> const ggml_tensor * {
+        while (t->view_src != nullptr) {
+            const ggml_tensor * parent = t->view_src;
+            if (t->data != parent->data || !ggml_are_same_shape(t, parent) || !ggml_are_same_stride(t, parent)) {
+                return nullptr;
+            }
+            t = parent;
+        }
+        return t;
+    };
+    const ggml_tensor * mul2_src0 = resolve_identity_view(mul2->src[0]);
+    const ggml_tensor * mul2_src1 = resolve_identity_view(mul2->src[1]);
+    if (!((mul2_src0 == silu && mul2_src1 == mul) || (mul2_src0 == mul && mul2_src1 == silu))) {
+        return false;
+    }
+
+    // the kernel writes the second mul output with the layout of the norm input
+    if (!ggml_are_same_shape(rms_norm, mul) || !ggml_are_same_shape(rms_norm, x) ||
+        !ggml_are_same_shape(rms_norm, gate) || !ggml_are_same_shape(rms_norm, mul2) ||
+        !ggml_is_contiguous(mul2) || !ggml_can_repeat(weight, mul2)) {
+        return false;
+    }
+
+    // the kernel runs at the position of the rms norm, so the gate and the weight must be ready there
+    if (!ggml_cuda_tensor_ready_before(cgraph, gate, i0) || !ggml_cuda_tensor_ready_before(cgraph, weight, i0)) {
+        return false;
+    }
+
+    const int idxs[] = { i0, i1, i2, i3 };
+    const enum ggml_op ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL };
+    const int out = i3;
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, 4, ops, &out, 1)) {
+        return false;
+    }
+
+    // the kernel reads x, gate and weight before overwriting each element
+    if (!ggml_cuda_fused_output_ranges_ok(mul2, { x, gate, weight })) {
+        return false;
+    }
+
+    match.rms_norm = cgraph->nodes[i0];
+    match.mul      = cgraph->nodes[i1];
+    match.silu     = cgraph->nodes[i2];
+    match.mul2     = cgraph->nodes[i3];
+    match.last     = i3;
+    return true;
+}
+
+struct ggml_cuda_cont_sigmoid_mul_match {
+    ggml_tensor * cont    = nullptr;
+    ggml_tensor * sigmoid = nullptr;
+    ggml_tensor * mul     = nullptr;
+    int           last    = 0;
+};
+
+// match CONT -> UNARY(SIGMOID) -> MUL, the attention gate that reads a strided view.
+// The CONT output is only consumed by the sigmoid, so the kernel reads the view directly.
+static bool ggml_cuda_match_cont_sigmoid_mul(
+        const ggml_cgraph * cgraph, int node_idx, ggml_cuda_cont_sigmoid_mul_match & match) {
+    const int i0 = node_idx;
+    const int i1 = ggml_cuda_next_real_node(cgraph, i0);
+    const int i2 = i1 < 0 ? -1 : ggml_cuda_next_real_node(cgraph, i1);
+    if (i2 < 0) {
+        return false;
+    }
+
+    const ggml_tensor * cont    = cgraph->nodes[i0];
+    const ggml_tensor * sigmoid = cgraph->nodes[i1];
+    const ggml_tensor * mul     = cgraph->nodes[i2];
+
+    if (cont->op != GGML_OP_CONT || sigmoid->op != GGML_OP_UNARY ||
+        ggml_get_unary_op(sigmoid) != GGML_UNARY_OP_SIGMOID || mul->op != GGML_OP_MUL ||
+        sigmoid->src[0] != cont) {
+        return false;
+    }
+
+    const ggml_tensor * gate = cont->src[0];
+    if (gate == nullptr || gate->view_src == nullptr ||
+        gate->type != GGML_TYPE_F32 || gate->nb[0] != ggml_type_size(GGML_TYPE_F32)) {
+        return false;
+    }
+
+    // one operand of the mul is the sigmoid output, the other one is the attention result
+    if ((mul->src[0] == sigmoid) == (mul->src[1] == sigmoid)) {
+        return false;
+    }
+    const ggml_tensor * attn = mul->src[0] == sigmoid ? mul->src[1] : mul->src[0];
+
+    if (attn->type != GGML_TYPE_F32 || !ggml_is_contiguous(attn) || !ggml_are_same_shape(attn, mul) ||
+        cont->type != GGML_TYPE_F32 || !ggml_is_contiguous(cont) || !ggml_are_same_shape(cont, mul) ||
+        mul->type != GGML_TYPE_F32 || !ggml_is_contiguous(mul)) {
+        return false;
+    }
+
+    // the kernel reads the gate with its own 4D strides: gate dims 0 and 1 span one dst row,
+    // gate dims 2 and 3 span the dst rows
+    if (ggml_nelements(gate) != ggml_nelements(cont) ||
+        cont->ne[0] != gate->ne[0]*gate->ne[1] ||
+        cont->ne[1]*cont->ne[2]*cont->ne[3] != gate->ne[2]*gate->ne[3]) {
+        return false;
+    }
+
+    // the kernel runs at the position of the cont, so the gate and the attention result must be ready there
+    if (!ggml_cuda_tensor_ready_before(cgraph, gate, i0) || !ggml_cuda_tensor_ready_before(cgraph, attn, i0)) {
+        return false;
+    }
+
+    const int idxs[] = { i0, i1, i2 };
+    const enum ggml_op ops[] = { GGML_OP_CONT, GGML_OP_UNARY, GGML_OP_MUL };
+    const int out = i2;
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, 3, ops, &out, 1)) {
+        return false;
+    }
+
+    if (!ggml_cuda_fused_output_ranges_ok(mul, { gate, attn })) {
+        return false;
+    }
+
+    match.cont    = cgraph->nodes[i0];
+    match.sigmoid = cgraph->nodes[i1];
+    match.mul     = cgraph->nodes[i2];
+    match.last    = i2;
+    return true;
 }
 
 static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm,
@@ -4735,6 +4959,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    // RMS_NORM -> MUL -> UNARY(SILU) -> MUL: gated norm at the output of the GDN layers
+    if (node->op == GGML_OP_RMS_NORM) {
+        ggml_cuda_rms_norm_gated_match match;
+        if (ggml_cuda_match_rms_norm_mul_silu_mul(cgraph, i, match)) {
+            ggml_cuda_op_rms_norm_mul_silu_mul_fused(*cuda_ctx, match.rms_norm, match.mul, match.silu, match.mul2);
+            return match.last - i;
+        }
+    }
+
     // ADD -> RMS_NORM -> MUL: the residual add feeds the norm, and both results are kept
     if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }, { i, i + 2 }) &&
             ggml_cuda_should_fuse_add_rms_norm(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
@@ -4779,6 +5012,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
         ggml_cuda_op_ssm_conv(*cuda_ctx, node, /*bias_add_node=*/ nullptr, cgraph->nodes[i + 1]);
         return 1;
+    }
+
+    // CONT -> UNARY(SIGMOID) -> MUL: the attention gate reads a strided view, so the CONT is elided
+    if (node->op == GGML_OP_CONT) {
+        ggml_cuda_cont_sigmoid_mul_match match;
+        if (ggml_cuda_match_cont_sigmoid_mul(cgraph, i, match)) {
+            ggml_cuda_op_cont_sigmoid_mul(*cuda_ctx, match.cont, match.sigmoid, match.mul);
+            return match.last - i;
+        }
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
