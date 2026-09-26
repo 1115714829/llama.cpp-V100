@@ -1695,7 +1695,16 @@ llm_graph_qkv llm_graph_context::build_qkv(
         }
     } else {
         // separate Q/K/V path
+        // Expand the three projections back to back so that the CUDA backend can run them with
+        // one input conversion and one multi-weight kernel. ggml reuses compute buffers in node
+        // order, so a projection expanded apart from the others could have its output
+        // overwritten before its consumers read it.
         Qcur = build_lora_mm(layer.wq, cur, layer.wq_s);
+        ggml_build_forward_expand(gf, Qcur);
+        Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
+        ggml_build_forward_expand(gf, Kcur);
+        Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
+        ggml_build_forward_expand(gf, Vcur);
         if (reshape) {
             cb(Qcur, "Qcur", il);
         }
@@ -1709,7 +1718,6 @@ llm_graph_qkv llm_graph_context::build_qkv(
             Qcur = ggml_clamp(ctx0, Qcur, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
             cb(Qcur, "Qcur_clamped", il);
         }
-        Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
         if (reshape) {
             cb(Kcur, "Kcur", il);
         }
@@ -1723,7 +1731,6 @@ llm_graph_qkv llm_graph_context::build_qkv(
             Kcur = ggml_clamp(ctx0, Kcur, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
             cb(Kcur, "Kcur_clamped", il);
         }
-        Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
         if (reshape) {
             cb(Vcur, "Vcur", il);
         }

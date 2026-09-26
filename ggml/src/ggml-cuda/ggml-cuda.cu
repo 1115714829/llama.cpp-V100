@@ -3669,6 +3669,48 @@ static int ggml_cuda_try_cpy_batch(ggml_backend_cuda_context * cuda_ctx, const g
     return last - i;
 }
 
+// Collects up to four MUL_MAT nodes starting at node_idx that share one src1 and read only
+// weights the q8 skinny multi-weight kernel can handle: repacked weights, or narrow row-major
+// Q8_0 weights (N is not a multiple of 32) that the kernel dot path reads directly.
+static int ggml_cuda_match_mul_mat_multi(const ggml_cgraph * cgraph, int node_idx,
+                                         const ggml_tensor * src0s[4], ggml_tensor * dsts[4]) {
+    const ggml_tensor * first = cgraph->nodes[node_idx];
+    if (first->op != GGML_OP_MUL_MAT) {
+        return 0;
+    }
+    const ggml_tensor * src1 = first->src[1];
+    if (src1 == nullptr || src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) ||
+            src1->ne[2] != 1 || src1->ne[3] != 1 || src1->ne[1] < 1 || src1->ne[1] > 16) {
+        return 0;
+    }
+    const int64_t k = first->src[0]->ne[0];
+    if (k % 32 != 0) {
+        return 0;
+    }
+    int n = 0;
+    while (n < 4 && node_idx + n < cgraph->n_nodes) {
+        ggml_tensor * node = cgraph->nodes[node_idx + n];
+        if (node->op != GGML_OP_MUL_MAT || node->src[1] != src1 ||
+                (node->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
+            break;
+        }
+        const ggml_tensor * w = node->src[0];
+        const bool repacked = ggml_cuda_q8_skinny_is_repacked(w);
+        const bool narrow = w->type == GGML_TYPE_Q8_0 && w->view_src == nullptr && w->op == GGML_OP_NONE &&
+                            w->ne[1] % 32 != 0;
+        if (w->ne[0] != k || (!repacked && !narrow)) {
+            break;
+        }
+        if (node->type != GGML_TYPE_F32 || !ggml_is_contiguous(node)) {
+            break;
+        }
+        src0s[n] = w;
+        dsts[n]  = node;
+        ++n;
+    }
+    return n >= 2 ? n : 0;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4239,6 +4281,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (fused_mul_mat_vec) {
         return fused_node_count - 1;
+    }
+
+    // Several MUL_MAT nodes that share one src1: one input conversion and one multi-weight
+    // kernel instead of one input conversion and one launch per weight. Runs after the GLU
+    // checks above so that gate/up pairs keep their fused SwiGLU path.
+    if (node->op == GGML_OP_MUL_MAT) {
+        const ggml_tensor * multi_src0[4];
+        ggml_tensor * multi_dst[4];
+        const int n_multi = ggml_cuda_match_mul_mat_multi(cgraph, i, multi_src0, multi_dst);
+        if (n_multi > 0) {
+            // every node of the group is a formal output and is only read after the group, so
+            // the fusion memory ranges cover all of them
+            ggml_op ops[4] = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT };
+            int out_nodes[4] = { i, i + 1, i + 2, i + 3 };
+            if (ggml_can_fuse_subgraph(cgraph, i, n_multi, ops, out_nodes, n_multi) &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_multi, out_nodes, n_multi) &&
+                    ggml_cuda_q8_skinny_mul_mat_multi(*cuda_ctx, multi_src0, multi_dst, n_multi, node->src[1])) {
+                return n_multi - 1;
+            }
+        }
     }
 
     fused_mul_mat_vec = false;

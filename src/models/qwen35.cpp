@@ -230,11 +230,17 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
     const int64_t n_seqs       = ubatch.n_seqs;
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
+    // Expand the projections that share this input back to back, so that the CUDA backend can
+    // run them with one input conversion and one multi-weight kernel. ggml reuses compute
+    // buffers in node order, so a projection expanded apart from the others could have its
+    // output overwritten before its consumers read it.
     ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
+    ggml_build_forward_expand(gf, qkv_mixed);
+    ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
+    ggml_build_forward_expand(gf, z);
+
     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
     cb(qkv_mixed, "linear_attn_qkv_mixed", il);
-
-    ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
     cb(z, "z", il);
 
     return { qkv_mixed, z };
@@ -355,14 +361,18 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
 
+    // same reason as in build_qkvz: keep the beta/alpha projections adjacent to the qkv ones
     ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
+    ggml_build_forward_expand(gf, beta);
+    ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+    ggml_build_forward_expand(gf, alpha);
+
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
 
     beta = ggml_sigmoid(ctx0, beta);
     cb(beta, "beta_sigmoid", il);
 
-    ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     cb(alpha, "alpha", il);
 

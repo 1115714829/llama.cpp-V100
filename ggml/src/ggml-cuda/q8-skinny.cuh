@@ -30,4 +30,11 @@ bool ggml_cuda_q8_skinny_mul_mat(ggml_backend_cuda_context & ctx, const ggml_ten
 // Returns false for anything the kernel does not handle, the caller then runs the nodes
 // on the regular path.
 bool ggml_cuda_q8_skinny_mul_mat_gated(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_w, const ggml_tensor * up_w, const ggml_tensor * src1, ggml_tensor * dst);
+
+// Runs 2 to 4 MUL_MAT nodes that share one src1 with a single input conversion and a single
+// kernel launch. Each src0 is either repacked or a narrow row-major Q8_0 weight (N is not a
+// multiple of 32). Returns false if any node does not fit, the caller then runs them all on
+// the regular path.
+bool ggml_cuda_q8_skinny_mul_mat_multi(ggml_backend_cuda_context & ctx, const ggml_tensor * const src0s[4], ggml_tensor * const dsts[4], int n_nodes, const ggml_tensor * src1);
+
 void ggml_cuda_q8_skinny_to_f16(const ggml_tensor * src0, half * dst, cudaStream_t stream);
