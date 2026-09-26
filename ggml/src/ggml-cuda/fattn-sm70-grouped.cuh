@@ -204,65 +204,114 @@ __device__ __forceinline__ float warp_reduce_max(float val) {
     return val;
 }
 
-// Load one 32 x 256 KV tile into the shared panel (row stride kGroupedVerifyKVStride).
-// K and V share the panel, so call this once per matrix. Rows with kv_idx >= n_kv are zeroed.
+// One raw KV tile held in registers between the global load and the shared write,
+// so the global latency of tile i+1 hides behind the compute of tile i.
 template <ggml_type type_KV>
-__device__ __forceinline__ void flash_attn_sm70_grouped_load_kv(
-        __half * shared_kv, uint8_t * kv_stage,
+struct GroupedVerifyKVRegs {
+    static constexpr int kRowBytes  = type_KV == GGML_TYPE_F16 ? kGroupedVerifyHeadDim * (int) sizeof(__half)
+                                                               : kGroupedVerifyKVQ8RowBytes;
+    static constexpr int kVecsPerRow  = kRowBytes / 16;
+    static constexpr int kVecsPerTile = kGroupedVerifyBlockN * kVecsPerRow;
+    static constexpr int kVecsPerThread = (kVecsPerTile + kGroupedVerifyThreads - 1) / kGroupedVerifyThreads;
+    static_assert(kVecsPerThread <= 2, "the prefetch must stay small");
+    uint4 vec[kVecsPerThread];
+};
+
+// Sign-extend two packed int8 and scale them by d, all in half precision.
+__device__ __forceinline__ __half2 grouped_verify_q8_pair_half2(const uint32_t packed, const __half2 d2) {
+    const __half2 q = __halves2half2(
+        __short2half_rn((int8_t) (uint8_t)  packed),
+        __short2half_rn((int8_t) (uint8_t) (packed >> 8)));
+    return __hmul2(d2, q);
+}
+
+__device__ __forceinline__ uint32_t grouped_verify_half2_uint(const __half2 h) {
+    uint32_t u;
+    memcpy(&u, &h, sizeof(u));
+    return u;
+}
+
+// Issue the global loads for one 32 x 256 KV tile. Rows with kv_idx >= n_kv load as zero.
+template <ggml_type type_KV>
+__device__ __forceinline__ void flash_attn_sm70_grouped_prefetch_kv(
+        GroupedVerifyKVRegs<type_KV> & regs,
         const char * __restrict__ KV, const int64_t nb11, const int64_t nb12, const int64_t nb13,
         const int seq, const int kv_head, const int tile_start, const int n_kv) {
     static_assert(type_KV == GGML_TYPE_F16 || type_KV == GGML_TYPE_Q8_0, "unsupported KV type");
-    constexpr int kSharedStrideVec = kGroupedVerifyKVStride / 8;
-    uint4 * shared_vec = reinterpret_cast<uint4 *>(shared_kv);
+    constexpr int kVecsPerRow  = GroupedVerifyKVRegs<type_KV>::kVecsPerRow;
+    constexpr int kVecsPerTile = GroupedVerifyKVRegs<type_KV>::kVecsPerTile;
     const int tid = threadIdx.x;
-
-    if constexpr (type_KV == GGML_TYPE_F16) {
-        constexpr int kRowBytes = kGroupedVerifyHeadDim * sizeof(__half);
-        constexpr int kVecsPerRow = kRowBytes / 16;
-        for (int idx = tid; idx < kGroupedVerifyBlockN * kVecsPerRow; idx += kGroupedVerifyThreads) {
-            const int row     = idx / kVecsPerRow;
-            const int vec_col = idx % kVecsPerRow;
-            const int kv_idx  = tile_start + row;
-            if (kv_idx < n_kv) {
-                const char * src = KV + kv_idx*nb11 + kv_head*nb12 + int64_t(seq)*nb13 + vec_col*16;
-                shared_vec[row * kSharedStrideVec + vec_col] = __ldg(reinterpret_cast<const uint4 *>(src));
-            } else {
-                shared_vec[row * kSharedStrideVec + vec_col] = make_uint4(0, 0, 0, 0);
-            }
-        }
-    } else {
-        // q8_0: stage the raw 272 B rows first, then dequantize to the half panel.
-        constexpr int kStageVecsPerRow = kGroupedVerifyKVQ8RowBytes / 16;
-        uint4 * stage_vec = reinterpret_cast<uint4 *>(kv_stage);
-        for (int idx = tid; idx < kGroupedVerifyBlockN * kStageVecsPerRow; idx += kGroupedVerifyThreads) {
-            const int row     = idx / kStageVecsPerRow;
-            const int vec_col = idx % kStageVecsPerRow;
-            const int kv_idx  = tile_start + row;
-            if (kv_idx < n_kv) {
-                const char * src = KV + kv_idx*nb11 + kv_head*nb12 + int64_t(seq)*nb13 + vec_col*16;
-                stage_vec[row * kStageVecsPerRow + vec_col] = __ldg(reinterpret_cast<const uint4 *>(src));
-            } else {
-                stage_vec[row * kStageVecsPerRow + vec_col] = make_uint4(0, 0, 0, 0);
-            }
-        }
-        __syncthreads();
-        constexpr int kColsPerBlock = 8;
-        constexpr int kGroupsPerRow = kGroupedVerifyHeadDim / kColsPerBlock;
-        for (int idx = tid; idx < kGroupedVerifyBlockN * kGroupsPerRow; idx += kGroupedVerifyThreads) {
-            const int row = idx / kGroupsPerRow;
-            const int c   = (idx % kGroupsPerRow) * kColsPerBlock;
-            const int blk = c / 32;
-            const int base = row * kGroupedVerifyKVQ8RowBytes + blk * 34;
-            const __half d = *reinterpret_cast<const __half *>(kv_stage + base);
-            __half * out = reinterpret_cast<__half *>(shared_vec + row * kSharedStrideVec) + c;
+    const char * tile_base = KV + int64_t(tile_start)*nb11 + kv_head*nb12 + int64_t(seq)*nb13;
 #pragma unroll
-            for (int i = 0; i < kColsPerBlock; ++i) {
-                const int q_i = int8_t(kv_stage[base + 2 + (c % 32) + i]);
-                out[i] = __float2half_rn(q_i * __half2float(d));
-            }
+    for (int i = 0; i < GroupedVerifyKVRegs<type_KV>::kVecsPerThread; ++i) {
+        const int idx = tid + i * kGroupedVerifyThreads;
+        if (idx >= kVecsPerTile) {
+            continue;
+        }
+        const int row     = idx / kVecsPerRow;
+        const int vec_col = idx % kVecsPerRow;
+        if (tile_start + row < n_kv) {
+            const char * src = tile_base + row*nb11 + vec_col*16;
+            regs.vec[i] = __ldg(reinterpret_cast<const uint4 *>(src));
+        } else {
+            regs.vec[i] = make_uint4(0, 0, 0, 0);
         }
     }
-    __syncthreads();
+}
+
+// fp16 tiles go straight into the half panel, q8_0 tiles into the raw staging buffer.
+template <ggml_type type_KV>
+__device__ __forceinline__ void flash_attn_sm70_grouped_store_kv(
+        __half * shared_kv, uint8_t * kv_stage, const GroupedVerifyKVRegs<type_KV> & regs) {
+    constexpr int kVecsPerRow  = GroupedVerifyKVRegs<type_KV>::kVecsPerRow;
+    constexpr int kVecsPerTile = GroupedVerifyKVRegs<type_KV>::kVecsPerTile;
+    constexpr int kSharedStrideVec = kGroupedVerifyKVStride / 8;
+    const int tid = threadIdx.x;
+#pragma unroll
+    for (int i = 0; i < GroupedVerifyKVRegs<type_KV>::kVecsPerThread; ++i) {
+        const int idx = tid + i * kGroupedVerifyThreads;
+        if (idx >= kVecsPerTile) {
+            continue;
+        }
+        if constexpr (type_KV == GGML_TYPE_F16) {
+            const int row     = idx / kVecsPerRow;
+            const int vec_col = idx % kVecsPerRow;
+            reinterpret_cast<uint4 *>(shared_kv)[row * kSharedStrideVec + vec_col] = regs.vec[i];
+        } else {
+            reinterpret_cast<uint4 *>(kv_stage)[idx] = regs.vec[i];
+        }
+    }
+}
+
+// Dequantize a staged q8_0 tile into the half panel. No-op for fp16, which is stored there directly.
+template <ggml_type type_KV>
+__device__ __forceinline__ void flash_attn_sm70_grouped_dequant_kv(
+        __half * shared_kv, const uint8_t * kv_stage) {
+    if constexpr (type_KV == GGML_TYPE_F16) {
+        return;
+    }
+    constexpr int kColsPerItem = 8;
+    constexpr int kGroupsPerRow = kGroupedVerifyHeadDim / kColsPerItem;
+    constexpr int kSharedStrideVec = kGroupedVerifyKVStride / 8;
+    const int tid = threadIdx.x;
+#pragma unroll
+    for (int idx = tid; idx < kGroupedVerifyBlockN * kGroupsPerRow; idx += kGroupedVerifyThreads) {
+        const int row = idx / kGroupsPerRow;
+        const int c   = (idx % kGroupsPerRow) * kColsPerItem;
+        const int blk = c / 32;
+        const int base = row * kGroupedVerifyKVQ8RowBytes + blk * 34;
+        const __half d = *reinterpret_cast<const __half *>(kv_stage + base);
+        const __half2 d2 = __half2half2(d);
+        // 8 columns = 16 B, and base + 2 + (c % 32) is even, so use u16 loads and one uint4 store.
+        const uint16_t * packed = reinterpret_cast<const uint16_t *>(kv_stage + base + 2 + (c % 32));
+        uint4 out;
+        out.x = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(packed[0], d2));
+        out.y = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(packed[1], d2));
+        out.z = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(packed[2], d2));
+        out.w = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(packed[3], d2));
+        __half * out_ptr = reinterpret_cast<__half *>(shared_kv + row * kGroupedVerifyKVStride) + c;
+        *reinterpret_cast<uint4 *>(out_ptr) = out;
+    }
 }
 
 __device__ __forceinline__ void grouped_verify_qk(
@@ -405,10 +454,36 @@ static __global__ void flash_attn_ext_sm70_grouped(
         ggml_sm70_wmma::fill_fragment(output_fragments[fragment_idx], 0.0f);
     }
 
+    // Tile i+1 is fetched into registers while tile i is computed.
+    GroupedVerifyKVRegs<type_K> k_regs;
+    GroupedVerifyKVRegs<type_V> v_regs;
+    flash_attn_sm70_grouped_prefetch_kv<type_K>(k_regs, K, nb11, nb12, nb13, seq, kv_head, split_start, n_kv);
+
     for (int tile_start = split_start; tile_start < split_end; tile_start += kGroupedVerifyBlockN) {
-        flash_attn_sm70_grouped_load_kv<type_K>(shared_kv, kv_stage, K, nb11, nb12, nb13, seq, kv_head, tile_start, n_kv);
+        // K: q8_0 first fills the staging buffer, fp16 goes straight into the panel.
+        if constexpr (type_K == GGML_TYPE_F16) {
+            __syncthreads(); // the previous PV must be done reading the panel
+            flash_attn_sm70_grouped_store_kv<type_K>(shared_kv, kv_stage, k_regs);
+            __syncthreads();
+        } else {
+            flash_attn_sm70_grouped_store_kv<type_K>(shared_kv, kv_stage, k_regs);
+            __syncthreads();
+            flash_attn_sm70_grouped_dequant_kv<type_K>(shared_kv, kv_stage);
+            __syncthreads();
+        }
+
+        // Hide the next global loads behind QK.
+        flash_attn_sm70_grouped_prefetch_kv<type_V>(v_regs, V, nb21, nb22, nb23, seq, kv_head, tile_start, n_kv);
+        if (tile_start + kGroupedVerifyBlockN < split_end) {
+            flash_attn_sm70_grouped_prefetch_kv<type_K>(
+                k_regs, K, nb11, nb12, nb13, seq, kv_head, tile_start + kGroupedVerifyBlockN, n_kv);
+        }
+
         grouped_verify_qk(shared_q, shared_kv, shared_scores, scale);
-        __syncthreads();
+        __syncthreads(); // scores are ready and QK is done with the panel
+
+        // V: the panel is free once QK is done, the staging buffer once the K dequantize is done.
+        flash_attn_sm70_grouped_store_kv<type_V>(shared_kv, kv_stage, v_regs);
 
 #pragma unroll
         for (int row = warp_id; row < kGroupedVerifyRows; row += kGroupedVerifyWarps) {
@@ -447,14 +522,16 @@ static __global__ void flash_attn_ext_sm70_grouped(
             }
         }
         __syncthreads();
+        if constexpr (type_V == GGML_TYPE_Q8_0) {
+            flash_attn_sm70_grouped_dequant_kv<type_V>(shared_kv, kv_stage);
+        }
 #pragma unroll
         for (int fragment_idx = 0; fragment_idx < kGroupedVerifyOutputTilesPerWarp; ++fragment_idx) {
             const int output_tile = warp_id + fragment_idx * kGroupedVerifyWarps;
             const int m_tile = output_tile / (kGroupedVerifyHeadDim / 16);
             grouped_verify_scale_output_fragment(output_fragments[fragment_idx], smem.row_scale, m_tile * 16);
         }
-
-        flash_attn_sm70_grouped_load_kv<type_V>(shared_kv, kv_stage, V, nb21, nb22, nb23, seq, kv_head, tile_start, n_kv);
+        __syncthreads(); // probs and the V panel are ready for PV
 
 #pragma unroll
         for (int fragment_idx = 0; fragment_idx < kGroupedVerifyOutputTilesPerWarp; ++fragment_idx) {
@@ -479,7 +556,8 @@ static __global__ void flash_attn_ext_sm70_grouped(
                 ggml_sm70_wmma::mma_sync(pv_fragment, probability_fragment, value_fragment, pv_fragment);
             }
         }
-        __syncthreads();
+        // No sync at the loop bottom: the next iteration starts by writing the staging
+        // buffer, which PV does not read, and its own syncthreads() orders the panel.
     }
 
     // The compute buffers are dead. Reuse their storage for the dense FP32 output.
