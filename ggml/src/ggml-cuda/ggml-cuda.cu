@@ -995,6 +995,20 @@ struct ggml_backend_cuda_comm_context {
 };
 
 #ifdef GGML_USE_NCCL
+// FP32 vs BF16 selection for the NCCL reduction, shared by the all-rank and
+// the per-rank entry points so both pick the same path for a given tensor.
+//
+// For small tensors, simply reduce them as FP32.
+// The following heuristic for how "small" a tensor should be is based on RTX 4090s connected via 16x PCIe 4.0.
+// exact skips both the heuristic and the BF16 compression, whose format
+// cannot represent every value (e.g. large token ids).
+static bool ggml_backend_cuda_comm_allreduce_nccl_use_fp32(
+        const ggml_backend_cuda_comm_context * comm_ctx, const struct ggml_tensor * tensor, bool exact) {
+    const int64_t ne         = ggml_nelements(tensor);
+    const size_t  n_backends = comm_ctx->backends.size();
+    return exact || (n_backends <= 2 && ne < 32768) || (n_backends == 3 && ne < 131072) || (n_backends >= 4 && ne < 262144);
+}
+
 // AllReduce via NCCL. Reduces as FP32 for small tensors and BF16 for large
 // tensors (bandwidth-bound), then converts back to FP32. `exact` forces the
 // FP32 path regardless of size.
@@ -1015,11 +1029,7 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
         GGML_ASSERT(ggml_is_contiguously_allocated(tensors[i]));
     }
 
-    // For small tensors, simply reduce them as FP32.
-    // The following heuristic for how "small" a tensor should be is based on RTX 4090s connected via 16x PCIe 4.0.
-    // exact skips both the heuristic and the BF16 compression, whose format
-    // cannot represent every value (e.g. large token ids).
-    if (exact || (n_backends <= 2 && ne < 32768) || (n_backends == 3 && ne < 131072) || (n_backends >= 4 && ne < 262144)) {
+    if (ggml_backend_cuda_comm_allreduce_nccl_use_fp32(comm_ctx, tensors[0], exact)) {
         for (size_t i = 0; i < n_backends; ++i) {
             if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                 ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
@@ -1069,6 +1079,57 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
         to_fp32(tmp[i].get(), (float *) tensors[i]->data, ne, cuda_ctx->stream());
         CUDA_CHECK(cudaGetLastError());
     }
+
+    return true;
+}
+
+// Per-rank variant of the NCCL reduction: enqueues rank's part on rank's
+// stream without ncclGroupStart/End, so every rank can be driven from its own
+// thread. All ranks must still call it for the same sequence of collectives.
+static bool ggml_backend_cuda_comm_allreduce_nccl_rank(
+        ggml_backend_cuda_comm_context * comm_ctx, size_t rank, struct ggml_tensor * tensor, bool exact) {
+    GGML_ASSERT(rank < comm_ctx->backends.size());
+    GGML_ASSERT(tensor != nullptr);
+    GGML_ASSERT(tensor->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguously_allocated(tensor));
+
+    const int64_t ne = ggml_nelements(tensor);
+    // FIXME the input of llm_graph_context::build_in_out_ids can produce a tensor with 0 elements if n_outputs == 0
+    // This then causes a crash in this function
+    if (ne == 0) {
+        return true;
+    }
+
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[rank]->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+
+    if (ggml_backend_cuda_comm_allreduce_nccl_use_fp32(comm_ctx, tensor, exact)) {
+        if ((tensor->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            CUDA_CHECK(cudaMemsetAsync(tensor->data, 0, ggml_nbytes(tensor), cuda_ctx->stream()));
+        }
+        NCCL_CHECK(ncclAllReduce(tensor->data, tensor->data, ne, ncclFloat, ncclSum, comm_ctx->comms[rank], cuda_ctx->stream()));
+        return true;
+    }
+
+    // For large tensors it's faster to compress them to BF16 for the reduction:
+    to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
+    to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
+
+    ggml_cuda_pool_alloc<nv_bfloat16> tmp;
+    tmp.pool = &cuda_ctx->pool();
+    tmp.alloc(ne);
+
+    if (tensor->flags & GGML_TENSOR_FLAG_COMPUTE) {
+        to_bf16(tensor->data, tmp.get(), ne, cuda_ctx->stream());
+    } else {
+        CUDA_CHECK(cudaMemsetAsync(tmp.get(), 0, ne * sizeof(nv_bfloat16), cuda_ctx->stream()));
+    }
+    CUDA_CHECK(cudaGetLastError());
+
+    NCCL_CHECK(ncclAllReduce(tmp.get(), tmp.get(), ne, ncclBfloat16, ncclSum, comm_ctx->comms[rank], cuda_ctx->stream()));
+
+    to_fp32(tmp.get(), (float *) tensor->data, ne, cuda_ctx->stream());
+    CUDA_CHECK(cudaGetLastError());
 
     return true;
 }
@@ -1281,6 +1342,80 @@ static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct gg
 // bitwise (the meta backend's TOP_K/GET_ROWS candidate buffers).
 static bool ggml_backend_cuda_comm_allreduce_tensor_exact(void * comm_ctx_v, struct ggml_tensor ** tensors) {
     return ggml_backend_cuda_comm_allreduce_tensor_impl(comm_ctx_v, tensors, true);
+}
+
+// Per-rank dispatch, for callers that drive every rank from its own thread.
+// Only the push and the NCCL paths can be driven this way; internal and
+// butterfly need cross-rank synchronization. Every rank picks its route from
+// its own tensor (see below), so a collective is admitted only if all ranks
+// agree on the route.
+static bool ggml_backend_cuda_comm_allreduce_rank_can(
+        void * comm_ctx_v, struct ggml_tensor ** tensors, bool exact) {
+    if (comm_ctx_v == nullptr) {
+        return false;
+    }
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    const size_t n = comm_ctx->backends.size();
+
+    size_t n_empty = 0;
+    size_t n_push  = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (tensors[i] == nullptr) {
+            return false;
+        }
+        if (ggml_nelements(tensors[i]) == 0) {
+            // nothing to do, as in the all-rank variants
+            n_empty++;
+        } else if (comm_ctx->ar_push != nullptr && ggml_cuda_ar_push_can(comm_ctx->ar_push, tensors[i], exact)) {
+            n_push++;
+        }
+    }
+    if (n_empty == n || n_push == n) {
+        return true;
+    }
+    if (n_empty != 0 || n_push != 0) {
+        return false;
+    }
+#ifdef GGML_USE_NCCL
+    if (comm_ctx->comms.empty()) {
+        return false;
+    }
+    for (size_t i = 0; i < n; ++i) {
+        if (tensors[i]->type != GGML_TYPE_F32 || !ggml_is_contiguously_allocated(tensors[i]) ||
+            ggml_nelements(tensors[i]) != ggml_nelements(tensors[0])) {
+            return false;
+        }
+    }
+    return true;
+#else
+    GGML_UNUSED(exact);
+    return false;
+#endif // GGML_USE_NCCL
+}
+
+static bool ggml_backend_cuda_comm_allreduce_rank(
+        void * comm_ctx_v, size_t rank, struct ggml_tensor * tensor, bool exact) {
+    GGML_ASSERT(comm_ctx_v != nullptr);
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    GGML_ASSERT(rank < comm_ctx->backends.size());
+
+    if (tensor != nullptr && ggml_nelements(tensor) == 0) {
+        // nothing to do, as in the all-rank variants
+        return true;
+    }
+    if (comm_ctx->ar_push != nullptr && ggml_cuda_ar_push_can(comm_ctx->ar_push, tensor, exact)) {
+        return ggml_cuda_ar_push_allreduce_rank(comm_ctx->ar_push, comm_ctx->backends[rank], rank, tensor, exact);
+    }
+#ifdef GGML_USE_NCCL
+    if (!comm_ctx->comms.empty() && tensor != nullptr && tensor->type == GGML_TYPE_F32 &&
+        ggml_is_contiguously_allocated(tensor)) {
+        return ggml_backend_cuda_comm_allreduce_nccl_rank(comm_ctx, rank, tensor, exact);
+    }
+#endif // GGML_USE_NCCL
+
+    // Calling with a tensor for which the corresponding `can` returned false is a caller error.
+    GGML_ABORT("per-rank AllReduce not supported for this tensor");
+    return false;
 }
 
 // host buffer type
@@ -6098,6 +6233,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor_exact") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor_exact;
+    }
+    if (strcmp(name, "ggml_backend_comm_allreduce_rank_can") == 0) {
+        return (void *)ggml_backend_cuda_comm_allreduce_rank_can;
+    }
+    if (strcmp(name, "ggml_backend_comm_allreduce_rank") == 0) {
+        return (void *)ggml_backend_cuda_comm_allreduce_rank;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;
