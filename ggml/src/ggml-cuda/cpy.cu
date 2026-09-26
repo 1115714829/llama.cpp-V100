@@ -247,6 +247,57 @@ static void ggml_cpy_scalar_cuda(
     }
 }
 
+struct cpy_batch_ptr_pair {
+    const char * src;
+    char * dst;
+};
+
+// kernel arguments for cpy_scalar_batch, all copies share one indexing scheme
+struct cpy_batch_kernel_args {
+    cpy_batch_ptr_pair pairs[CUDA_CPY_BATCH_MAX];
+    int64_t ne;
+    int64_t ne00, ne01, ne02, nb00, nb01, nb02, nb03;
+    int64_t ne10, ne11, ne12, nb10, nb11, nb12, nb13;
+};
+
+template <cpy_kernel_t cpy_1>
+static __global__ void cpy_scalar_batch(const cpy_batch_kernel_args args) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= args.ne) {
+        return;
+    }
+
+    const cpy_batch_ptr_pair pair = args.pairs[blockIdx.y];
+
+    // determine indices i03/i13, i02/i12, i01/i11, i00/i10 as a function of index i of flattened tensor
+    // then combine those indices with the corresponding byte offsets to get the total offsets
+    const int64_t i03 = i/(args.ne00 * args.ne01 * args.ne02);
+    const int64_t i02 = (i - i03*args.ne00*args.ne01*args.ne02 )/ (args.ne00*args.ne01);
+    const int64_t i01 = (i - i03*args.ne00*args.ne01*args.ne02  -  i02*args.ne01*args.ne00) / args.ne00;
+    const int64_t i00 = i - i03*args.ne00*args.ne01*args.ne02 - i02*args.ne01*args.ne00 - i01*args.ne00;
+    const int64_t x_offset = i00*args.nb00 + i01*args.nb01 + i02*args.nb02 + i03 * args.nb03;
+
+    const int64_t i13 = i/(args.ne10 * args.ne11 * args.ne12);
+    const int64_t i12 = (i - i13*args.ne10*args.ne11*args.ne12) / (args.ne10*args.ne11);
+    const int64_t i11 = (i - i13*args.ne10*args.ne11*args.ne12 - i12*args.ne10*args.ne11) / args.ne10;
+    const int64_t i10 = i - i13*args.ne10*args.ne11*args.ne12 - i12*args.ne10*args.ne11 - i11*args.ne10;
+    const int64_t dst_offset = i10*args.nb10 + i11*args.nb11 + i12*args.nb12 + i13 * args.nb13;
+
+    ggml_cuda_pdl_sync();
+    cpy_1(pair.src + x_offset, pair.dst + dst_offset);
+}
+
+template<typename src_t, typename dst_t>
+static void ggml_cpy_scalar_batch_cuda(const cpy_batch_kernel_args & args, const int n, cudaStream_t stream) {
+    const int64_t num_blocks = (args.ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
+    GGML_ASSERT(num_blocks <= INT_MAX);
+    const dim3 dimGrid((unsigned int) num_blocks, (unsigned int) n, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(dimGrid, CUDA_CPY_BLOCK_SIZE, 0, stream);
+    ggml_cuda_kernel_launch(cpy_scalar_batch<cpy_1_scalar<src_t, dst_t>>, launch_params, args);
+}
+
 static void ggml_cpy_f32_q8_0_cuda(
     const char * cx, char * cdst, const int64_t ne,
     const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
@@ -622,4 +673,66 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
 void ggml_cuda_dup(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     ggml_cuda_cpy(ctx, src0, dst);
+}
+
+bool ggml_cuda_cpy_batch(ggml_backend_cuda_context & ctx, const ggml_tensor * const * srcs, ggml_tensor * const * dsts, const int n) {
+    if (n < 2 || n > CUDA_CPY_BATCH_MAX) {
+        return false;
+    }
+
+    // the batch kernel handles only a plain same-type F32 or F16 copy
+    const ggml_type src_type = srcs[0]->type;
+    const ggml_type dst_type = dsts[0]->type;
+    const bool is_f32 = src_type == GGML_TYPE_F32 && dst_type == GGML_TYPE_F32;
+    const bool is_f16 = src_type == GGML_TYPE_F16 && dst_type == GGML_TYPE_F16;
+    if (!is_f32 && !is_f16) {
+        return false;
+    }
+
+    // all copies must share the layout of the first one, the kernel uses one index mapping for the whole batch
+    const int64_t ne = ggml_nelements(srcs[0]);
+    if (ne != ggml_nelements(dsts[0])) {
+        return false;
+    }
+
+    cpy_batch_kernel_args args = {};
+    args.ne   = ne;
+    args.ne00 = srcs[0]->ne[0];
+    args.ne01 = srcs[0]->ne[1];
+    args.ne02 = srcs[0]->ne[2];
+    args.nb00 = srcs[0]->nb[0];
+    args.nb01 = srcs[0]->nb[1];
+    args.nb02 = srcs[0]->nb[2];
+    args.nb03 = srcs[0]->nb[3];
+    args.ne10 = dsts[0]->ne[0];
+    args.ne11 = dsts[0]->ne[1];
+    args.ne12 = dsts[0]->ne[2];
+    args.nb10 = dsts[0]->nb[0];
+    args.nb11 = dsts[0]->nb[1];
+    args.nb12 = dsts[0]->nb[2];
+    args.nb13 = dsts[0]->nb[3];
+
+    for (int k = 0; k < n; ++k) {
+        if (srcs[k]->type != src_type || dsts[k]->type != dst_type ||
+            ggml_nelements(srcs[k]) != ne || ggml_nelements(dsts[k]) != ggml_nelements(dsts[0])) {
+            return false;
+        }
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            if (srcs[k]->ne[d] != srcs[0]->ne[d] || srcs[k]->nb[d] != srcs[0]->nb[d] ||
+                dsts[k]->ne[d] != dsts[0]->ne[d] || dsts[k]->nb[d] != dsts[0]->nb[d]) {
+                return false;
+            }
+        }
+
+        args.pairs[k].src = (const char *) srcs[k]->data;
+        args.pairs[k].dst = (char *) dsts[k]->data;
+    }
+
+    const cudaStream_t stream = ctx.stream();
+    if (is_f32) {
+        ggml_cpy_scalar_batch_cuda<float, float>(args, n, stream);
+    } else {
+        ggml_cpy_scalar_batch_cuda<half, half>(args, n, stream);
+    }
+    return true;
 }

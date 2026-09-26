@@ -3590,12 +3590,96 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// conservative overlap test: ggml_nbytes spans all bytes the tensor may touch
+static bool ggml_cuda_cpy_ranges_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    const uintptr_t a0 = (uintptr_t) a->data;
+    const uintptr_t b0 = (uintptr_t) b->data;
+    return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+}
+
+// batch consecutive same-layout CPY nodes into a single kernel launch, e.g. the per-position
+// writes of the recurrent state snapshots. Scans forward from a CPY, skipping view/noop nodes;
+// any other op stops the batch. Returns the number of nodes to skip, 0 if nothing was fused.
+static int ggml_cuda_try_cpy_batch(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i) {
+    const ggml_tensor * first = cgraph->nodes[i];
+    if (first->op != GGML_OP_CPY || (first->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+        first->src[0]->data == nullptr || first->src[1]->data == nullptr) {
+        return 0;
+    }
+
+    const ggml_tensor * srcs[CUDA_CPY_BATCH_MAX];
+    ggml_tensor *       dsts[CUDA_CPY_BATCH_MAX];
+
+    srcs[0] = first->src[0];
+    dsts[0] = first->src[1];
+    int n    = 1;
+    int last = i;
+
+    for (int j = i + 1; j < cgraph->n_nodes && n < CUDA_CPY_BATCH_MAX; ++j) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(node)) {
+            continue;
+        }
+        if (node->op != GGML_OP_CPY || (node->flags & (GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_COMPUTE)) != GGML_TENSOR_FLAG_COMPUTE) {
+            break;
+        }
+
+        const ggml_tensor * src = node->src[0];
+        ggml_tensor *       dst = node->src[1];
+
+        // all copies must share the type combination, element count and layout of the first one
+        if (src->type != srcs[0]->type || dst->type != dsts[0]->type ||
+            ggml_nelements(src) != ggml_nelements(srcs[0]) || ggml_nelements(dst) != ggml_nelements(dsts[0]) ||
+            src->data == nullptr || dst->data == nullptr) {
+            break;
+        }
+        bool same_layout = true;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            if (src->ne[d] != srcs[0]->ne[d] || src->nb[d] != srcs[0]->nb[d] ||
+                dst->ne[d] != dsts[0]->ne[d] || dst->nb[d] != dsts[0]->nb[d]) {
+                same_layout = false;
+                break;
+            }
+        }
+        if (!same_layout) {
+            break;
+        }
+
+        // the copies run concurrently, so a new dst must not overlap any src or dst of the batch
+        bool conflict = false;
+        for (int k = 0; k < n && !conflict; ++k) {
+            conflict = ggml_cuda_cpy_ranges_overlap(dst, dsts[k]) ||
+                       ggml_cuda_cpy_ranges_overlap(dst, srcs[k]) ||
+                       ggml_cuda_cpy_ranges_overlap(src, dsts[k]);
+        }
+        if (conflict) {
+            break;
+        }
+
+        srcs[n] = src;
+        dsts[n] = dst;
+        ++n;
+        last = j;
+    }
+
+    if (n < 2 || !ggml_cuda_cpy_batch(*cuda_ctx, srcs, dsts, n)) {
+        return 0;
+    }
+
+    return last - i;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     if (disable_fusion) {
         return 0;
+    }
+
+    const int n_cpy_batch = ggml_cuda_try_cpy_batch(cuda_ctx, cgraph, i);
+    if (n_cpy_batch > 0) {
+        return n_cpy_batch;
     }
 
     ggml_tensor * node = cgraph->nodes[i];
