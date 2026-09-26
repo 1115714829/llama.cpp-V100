@@ -157,6 +157,74 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
     }
 }
 
+// d_conv is fixed to 4: the pattern matched by ggml_cuda_try_ssm_conv_rollback_fusion comes from
+// the gated delta net layers, which always use a kernel of size 4
+static constexpr size_t d_conv_fused = 4;
+
+// One thread per channel: rebuilds the [d_conv - 1 + n_tok, C] convolution window from the state
+// row and the qkv projection, writes the rollback snapshots into the state cache and produces the
+// conv output. The accumulate order matches ssm_conv_f32.
+static __global__ void ssm_conv_rollback_fused_f32(const ggml_cuda_ssm_conv_rollback_params p) {
+    ggml_cuda_pdl_lc();
+
+    const int64_t c = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= p.n_channels) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+
+    const float * state_c = p.state + (int64_t) p.row[0] * p.state_stride + c * (d_conv_fused - 1);
+
+    float x[d_conv_fused];
+#pragma unroll
+    for (size_t j = 0; j < d_conv_fused - 1; ++j) {
+        x[j] = state_c[j];
+    }
+
+    // the snapshots are written from the values already in registers, so a snapshot may overwrite
+    // the state row that was just read
+    for (int k = 0; k < p.n_snap; ++k) {
+        float * snap_c = p.snap_dst[k] + c * (d_conv_fused - 1);
+#pragma unroll
+        for (size_t j = 0; j < d_conv_fused - 1; ++j) {
+            const int64_t t = p.snap_off[k] + j - (d_conv_fused - 1);
+            snap_c[j] = t < 0 ? x[p.snap_off[k] + j] : p.qkv[t * p.qkv_nb0 + c * p.qkv_nb1];
+        }
+    }
+
+    float w[d_conv_fused];
+#pragma unroll
+    for (size_t j = 0; j < d_conv_fused; ++j) {
+        w[j] = p.w[c * p.w_nb1 + j];
+    }
+
+    x[d_conv_fused - 1] = p.qkv[c * p.qkv_nb1];
+
+    float * dst_c = p.dst + c;
+    for (int64_t i = 0; i < p.n_tok; ++i) {
+        if (i > 0) {
+            x[(i - 1) % d_conv_fused] = p.qkv[i * p.qkv_nb0 + c * p.qkv_nb1];
+        }
+
+        float sumf = 0.0f;
+#pragma unroll
+        for (size_t j = 0; j < d_conv_fused; ++j) {
+            sumf += x[(i + j) % d_conv_fused] * w[j];
+        }
+        dst_c[i * p.dst_nb1] = ggml_cuda_op_silu_single(sumf);
+    }
+}
+
+void ggml_cuda_op_ssm_conv_rollback_fused(ggml_backend_cuda_context & ctx, const ggml_cuda_ssm_conv_rollback_params & params) {
+    const int    threads = 256;
+    const dim3   blocks((params.n_channels + threads - 1) / threads);
+    cudaStream_t stream = ctx.stream();
+
+    ssm_conv_rollback_fused_f32<<<blocks, threads, 0, stream>>>(params);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node, ggml_tensor * silu_dst) {
     const struct ggml_tensor * src0 = dst->src[0];  // conv_x
     const struct ggml_tensor * src1 = dst->src[1];  // conv1d.weight
