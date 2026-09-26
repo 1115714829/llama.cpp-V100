@@ -413,6 +413,19 @@ static std::string var_to_str(const std::array<T, N> & x) {
     return s;
 }
 
+template<typename T>
+static std::string var_to_str(const std::vector<T> & x) {
+    std::string s = "[";
+    for (size_t i = 0; i < x.size(); i++) {
+        if (i > 0) {
+            s += ",";
+        }
+        s += var_to_str(x[i]);
+    }
+    s += "]";
+    return s;
+}
+
 static std::string var_to_str(ggml_type type) {
     return ggml_type_name(type);
 }
@@ -5188,6 +5201,66 @@ struct test_mul_mat : public test_case {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return ggml_op_name(GGML_OP_MUL_MAT);
+    }
+};
+
+// Multiple Q8_0 matmuls that share one input, run by one multi-weight kernel
+struct test_mul_mat_multi : public test_case {
+    const std::vector<int64_t> ns; // output columns of each matmul, 2 to 4 entries
+    const int64_t m;
+    const int64_t k;
+
+    std::string vars() override {
+        return VARS_TO_STR3(ns, m, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        uint64_t flops = 0;
+        for (int64_t n : ns) {
+            flops += 2 * m * n * k;
+        }
+        return flops;
+    }
+
+    test_mul_mat_multi(std::vector<int64_t> ns, int64_t m, int64_t k)
+        : ns(ns), m(m), k(k) {
+        GGML_ASSERT(ns.size() >= 2 && ns.size() <= 4);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
+        ggml_set_name(x, "x");
+
+        std::vector<ggml_tensor *> outs;
+        outs.reserve(ns.size());
+        for (int64_t n : ns) {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k, n);
+            ggml_set_name(w, "w");
+            outs.push_back(ggml_mul_mat(ctx, w, x));
+        }
+
+        // concat so that every result is compared, not only the last one. Fold from the right
+        // so that the DFS of the output visits the matmuls first and the fusion sees them
+        // adjacent.
+        ggml_tensor * out = outs.back();
+        for (int i = (int) outs.size() - 2; i >= 0; --i) {
+            out = ggml_concat(ctx, outs[i], out, 0);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    // the fusion only happens when the whole graph is evaluated at once
+    bool run_whole_graph() override { return true; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_MULTI";
     }
 };
 
@@ -10252,6 +10325,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             false, 1, 1, false, false, true, false, {1, 1}));
     }
 
+    // multiple Q8_0 matmuls sharing one input: one input conversion and one multi-weight kernel
+    for (int64_t n_tokens : {1, 8, 16}) {
+        test_cases.emplace_back(new test_mul_mat_multi({2560, 1536, 12, 12}, n_tokens, 5120));
+        test_cases.emplace_back(new test_mul_mat_multi({3072, 256, 256}, n_tokens, 5120));
+    }
+
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
     for (int64_t n : {1, 7, 8, 9, 16, 127, 128, 511, 512}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1, n, 2048, {1, 1}, {1, 1}));
@@ -11429,6 +11508,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // the same gate/up pair with the fused SWIGLU (verify width) for a direct comparison
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0, GGML_GLU_OP_SWIGLU, 8, 4352, 5120,
         false, 1, 1, false, false, true, false, {1, 1}));
+
+    // the multi-weight kernel in the GDN (qkv/z/beta/alpha) and full attention (q/k/v) shapes
+    test_cases.emplace_back(new test_mul_mat_multi({2560, 1536, 12, 12}, 8, 5120));
+    test_cases.emplace_back(new test_mul_mat_multi({3072, 256, 256}, 8, 5120));
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

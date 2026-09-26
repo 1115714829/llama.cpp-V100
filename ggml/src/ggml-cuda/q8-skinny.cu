@@ -315,6 +315,255 @@ __global__ void q8_skinny_kernel(
 #endif
 }
 
+// ---- multiple projections of one input in one launch ----
+
+// One segment is a repacked weight (N is a multiple of 32) plus its output tile range.
+// first_tile is the running sum of n / 32 over the previous segments, so a CTA finds its
+// segment from blockIdx.x with a short scan.
+struct q8_skinny_multi_seg {
+    const uint8_t * codes;
+    const half *    scales;
+    int             n;
+    float *         dst;
+    int             first_tile;
+};
+
+// A narrow weight (N is not a multiple of 32, e.g. ssm_beta/ssm_alpha at 12) keeps the
+// standard Q8_0 rows: K/32 blocks of 34 bytes per row, half d first, then 32 int8.
+// One warp computes one row for all M tokens. Like the repacked tiles above, first_row
+// is a running sum of n_rows.
+struct q8_skinny_multi_dot {
+    const uint8_t * rows;
+    int             n_rows;
+    float *         dst;
+    int             first_row;
+};
+
+// Passed by value. The repacked tiles come first in the grid, the dot rows follow.
+struct q8_skinny_multi_params {
+    q8_skinny_multi_seg seg[4];
+    q8_skinny_multi_dot dot[4];
+    int n_seg;
+    int n_dot;
+    int n_main_tiles;
+    int n_dot_rows;
+    const half * input;
+    int k;
+    int m;
+};
+
+// Same execution as q8_skinny_kernel, but each CTA picks its segment from blockIdx.x and
+// writes to that segment's dst with its own row length. The dot CTAs have no split-K.
+template <int SplitK, int NAcc, bool M1Only = false, int RowTiles = 1>
+__global__ void q8_skinny_multi_kernel(const q8_skinny_multi_params p) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    static_assert(RowTiles == 1 || RowTiles == 2,
+                  "Q8 skinny multi supports one or two 8-row tiles");
+    static_assert(!M1Only || RowTiles == 1,
+                  "Q8 skinny multi M=1 specialization uses one row tile");
+    __shared__ float partials[SplitK][M1Only ? 32 : RowTiles * 256];
+
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+
+    if ((int) blockIdx.x >= p.n_main_tiles) {
+        // One narrow row per CTA: all threads split K, so that each warp step reads exactly one
+        // Q8_0 block (a broadcast scale and 32 contiguous quants), then the block reduces in a
+        // fixed order. With one warp per row the K loop was latency bound and these few rows
+        // outlasted all repacked tiles of the launch.
+        const int row_all = (int) blockIdx.x - p.n_main_tiles;
+        int seg = 0;
+        while (seg + 1 < p.n_dot && row_all >= p.dot[seg + 1].first_row) {
+            ++seg;
+        }
+        const int row = row_all - p.dot[seg].first_row;
+        const block_q8_0 * wrow = reinterpret_cast<const block_q8_0 *>(p.dot[seg].rows) + (size_t) row * (p.k / QK8_0);
+
+        float accum[16];
+#pragma unroll
+        for (int t = 0; t < 16; ++t) {
+            accum[t] = 0.0f;
+        }
+#pragma unroll 2
+        for (int i = threadIdx.x; i < p.k; i += blockDim.x) {
+            const block_q8_0 * block = wrow + i / QK8_0;
+            const float weight = __half2float(block->d) * (float) block->qs[i % QK8_0];
+#pragma unroll
+            for (int t = 0; t < 16; ++t) {
+                if (t < p.m) {
+                    accum[t] = fmaf(weight, __half2float(p.input[(size_t) t * p.k + i]), accum[t]);
+                }
+            }
+        }
+
+        // the partials buffer holds at least 16 values per warp (SplitK * 256 >= warps * 16)
+        float * red = &partials[0][0];
+        const int n_warps = blockDim.x >> 5;
+#pragma unroll
+        for (int t = 0; t < 16; ++t) {
+            if (t < p.m) {
+                float v = accum[t];
+#pragma unroll
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    v += __shfl_down_sync(0xffffffffU, v, offset);
+                }
+                if (lane == 0) {
+                    red[warp * 16 + t] = v;
+                }
+            }
+        }
+        __syncthreads();
+        if ((int) threadIdx.x < p.m) {
+            float v = 0.0f;
+            for (int w = 0; w < n_warps; ++w) {
+                v += red[w * 16 + threadIdx.x];
+            }
+            p.dot[seg].dst[(size_t) threadIdx.x * p.dot[seg].n_rows + row] = v;
+        }
+        return;
+    }
+
+    int seg = 0;
+    while (seg + 1 < p.n_seg && (int) blockIdx.x >= p.seg[seg + 1].first_tile) {
+        ++seg;
+    }
+    const int n = p.seg[seg].n;
+    const int k = p.k;
+    const int m = p.m;
+    const int tile = (int) blockIdx.x - p.seg[seg].first_tile;
+    const uint8_t * codes = p.seg[seg].codes;
+    const half * scales = p.seg[seg].scales;
+    const half * input = p.input;
+    float * output = p.seg[seg].dst;
+
+    const int quadpair = (lane >> 2) & 3;
+    const int row = (lane & 3) + ((lane & 16) ? 4 : 0);
+    const int groups_k16 = k >> 4;
+    const int groups_per_warp = groups_k16 / SplitK;
+    const int group_begin = warp * groups_per_warp;
+    const uint4 * code_ptr = reinterpret_cast<const uint4 *>(codes) +
+                             (size_t) tile * groups_k16 * 32 + lane;
+    const half * scale_ptr = scales + tile * 32 + lane;
+
+    float accum[RowTiles][NAcc][8];
+#pragma unroll
+    for (int row_tile = 0; row_tile < RowTiles; ++row_tile) {
+#pragma unroll
+        for (int chain = 0; chain < NAcc; ++chain) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                accum[row_tile][chain][i] = 0.0f;
+            }
+        }
+    }
+    int loaded_scale_group = -1;
+    half loaded_scale = __float2half(0.0f);
+
+#pragma unroll 4
+    for (int group = group_begin; group < group_begin + groups_per_warp; ++group) {
+        const int scale_group = group >> 1;
+        if (scale_group != loaded_scale_group) {
+            loaded_scale = __ldg(scale_ptr + (size_t) scale_group * n);
+            loaded_scale_group = scale_group;
+        }
+
+        const uint4 packed = __ldcs(code_ptr + (size_t) group * 32);
+        half2 weights[8];
+        s8x8_to_half2x4(make_uint2(packed.x, packed.y), weights);
+        s8x8_to_half2x4(make_uint2(packed.z, packed.w), weights + 4);
+
+        const half2 scale2 = __halves2half2(loaded_scale, loaded_scale);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            weights[i] = __hmul2(weights[i], scale2);
+        }
+
+        const unsigned * b = reinterpret_cast<const unsigned *>(weights);
+#pragma unroll
+        for (int row_tile = 0; row_tile < RowTiles; ++row_tile) {
+            uint4 input01 = make_uint4(0, 0, 0, 0);
+            uint4 input23 = make_uint4(0, 0, 0, 0);
+            const int input_row_idx = row_tile * 8 + row;
+            if (input_row_idx < m) {
+                const half * input_row = input + (size_t) input_row_idx * k;
+                input01 = *reinterpret_cast<const uint4 *>(input_row + group * 16);
+                input23 = *reinterpret_cast<const uint4 *>(input_row + group * 16 + 8);
+            }
+
+            const unsigned * a0 = reinterpret_cast<const unsigned *>(&input01);
+            const unsigned * a1 = reinterpret_cast<const unsigned *>(&input23);
+            Q8_SKINNY_MMA_8N8K4(accum[row_tile][0], a0[0], a0[1], b[0], b[1]);
+            Q8_SKINNY_MMA_8N8K4(accum[row_tile][1 % NAcc], a0[2], a0[3], b[2], b[3]);
+            Q8_SKINNY_MMA_8N8K4(accum[row_tile][2 % NAcc], a1[0], a1[1], b[4], b[5]);
+            Q8_SKINNY_MMA_8N8K4(accum[row_tile][3 % NAcc], a1[2], a1[3], b[6], b[7]);
+        }
+    }
+
+#pragma unroll
+    for (int row_tile = 0; row_tile < RowTiles; ++row_tile) {
+#pragma unroll
+        for (int chain = 1; chain < NAcc; ++chain) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                accum[row_tile][0][i] += accum[row_tile][chain][i];
+            }
+        }
+    }
+
+    if constexpr (M1Only) {
+        if ((lane & 17) == 0) {
+#pragma unroll
+            for (int pair = 0; pair < 2; ++pair) {
+#pragma unroll
+                for (int offset = 0; offset < 2; ++offset) {
+                    const int i = pair * 4 + offset;
+                    const int output_col =
+                        offset | (((lane >> 1) & 1) << 1) | (pair << 2);
+                    partials[warp][quadpair * 8 + output_col] = accum[0][0][i];
+                }
+            }
+        }
+    } else {
+#pragma unroll
+        for (int row_tile = 0; row_tile < RowTiles; ++row_tile) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int output_row =
+                    row_tile * 8 + (i & 2) + ((lane & 16) ? 4 : 0) + (lane & 1);
+                const int output_col =
+                    (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+                partials[warp][output_row * 32 + quadpair * 8 + output_col] =
+                    accum[row_tile][0][i];
+            }
+        }
+    }
+    __syncthreads();
+
+    // fixed reduction order over the split-K warps keeps the result reproducible
+    constexpr int kOutputElements = M1Only ? 32 : RowTiles * 256;
+    for (int element = threadIdx.x; element < kOutputElements;
+         element += blockDim.x) {
+        float value = 0.0f;
+#pragma unroll
+        for (int k_warp = 0; k_warp < SplitK; ++k_warp) {
+            value += partials[k_warp][element];
+        }
+        if constexpr (M1Only) {
+            output[tile * 32 + element] = value;
+        } else {
+            const int output_row = element >> 5;
+            const int output_col = element & 31;
+            if (output_row < m) {
+                output[(size_t) output_row * n + tile * 32 + output_col] = value;
+            }
+        }
+    }
+#else
+    NO_DEVICE_CODE;
+    GGML_UNUSED(p);
+#endif
+}
+
 // ---- 1Cat fp8_qpn8_sm70.cu:588-770 (gated pair kernel, adapted) ----
 
 // gate and up are two separate tensors instead of one combined weight: projection p
@@ -508,6 +757,17 @@ static q8_skinny_config q8_skinny_config_for(const int64_t n, const int64_t k) {
     return {q8_skinny_split_k(k), k >= 4096 ? 2 : 1, false};
 }
 
+// The multi-weight kernel never prefetches, so the K=5120/N=4352 special case is not used.
+static q8_skinny_config q8_skinny_multi_config_for(const int64_t k) {
+    if (k == 4352 || k == 1536) {
+        return {16, 1, false};
+    }
+    if (k == 5120) {
+        return {16, 2, false};
+    }
+    return {q8_skinny_split_k(k), k >= 4096 ? 2 : 1, false};
+}
+
 template <int SplitK, int NAcc, bool PrefetchCodes, bool M1Only, int RowTiles>
 static void q8_skinny_launch(const uint8_t * codes, const half * scales, const half * input,
                              float * output, int n, int k, int m, cudaStream_t stream) {
@@ -578,6 +838,37 @@ static void q8_skinny_gated_mul_mat_launch(const uint8_t * gate_codes, const hal
     CUDA_CHECK(cudaGetLastError());
 }
 
+template <int SplitK, int NAcc, bool M1Only, int RowTiles>
+static void q8_skinny_multi_launch(const q8_skinny_multi_params & p, cudaStream_t stream) {
+    // one CTA per narrow row after the repacked tiles
+    const int n_tiles = p.n_main_tiles + p.n_dot_rows;
+    q8_skinny_multi_kernel<SplitK, NAcc, M1Only, RowTiles><<<n_tiles, 32 * SplitK, 0, stream>>>(p);
+}
+
+#define Q8_SKINNY_MULTI_LAUNCH(NAcc, M1Only, RowTiles)                                      \
+    do {                                                                                    \
+        switch (config.split_k) {                                                           \
+            case 16: q8_skinny_multi_launch<16, NAcc, M1Only, RowTiles>(p, stream); break;  \
+            case 8:  q8_skinny_multi_launch<8, NAcc, M1Only, RowTiles>(p, stream); break;   \
+            default: q8_skinny_multi_launch<4, NAcc, M1Only, RowTiles>(p, stream); break;   \
+        }                                                                                   \
+    } while (0)
+
+static void q8_skinny_multi_mul_mat_launch(const q8_skinny_multi_params & p, cudaStream_t stream) {
+    const q8_skinny_config config = q8_skinny_multi_config_for(p.k);
+    GGML_ASSERT(!config.prefetch);
+    if (config.n_acc == 2) {
+        if (p.m == 1) { Q8_SKINNY_MULTI_LAUNCH(2, true, 1); } else if (p.m <= 8) { Q8_SKINNY_MULTI_LAUNCH(2, false, 1); }
+        else { Q8_SKINNY_MULTI_LAUNCH(2, false, 2); }
+    } else {
+        if (p.m == 1) { Q8_SKINNY_MULTI_LAUNCH(1, true, 1); } else if (p.m <= 8) { Q8_SKINNY_MULTI_LAUNCH(1, false, 1); }
+        else { Q8_SKINNY_MULTI_LAUNCH(1, false, 2); }
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+#undef Q8_SKINNY_MULTI_LAUNCH
+
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 bool ggml_cuda_q8_skinny_is_repacked(const ggml_tensor * t) {
@@ -606,8 +897,10 @@ bool ggml_cuda_q8_skinny_can_repack(const ggml_tensor * t) {
     }
     const int64_t k = t->ne[0];
     const int64_t n = t->ne[1];
-    // the small-M kernel needs a split-K that divides the group count
-    return k % 32 == 0 && n % 32 == 0 && n >= 512 && q8_skinny_split_k(k) != 0;
+    // the small-M kernel needs a split-K that divides the group count; the N >= 32 bound only
+    // keeps the tile grid non-empty. Small-N weights (wk/wv at 256, ...) usually run in a
+    // group of projections that share the input, the multi-weight kernel below handles them.
+    return k % 32 == 0 && n % 32 == 0 && n >= 32 && q8_skinny_split_k(k) != 0;
 #endif
 }
 
@@ -782,6 +1075,75 @@ bool ggml_cuda_q8_skinny_mul_mat_gated(ggml_backend_cuda_context & ctx, const gg
     return true;
 }
 
+bool ggml_cuda_q8_skinny_mul_mat_multi(ggml_backend_cuda_context & ctx,
+                                       const ggml_tensor * const src0s[4], ggml_tensor * const dsts[4],
+                                       int n_nodes, const ggml_tensor * src1) {
+    if (n_nodes < 2 || n_nodes > 4) {
+        return false;
+    }
+    const int64_t k = src0s[0]->ne[0];
+    const int64_t m = src1->ne[1];
+    if (src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) ||
+            src1->ne[2] != 1 || src1->ne[3] != 1 || m < 1 || m > 16 ||
+            k % 32 != 0 || q8_skinny_split_k(k) == 0) {
+        return false;
+    }
+
+    q8_skinny_multi_params p = {};
+    p.k = (int) k;
+    p.m = (int) m;
+    for (int i = 0; i < n_nodes; ++i) {
+        const ggml_tensor * w = src0s[i];
+        ggml_tensor * dst = dsts[i];
+        const int64_t n = w->ne[1];
+        if (w->ne[0] != k || w->ne[2] != 1 || w->ne[3] != 1 || !ggml_is_contiguous(w) ||
+                dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
+                dst->ne[0] != n || dst->ne[1] != m || dst->ne[2] != 1 || dst->ne[3] != 1) {
+            return false;
+        }
+        if (ggml_cuda_q8_skinny_is_repacked(w)) {
+            if (p.n_seg >= 4) {
+                return false;
+            }
+            q8_skinny_multi_seg & seg = p.seg[p.n_seg++];
+            seg.codes = (const uint8_t *) w->data;
+            seg.scales = (const half *) (seg.codes + n * k);
+            seg.n = (int) n;
+            seg.dst = (float *) dst->data;
+        } else {
+            // narrow rows keep the row-major Q8_0 layout, the dot path reads them directly
+            if (w->type != GGML_TYPE_Q8_0 || w->view_src != nullptr || w->op != GGML_OP_NONE || n % 32 == 0) {
+                return false;
+            }
+            if (p.n_dot >= 4) {
+                return false;
+            }
+            q8_skinny_multi_dot & dot = p.dot[p.n_dot++];
+            dot.rows = (const uint8_t *) w->data;
+            dot.n_rows = (int) n;
+            dot.dst = (float *) dst->data;
+        }
+    }
+
+    for (int s = 0; s < p.n_seg; ++s) {
+        p.seg[s].first_tile = p.n_main_tiles;
+        p.n_main_tiles += p.seg[s].n / 32;
+    }
+    for (int s = 0; s < p.n_dot; ++s) {
+        p.dot[s].first_row = p.n_dot_rows;
+        p.n_dot_rows += p.dot[s].n_rows;
+    }
+
+    ggml_cuda_pool_alloc<half> input(ctx.pool(), m * k);
+    const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
+    GGML_ASSERT(to_fp16 != nullptr);
+    to_fp16(src1->data, input.get(), m * k, ctx.stream());
+    p.input = input.get();
+
+    q8_skinny_multi_mul_mat_launch(p, ctx.stream());
+    return true;
+}
+
 void ggml_cuda_q8_skinny_to_f16(const ggml_tensor * src0, half * dst, cudaStream_t stream) {
     const int n = (int) src0->ne[1];
     const int k = (int) src0->ne[0];
@@ -821,6 +1183,17 @@ bool ggml_cuda_q8_skinny_mul_mat_gated(ggml_backend_cuda_context & ctx, const gg
     GGML_UNUSED(up_w);
     GGML_UNUSED(src1);
     GGML_UNUSED(dst);
+    return false;
+}
+
+bool ggml_cuda_q8_skinny_mul_mat_multi(ggml_backend_cuda_context & ctx,
+                                       const ggml_tensor * const src0s[4], ggml_tensor * const dsts[4],
+                                       int n_nodes, const ggml_tensor * src1) {
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(src0s);
+    GGML_UNUSED(dsts);
+    GGML_UNUSED(n_nodes);
+    GGML_UNUSED(src1);
     return false;
 }
 
