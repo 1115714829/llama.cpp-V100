@@ -4047,6 +4047,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const ggml_tensor * src1 = up->src[1];
             const ggml_tensor * ids  = up->src[2];
 
+            // q8 skinny gated pair: gate and up in one kernel, GLU written directly
+            if (op == GGML_OP_MUL_MAT && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
+                    gate->src[1] == up->src[1] &&
+                    ggml_cuda_q8_skinny_mul_mat_gated(*cuda_ctx, gate->src[0], up->src[0], src1, glu)) {
+                fused_mul_mat_vec = true;
+                fused_node_count  = 3;
+                break;
+            }
+
+            // the mul_mat_vec fusion kernels cannot read a repacked weight
+            if (ggml_cuda_q8_skinny_is_repacked(gate->src[0]) || ggml_cuda_q8_skinny_is_repacked(up->src[0])) {
+                continue;
+            }
+
             if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate->src[0];
