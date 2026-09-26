@@ -614,6 +614,16 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
     return (int) users.size();
 }
 
+// DFlash drafts decode noise blocks of dflash_block_size tokens per sequence and inject target
+// features with a separate embd-batch graph. DSpark/DSV4 drafts keep the worst-case reserve.
+static bool is_dflash_draft(const llama_model & model, const llama_cparams & cparams) {
+    return model.arch == LLM_ARCH_DFLASH
+        && cparams.ctx_other != nullptr
+        && model.hparams.dflash_block_size > 0
+        && model.dspark_markov_w1 == nullptr
+        && model.hparams.dsv4_hc_mult == 0;
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -629,6 +639,12 @@ void llama_context::sched_reserve() {
 
     const uint32_t n_seqs = cparams.n_seq_max;
     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+
+    // DFlash drafts only run noise blocks of dflash_block_size tokens per sequence; a full n_ubatch
+    // reserve would size the block graph's LM head at n_ubatch columns
+    const bool dflash_draft = is_dflash_draft(model, cparams);
+
+    const uint32_t n_tokens_pp = dflash_draft ? model.hparams.dflash_block_size*n_seqs : n_tokens;
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
 
@@ -669,18 +685,18 @@ void llama_context::sched_reserve() {
     int n_inputs_tg        = -1;
     int n_input_tensors_tg = -1;
 
-    const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
+    const uint32_t n_outputs_pp = std::min(n_tokens_pp, cparams.n_outputs_max);
 
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
+        auto * gf = graph_reserve(n_tokens_pp, n_seqs, n_outputs_pp, mctx.get(),
                 model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
         if (!gf) {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
+                gf = graph_reserve(n_tokens_pp, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
                 throw std::runtime_error("failed to allocate compute pp buffers");
@@ -706,6 +722,14 @@ void llama_context::sched_reserve() {
         n_input_tensors_tg = this->n_input_tensors;
     }
 
+    // reserve the injection graph of DFlash drafts: an embd ubatch of up to n_ubatch target-feature rows
+    if (dflash_draft) {
+        auto * gf = graph_reserve(n_tokens, 1, 1, mctx.get(), model.hparams.no_alloc, nullptr, model.hparams.n_embd_inp_enc());
+        if (!gf) {
+            throw std::runtime_error("failed to allocate compute inject buffers");
+        }
+    }
+
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
     {
         // TODO: the worst case graph is not always reached for `n_seqs > 1`
@@ -717,10 +741,10 @@ void llama_context::sched_reserve() {
                 // [TAG_RESERVE_DIAG_DECAY]
                 // the `inp_diag_decay` tensor size scales with `n_seq_tokens^2` which
                 // makes `n_seqs == 1` use more memory for the compute graph compared to `n_seqs > 1`
-                gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+                gf = graph_reserve(n_tokens_pp, 1,      n_outputs_pp, mctx.get(), model.hparams.no_alloc);
                 break;
             default:
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+                gf = graph_reserve(n_tokens_pp, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
         };
 
         if (!gf) {
@@ -751,7 +775,7 @@ void llama_context::sched_reserve() {
 
         LLAMA_LOG_INFO("%s: graph%s: nodes = %s, splits = %s, input objects = %s, input tensors = %s\n",
                 __func__,
-                diff ? format(" (pp bs=%d, tg bs=%d)", n_tokens, n_seqs).c_str() : "",
+                diff ? format(" (pp bs=%d, tg bs=%d)", n_tokens_pp, n_seqs).c_str() : "",
                 val(n_nodes_pp, n_nodes_tg).c_str(),
                 val(n_splits_pp, n_splits_tg).c_str(),
                 val(n_inputs_pp, n_inputs_tg).c_str(),
@@ -891,11 +915,23 @@ bool llama_context::memory_update(bool optimize) {
         const uint32_t n_seqs = cparams.n_seq_max;
         const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
-        const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
+        // same real-shape reserve as for sched_reserve
+        const bool dflash_draft = is_dflash_draft(model, cparams);
 
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_max, mctx.get());
+        const uint32_t n_tokens_pp = dflash_draft ? model.hparams.dflash_block_size*n_seqs : n_tokens;
+
+        const uint32_t n_outputs_max = std::min(n_tokens_pp, cparams.n_outputs_max);
+
+        auto * gf = graph_reserve(n_tokens_pp, n_seqs, n_outputs_max, mctx.get());
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to reserve graph after the memory update\n", __func__);
+        }
+
+        if (dflash_draft) {
+            gf = graph_reserve(n_tokens, 1, 1, mctx.get(), false, nullptr, model.hparams.n_embd_inp_enc());
+            if (!gf) {
+                LLAMA_LOG_ERROR("%s: failed to reserve inject graph after the memory update\n", __func__);
+            }
         }
     }
 
@@ -2481,7 +2517,7 @@ static void ubatch_prepare_reserve(
 }
 
 ggml_cgraph * llama_context::graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes, uint32_t n_embd) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
 
@@ -2507,7 +2543,7 @@ ggml_cgraph * llama_context::graph_reserve(
     this->n_outputs = n_outputs;
 
     llama_batch_allocr balloc(model.hparams.n_pos_per_embd());
-    llama_ubatch ubatch = balloc.ubatch_reserve(n_tokens/n_seqs, n_seqs);
+    llama_ubatch ubatch = balloc.ubatch_reserve(n_tokens/n_seqs, n_seqs, n_embd);
 
     ubatch_prepare_reserve(ubatch, n_outputs, sampling.samplers, cparams.n_outputs_max_per_seq);
 
