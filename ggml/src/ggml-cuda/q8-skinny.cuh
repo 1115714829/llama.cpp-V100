@@ -25,4 +25,9 @@ void ggml_cuda_q8_skinny_repack_inplace(ggml_backend_cuda_context & ctx, ggml_te
 // Returns true if the small-M kernel handled the multiplication. If it returns false the
 // caller must expand the repacked weights to dense F16 and use the regular path.
 bool ggml_cuda_q8_skinny_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+
+// Fused gate/up projection with a trailing silu(gate) * up, writing to the GLU node dst.
+// Returns false for anything the kernel does not handle, the caller then runs the nodes
+// on the regular path.
+bool ggml_cuda_q8_skinny_mul_mat_gated(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_w, const ggml_tensor * up_w, const ggml_tensor * src1, ggml_tensor * dst);
 void ggml_cuda_q8_skinny_to_f16(const ggml_tensor * src0, half * dst, cudaStream_t stream);
