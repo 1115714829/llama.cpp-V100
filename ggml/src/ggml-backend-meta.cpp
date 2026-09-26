@@ -2067,6 +2067,7 @@ struct ggml_backend_meta_context {
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
+    ggml_backend_comm_allreduce_tensor_t comm_allreduce_exact = nullptr;
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
@@ -2098,6 +2099,11 @@ struct ggml_backend_meta_context {
                 ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
                     ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor");
             GGML_ASSERT(comm_allreduce != nullptr);
+            // Optional: the fallback reduction is exact, so a missing proc
+            // only means that the collectives lose the fast path.
+            comm_allreduce_exact = (ggml_backend_comm_allreduce_tensor_t)
+                ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
+                    ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor_exact");
         }
     }
 
@@ -2891,6 +2897,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         return allreduce_fallback(nodes);
     };
 
+    auto allreduce_exact = [&](std::vector<ggml_tensor *> & nodes) -> ggml_status {
+        if (backend_ctx->comm_ctx != nullptr && backend_ctx->comm_allreduce_exact != nullptr &&
+            backend_ctx->comm_allreduce_exact(backend_ctx->comm_ctx, nodes.data())) {
+            return GGML_STATUS_SUCCESS;
+        }
+        return allreduce_fallback(nodes);
+    };
+
 
     GGML_ASSERT(p != nullptr);
 
@@ -2918,7 +2932,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
             }
             if (n_backends > 1) {
-                const ggml_status status = allreduce(collect.reduce);
+                // These all-reduces gather disjoint contributions, e.g. the TOP_K
+                // candidates with their token ids stored as f32 (as f16, ids above
+                // 65504 would become inf), so they must not take a lossy reduction.
+                const ggml_status status = allreduce_exact(collect.reduce);
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;
                 }
@@ -2932,6 +2949,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
             }
         } else if (n_backends > 1 && i < p->n_subgraphs - 1) {
+            // Ordinary PARTIAL sums can take the lossy fast path.
             const ggml_status status = allreduce(collect.reduce);
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
