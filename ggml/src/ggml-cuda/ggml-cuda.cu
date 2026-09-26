@@ -42,6 +42,7 @@
 #include "ggml-cuda/pad.cuh"
 #include "ggml-cuda/pool2d.cuh"
 #include "ggml-cuda/pool1d.cuh"
+#include "ggml-cuda/q8-skinny.cuh"
 #include "ggml-cuda/quantize.cuh"
 #include "ggml-cuda/rope.cuh"
 #include "ggml-cuda/roll.cuh"
@@ -1794,6 +1795,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
+    if (ggml_cuda_q8_skinny_is_repacked(src0)) {
+        return false;
+    }
+
     const bool is_mul_mat_id = tensor->op == GGML_OP_MUL_MAT_ID;
 
     bool use_mul_mat_vec_f =
@@ -1821,6 +1826,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
+    if (ggml_cuda_q8_skinny_is_repacked(src0)) {
+        return false;
+    }
+
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                    src0->view_src;
@@ -1845,11 +1854,18 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
+static void ggml_cuda_mul_mat_q8_skinny(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && ggml_cuda_op_fwht(ctx, src1, dst)) {
+        return;
+    }
+
+    if (ggml_cuda_q8_skinny_is_repacked(src0)) {
+        ggml_cuda_mul_mat_q8_skinny(ctx, src0, src1, dst);
         return;
     }
 
@@ -1899,6 +1915,30 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+}
+
+static void ggml_cuda_mul_mat_q8_skinny(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (ggml_cuda_q8_skinny_mul_mat(ctx, src0, src1, dst)) {
+        return;
+    }
+
+    // Large M or an unsupported input: expand the repacked weights to dense F16 and run the
+    // regular path on them.
+    const int64_t k = src0->ne[0];
+    const int64_t n = src0->ne[1];
+    ggml_cuda_pool_alloc<half> src0_f16(ctx.pool(), ggml_nelements(src0));
+    ggml_cuda_q8_skinny_to_f16(src0, src0_f16.get(), ctx.stream());
+
+    ggml_tensor src0_tmp = *src0;
+    src0_tmp.type = GGML_TYPE_F16;
+    src0_tmp.data = src0_f16.get();
+    src0_tmp.extra = nullptr;
+    src0_tmp.nb[0] = sizeof(half);
+    src0_tmp.nb[1] = src0_tmp.nb[0] * k;
+    src0_tmp.nb[2] = src0_tmp.nb[1] * n;
+    src0_tmp.nb[3] = src0_tmp.nb[2];
+
+    ggml_cuda_mul_mat(ctx, &src0_tmp, src1, dst);
 }
 
 // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
@@ -2090,6 +2130,21 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+    // A repacked Q8_0 tensor only carries weights for MUL_MAT src0; anything else reading it
+    // would interpret the repacked bytes as Q8_0, so abort loudly instead of computing garbage.
+    if (dst->op != GGML_OP_MUL_MAT || (dst->src[1] != nullptr && ggml_cuda_q8_skinny_is_repacked(dst->src[1]))) {
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            const ggml_tensor * src = dst->src[i];
+            if (src == nullptr) {
+                continue;
+            }
+            if (ggml_cuda_q8_skinny_is_repacked(src) ||
+                (src->view_src != nullptr && ggml_cuda_q8_skinny_is_repacked(src->view_src))) {
+                GGML_ABORT("%s: op %s reads a repacked Q8_0 tensor %s", __func__, ggml_op_name(dst->op), src->name);
+            }
+        }
+    }
+
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
@@ -4468,6 +4523,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    ggml_cuda_q8_skinny_prepass(*cuda_ctx, cgraph);
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
