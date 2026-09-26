@@ -1473,7 +1473,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
-        gf_res_prev_active[slot] = nullptr;
+        if (sched_slot0) {
+            gf_res_prev_active[slot] = nullptr;
+        } else {
+            // both slots share `sched`, so allocating this graph invalidates the other slot's graph
+            gf_res_prev_active = { nullptr, nullptr };
+        }
         res->reset();
 
         ggml_backend_sched_reset(sched_cur);
