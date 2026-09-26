@@ -1467,6 +1467,10 @@ extern "C" {
     /// seed == LLAMA_DEFAULT_SEED to use a random seed.
     LLAMA_API struct llama_sampler * llama_sampler_init_dist(uint32_t seed);
 
+    /// @details Draw a uniform random number in [0, 1) from the dist sampler's RNG.
+    /// Aborts if the sampler is not a dist sampler.
+    LLAMA_API float llama_sampler_dist_draw_u(struct llama_sampler * smpl);
+
     /// @details Top-K sampling described in academic paper "The Curious Case of Neural Text Degeneration" https://arxiv.org/abs/1904.09751
     /// Setting k <= 0 makes this a noop
     LLAMA_API struct llama_sampler * llama_sampler_init_top_k      (int32_t k);

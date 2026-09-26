@@ -1414,6 +1414,19 @@ struct llama_sampler * llama_sampler_init_dist(uint32_t seed) {
     );
 }
 
+float llama_sampler_dist_draw_u(struct llama_sampler * smpl) {
+    GGML_ASSERT(smpl != nullptr);
+
+    if (smpl->iface != &llama_sampler_dist_i) {
+        GGML_ABORT("%s: sampler '%s' is not a dist sampler\n", __func__, llama_sampler_name(smpl));
+    }
+
+    auto * ctx = (llama_sampler_dist *) smpl->ctx;
+
+    // mt19937 has 32-bit output; take the top 24 bits so the result is in [0, 1)
+    return (float) (ctx->rng() >> 8) * (1.0f / 16777216.0f);
+}
+
 void llama_sampler_backend_begin(llama_sampler * sampler) {
     GGML_ASSERT(sampler != nullptr);
 

@@ -88,6 +88,58 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
 
+// sparse distribution over a subset of the vocabulary, probs must sum to 1
+struct common_sampler_sparse_probs {
+    std::vector<llama_token> ids;
+    std::vector<float>       probs;
+};
+
+// proposal candidates of one speculative draft step, q must sum to 1
+struct common_sampler_draft_q {
+    std::vector<llama_token> ids;
+    std::vector<float>       q;
+};
+
+// uniform [0, 1) random number callback
+typedef float (* common_sampler_uniform_fn)(void * data);
+
+// pure rejection sampling core, independent of llama_context:
+//
+// - p_rows:  draft.size() + 1 normalized sparse target distributions, p_rows[i] corresponds to draft[i]
+// - draft:   the sampled draft tokens
+// - draft_q: the proposal distribution of the walk, one per draft token
+//
+// returns the accepted draft tokens followed by one resampled or bonus token
+// (only the resampled token if the first draft token is rejected)
+//
+// exposed for unit tests
+std::vector<llama_token> common_sampler_reject_core(
+        const std::vector<common_sampler_sparse_probs> & p_rows,
+        const llama_tokens & draft,
+        const std::vector<common_sampler_draft_q> & draft_q,
+        common_sampler_uniform_fn uniform,
+        void * uniform_data);
+
+// true if the chain of gsmpl can be replayed exactly on a sparse top-k row:
+// T > 0, no sampler that rewrites the full logits, a top_k with 0 < k <= 64
+// after only no-op samplers, and dist as the last sampler
+bool common_sampler_can_sparse_reject(const struct common_sampler * gsmpl);
+
+// rejection sampling variant of common_sampler_sample_and_accept_n:
+//
+// - reads the top_k logits of every row in idxs, replays the sampler chain on them to get p
+// - accepts draft tokens with probability min(1, p/q), resamples rejects from relu(p - q)
+//   and draws a bonus token from the last row if all draft tokens are accepted
+// - draws all random numbers from the dist sampler of the chain
+//
+// requires: common_sampler_can_sparse_reject(gsmpl) and idxs.size() == draft.size() + 1
+std::vector<llama_token> common_sampler_reject_and_accept_n(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        const std::vector<int> & idxs,
+        const llama_tokens & draft,
+        const std::vector<common_sampler_draft_q> & draft_q);
+
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.

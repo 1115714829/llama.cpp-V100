@@ -714,6 +714,280 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
 }
 
+// rejection sampling
+
+static bool common_sampler_name_is(const char * name, const char * base) {
+    // backend samplers carry a '+' or '-' support prefix
+    if (name[0] == '+' || name[0] == '-') {
+        name++;
+    }
+
+    return strcmp(name, base) == 0;
+}
+
+bool common_sampler_can_sparse_reject(const struct common_sampler * gsmpl) {
+    if (!gsmpl) {
+        return false;
+    }
+
+    const auto & params = gsmpl->params;
+
+    if (params.temp <= 0.0f || params.n_probs != 0 || params.dynatemp_range != 0.0f) {
+        return false;
+    }
+
+    // the rejection path draws from the host dist RNG, which is not used with backend sampling
+    if (params.backend_sampling) {
+        return false;
+    }
+
+    // the sparse rows come from the top_k sampler of the chain
+    if (params.top_k <= 0 || params.top_k > 64) {
+        return false;
+    }
+
+    if (gsmpl->grmr || gsmpl->rbudget) {
+        return false;
+    }
+
+    struct llama_sampler * chain = gsmpl->chain;
+    const int32_t n = llama_sampler_chain_n(chain);
+    if (n < 2 || !common_sampler_name_is(llama_sampler_name(llama_sampler_chain_get(chain, n - 1)), "dist")) {
+        return false;
+    }
+
+    int32_t i_top_k = -1;
+    for (int32_t i = 0; i < n - 1; ++i) {
+        if (common_sampler_name_is(llama_sampler_name(llama_sampler_chain_get(chain, i)), "top-k")) {
+            i_top_k = i;
+            break;
+        }
+    }
+    if (i_top_k < 0) {
+        return false;
+    }
+
+    // before top-k only no-op samplers are allowed
+    for (int32_t i = 0; i < i_top_k; ++i) {
+        if (llama_sampler_name(llama_sampler_chain_get(chain, i))[0] != '?') {
+            return false;
+        }
+    }
+
+    // after top-k only truncation and temperature samplers are allowed; this rejects
+    // penalties, DRY, logit bias, top-n-sigma, typical, XTC, mirostat, infill, etc.
+    for (int32_t i = i_top_k + 1; i < n - 1; ++i) {
+        const char * name = llama_sampler_name(llama_sampler_chain_get(chain, i));
+        if (name[0] == '?') {
+            continue;
+        }
+        if (common_sampler_name_is(name, "top-p") ||
+            common_sampler_name_is(name, "min-p") ||
+            common_sampler_name_is(name, "temp") ||
+            common_sampler_name_is(name, "temp-ext")) {
+            continue;
+        }
+        return false;
+    }
+
+    return true;
+}
+
+static float common_sampler_sparse_get(const std::vector<llama_token> & ids, const std::vector<float> & probs, llama_token id) {
+    for (size_t i = 0; i < ids.size(); ++i) {
+        if (ids[i] == id) {
+            return probs[i];
+        }
+    }
+
+    return 0.0f;
+}
+
+static llama_token common_sampler_sparse_sample(const std::vector<llama_token> & ids, const std::vector<float> & probs, common_sampler_uniform_fn uniform, void * uniform_data) {
+    GGML_ASSERT(ids.size() == probs.size() && !ids.empty());
+
+    float sum = 0.0f;
+    for (size_t i = 0; i < probs.size(); ++i) {
+        sum += probs[i];
+    }
+    GGML_ASSERT(sum > 0.0f);
+
+    const float tgt = uniform(uniform_data) * sum;
+
+    float acc = 0.0f;
+    size_t last_pos = 0;
+    for (size_t i = 0; i < probs.size(); ++i) {
+        acc += probs[i];
+        if (acc > tgt) {
+            return ids[i];
+        }
+        if (probs[i] > 0.0f) {
+            last_pos = i;
+        }
+    }
+
+    return ids[last_pos];
+}
+
+std::vector<llama_token> common_sampler_reject_core(
+        const std::vector<common_sampler_sparse_probs> & p_rows,
+        const llama_tokens & draft,
+        const std::vector<common_sampler_draft_q> & draft_q,
+        common_sampler_uniform_fn uniform,
+        void * uniform_data) {
+    GGML_ASSERT(p_rows.size() == draft.size() + 1 && "p_rows.size() must be draft.size() + 1");
+    GGML_ASSERT(draft_q.size() == draft.size() && "draft_q.size() must be draft.size()");
+
+    std::vector<llama_token> result;
+    result.reserve(draft.size() + 1);
+
+    for (size_t i = 0; i < draft.size(); ++i) {
+        const auto & p = p_rows[i];
+        const auto & q = draft_q[i];
+        const llama_token x = draft[i];
+
+        const float p_x = common_sampler_sparse_get(p.ids, p.probs, x);
+        const float q_x = common_sampler_sparse_get(q.ids, q.q,       x);
+
+        if (q_x > 0.0f && uniform(uniform_data) < std::min(1.0f, p_x / q_x)) {
+            result.push_back(x);
+            continue;
+        }
+
+        // rejected: resample from the normalized relu(p - q); only the p support can have a positive residual
+        std::vector<llama_token> r_ids;
+        std::vector<float>       r_probs;
+        r_ids.reserve(p.ids.size());
+        r_probs.reserve(p.ids.size());
+
+        float z = 0.0f;
+        for (size_t j = 0; j < p.ids.size(); ++j) {
+            const float r = std::max(p.probs[j] - common_sampler_sparse_get(q.ids, q.q, p.ids[j]), 0.0f);
+            r_ids.push_back(p.ids[j]);
+            r_probs.push_back(r);
+            z += r;
+        }
+
+        if (z > 0.0f) {
+            result.push_back(common_sampler_sparse_sample(r_ids, r_probs, uniform, uniform_data));
+        } else {
+            // numerical fallback, should not happen for valid distributions
+            result.push_back(common_sampler_sparse_sample(p.ids, p.probs, uniform, uniform_data));
+        }
+
+        return result;
+    }
+
+    // all draft tokens accepted: bonus token from the last p row
+    const auto & p_last = p_rows.back();
+    result.push_back(common_sampler_sparse_sample(p_last.ids, p_last.probs, uniform, uniform_data));
+
+    return result;
+}
+
+// top-k logits of the idx-th row of ctx, replayed through the sampler chain to get p
+static common_sampler_sparse_probs common_sampler_sparse_p(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        int idx,
+        int32_t k) {
+    const float * logits = llama_get_logits_ith(ctx, idx);
+    GGML_ASSERT(logits != nullptr);
+
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    GGML_ASSERT(k > 0 && k <= n_vocab);
+
+    std::vector<llama_token> ids(n_vocab);
+    for (llama_token i = 0; i < n_vocab; ++i) {
+        ids[i] = i;
+    }
+
+    // top-k with a deterministic tie break (logit desc, id asc)
+    std::partial_sort(ids.begin(), ids.begin() + k, ids.end(), [logits](llama_token a, llama_token b) {
+        if (logits[a] != logits[b]) {
+            return logits[a] > logits[b];
+        }
+        return a < b;
+    });
+    ids.resize(k);
+
+    std::vector<llama_token_data> cur(k);
+    for (int32_t i = 0; i < k; ++i) {
+        cur[i] = llama_token_data{ids[i], logits[ids[i]], 0.0f};
+    }
+
+    llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
+
+    // replay the chain without the final dist sampler
+    struct llama_sampler * chain = gsmpl->chain;
+    const int32_t n = llama_sampler_chain_n(chain);
+    for (int32_t i = 0; i < n - 1; ++i) {
+        llama_sampler_apply(llama_sampler_chain_get(chain, i), &cur_p);
+    }
+    GGML_ASSERT(cur_p.size > 0);
+
+    // softmax; the temperature is already applied by the chain
+    common_sampler_sparse_probs res;
+    res.ids.reserve(cur_p.size);
+    res.probs.reserve(cur_p.size);
+
+    float max_l = -INFINITY;
+    for (size_t i = 0; i < cur_p.size; ++i) {
+        max_l = std::max(max_l, cur_p.data[i].logit);
+    }
+
+    double sum = 0.0;
+    for (size_t i = 0; i < cur_p.size; ++i) {
+        const float p = expf(cur_p.data[i].logit - max_l);
+        res.ids.push_back(cur_p.data[i].id);
+        res.probs.push_back(p);
+        sum += p;
+    }
+    for (size_t i = 0; i < res.probs.size(); ++i) {
+        res.probs[i] = (float) (res.probs[i] / sum);
+    }
+
+    return res;
+}
+
+static float common_sampler_dist_uniform(void * data) {
+    return llama_sampler_dist_draw_u((struct llama_sampler *) data);
+}
+
+std::vector<llama_token> common_sampler_reject_and_accept_n(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        const std::vector<int> & idxs,
+        const llama_tokens & draft,
+        const std::vector<common_sampler_draft_q> & draft_q) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+    GGML_ASSERT(draft_q.size() == draft.size() && "draft_q.size() must be draft.size()");
+    GGML_ASSERT(common_sampler_can_sparse_reject(gsmpl) && "sampler chain does not support sparse rejection");
+
+    llama_synchronize(ctx);
+
+    const int32_t k = gsmpl->params.top_k;
+
+    std::vector<common_sampler_sparse_probs> p_rows;
+    p_rows.reserve(idxs.size());
+    for (size_t i = 0; i < idxs.size(); ++i) {
+        p_rows.push_back(common_sampler_sparse_p(gsmpl, ctx, idxs[i], k));
+    }
+
+    const int32_t n = llama_sampler_chain_n(gsmpl->chain);
+    struct llama_sampler * dist = llama_sampler_chain_get(gsmpl->chain, n - 1);
+
+    std::vector<llama_token> result = common_sampler_reject_core(p_rows, draft, draft_q, common_sampler_dist_uniform, dist);
+
+    for (llama_token id : result) {
+        common_sampler_accept(gsmpl, id, true);
+    }
+
+    return result;
+}
+
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {
     return llama_sampler_get_seed(gsmpl->chain);
 }
