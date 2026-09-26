@@ -385,6 +385,11 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
 
+    // compute the gating right after its projections, so that the q/k normalization directly
+    // precedes the gated delta net and the CUDA backend can fold it into the gdn kernel
+    ggml_build_forward_expand(gf, beta);
+    ggml_build_forward_expand(gf, gate);
+
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
     ggml_tensor * ssm_states_all  = mctx_cur->get_s_l(il);
 

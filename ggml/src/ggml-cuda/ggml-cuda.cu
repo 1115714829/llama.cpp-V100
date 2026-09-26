@@ -3097,6 +3097,136 @@ static int ggml_cuda_try_gdn_cache_fusion(
     return skip;
 }
 
+// the prologue kernel reads these tensors, so they must be produced before the first fused node
+// (otherwise their producers lie inside the range of skipped nodes)
+static bool ggml_cuda_gdn_prologue_input_ready(const ggml_cgraph * cgraph, int node_idx, const ggml_tensor * t) {
+    while (t != nullptr && (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE ||
+                            t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE)) {
+        t = t->view_src;
+    }
+    if (t == nullptr || t->op == GGML_OP_NONE) {
+        return true;
+    }
+    for (int j = 0; j < node_idx; ++j) {
+        if (cgraph->nodes[j] == t) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// match the q/k l2 norm (rms_norm + scale, see build_gdn_l2_norm) directly in front of a
+// gated_delta_net, so that the kernel normalizes the raw q/k and skips 4 nodes. The raw q/k are
+// views of the conv output, which the gdn also reads as v, so they outlive the gdn node.
+// Only the scalar-gate (non-KDA) path is handled.
+static bool ggml_cuda_match_gdn_prologue(
+        const ggml_cgraph * cgraph, int node_idx, ggml_cuda_gdn_prologue & pro, int & gdn_idx) {
+    static const ggml_op ops[5] = {
+        GGML_OP_RMS_NORM, GGML_OP_SCALE, GGML_OP_RMS_NORM, GGML_OP_SCALE, GGML_OP_GATED_DELTA_NET,
+    };
+
+    const ggml_tensor * match[5];
+    int                 match_idx[5];
+    int                 count = 0;
+    for (int j = node_idx; j < cgraph->n_nodes && count < 5; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(n)) {
+            continue;
+        }
+        if (n->op != ops[count] || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return false;
+        }
+        match[count]     = n;
+        match_idx[count] = j;
+        count++;
+    }
+    if (count < 5) {
+        return false;
+    }
+
+    const ggml_tensor * rms_q   = match[0];
+    const ggml_tensor * scale_q = match[1];
+    const ggml_tensor * rms_k   = match[2];
+    const ggml_tensor * scale_k = match[3];
+    const ggml_tensor * gdn     = match[4];
+
+    // the fused nodes feed each other and must have no other users
+    for (int k = 0; k < 4; ++k) {
+        if (match[k]->type != GGML_TYPE_F32 || (match[k]->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            ggml_node_get_use_count(cgraph, match_idx[k]) != 1) {
+            return false;
+        }
+    }
+
+    // the rms norm is fed through a unit-bias scale and has no weight
+    if (scale_q->src[0] != rms_q || scale_k->src[0] != rms_k ||
+        rms_q->src[1] != nullptr || rms_k->src[1] != nullptr ||
+        ggml_get_op_params_f32(scale_q, 1) != 0.0f || ggml_get_op_params_f32(scale_k, 1) != 0.0f) {
+        return false;
+    }
+
+    if (gdn->type != GGML_TYPE_F32 || gdn->src[3]->ne[0] != 1) {
+        return false; // a vector gate means KDA, which is not fused
+    }
+
+    const int64_t S_v = gdn->src[2]->ne[0];
+
+    const ggml_tensor * q_raw = rms_q->src[0];
+    const ggml_tensor * k_raw = rms_k->src[0];
+    if (q_raw == nullptr || k_raw == nullptr ||
+        q_raw->type != GGML_TYPE_F32 || k_raw->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous_rows(q_raw) || !ggml_is_contiguous_rows(k_raw) ||
+        q_raw->ne[0] != S_v || k_raw->ne[0] != S_v ||
+        !ggml_are_same_shape(q_raw, gdn->src[0]) || !ggml_are_same_shape(k_raw, gdn->src[1])) {
+        return false;
+    }
+
+    // q and k reach the gdn directly or through single-use views
+    auto trace_view = [&](const ggml_tensor * t) -> const ggml_tensor * {
+        while (t != nullptr && (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE ||
+                                t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE)) {
+            int t_idx = -1;
+            for (int j = node_idx; j < match_idx[4]; ++j) {
+                if (cgraph->nodes[j] == t) {
+                    t_idx = j;
+                    break;
+                }
+            }
+            if (t_idx < 0 || (t->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                ggml_node_get_use_count(cgraph, t_idx) != 1) {
+                return nullptr;
+            }
+            t = t->view_src;
+        }
+        return t;
+    };
+    if (trace_view(gdn->src[0]) != scale_q || trace_view(gdn->src[1]) != scale_k) {
+        return false;
+    }
+
+    for (const ggml_tensor * t : { q_raw, k_raw }) {
+        if (!ggml_cuda_gdn_prologue_input_ready(cgraph, node_idx, t)) {
+            return false;
+        }
+    }
+
+    pro.q_raw   = (const float *) q_raw->data;
+    pro.k_raw   = (const float *) k_raw->data;
+    pro.sq1     = q_raw->nb[1] / sizeof(float);
+    pro.sq2     = q_raw->nb[2] / sizeof(float);
+    pro.sq3     = q_raw->nb[3] / sizeof(float);
+    pro.sk1     = k_raw->nb[1] / sizeof(float);
+    pro.sk2     = k_raw->nb[2] / sizeof(float);
+    pro.sk3     = k_raw->nb[3] / sizeof(float);
+    pro.eps_q   = ggml_get_op_params_f32(rms_q, 0);
+    pro.scale_q = ggml_get_op_params_f32(scale_q, 0);
+    pro.eps_k   = ggml_get_op_params_f32(rms_k, 0);
+    pro.scale_k = ggml_get_op_params_f32(scale_k, 0);
+
+    gdn_idx = match_idx[4];
+    return true;
+}
+
 static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int node_idx, ggml_cuda_topk_moe_args & args) {
     args.sigmoid         = false;
     args.sqrt_softplus   = false;
@@ -3860,6 +3990,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // gated_delta_net prologue: fold the q/k l2 normalization into the gdn kernel. Tried before
+    // the other rms_norm fusions, which would otherwise eat the first rms_norm of the pattern.
+    if (node->op == GGML_OP_RMS_NORM) {
+        ggml_cuda_gdn_prologue pro{};
+        int                     gdn_idx = 0;
+        if (ggml_cuda_match_gdn_prologue(cgraph, i, pro, gdn_idx) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, gdn_idx - i + 1, &gdn_idx, 1)) {
+            ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
+            const int cache_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, gdn_idx, fused_state_cpy);
+            ggml_cuda_op_gated_delta_net_fused(*cuda_ctx, cgraph->nodes[gdn_idx], pro,
+                cache_skip > 0 ? &fused_state_cpy : nullptr);
+            return gdn_idx - i + (cache_skip > 0 ? cache_skip : 0);
+        }
+    }
 
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;

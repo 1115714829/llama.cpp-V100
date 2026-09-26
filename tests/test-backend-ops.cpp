@@ -4988,6 +4988,97 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     }
 };
 
+// GATED_DELTA_NET + q/k l2 normalization (see ggml_cuda_match_gdn_prologue)
+struct test_gdn_prologue : public test_case {
+    const int64_t head_count_k;
+    const int64_t head_count_v;
+    const int64_t head_size;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+    const int64_t K; // snapshot slot count: 1 = final-only, >1 = last K states
+
+    std::string vars() override {
+        return VARS_TO_STR6(head_count_k, head_count_v, head_size, n_seq_tokens, n_seqs, K);
+    }
+
+    test_gdn_prologue(int64_t head_count_k = 4, int64_t head_count_v = 12, int64_t head_size = 128,
+            int64_t n_seq_tokens = 1, int64_t n_seqs = 1, int64_t K = 1)
+        : head_count_k(head_count_k), head_count_v(head_count_v), head_size(head_size),
+          n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t H_k = head_count_k;
+        const int64_t H_v = head_count_v;
+        const int64_t S_k = head_size;
+        const int64_t S_v = head_size;
+
+        // conv output holding [q | k | v], sliced into q/k/v like qwen35
+        const int64_t qkv_dim = S_k * H_k * 2 + S_v * H_v;
+        ggml_tensor * conv = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, qkv_dim, n_seq_tokens, n_seqs);
+        ggml_set_name(conv, "conv");
+        const size_t nb1_qkv = ggml_row_size(conv->type, qkv_dim);
+
+        ggml_tensor * q = ggml_view_4d(ctx, conv, S_k, H_k, n_seq_tokens, n_seqs,
+                ggml_row_size(conv->type, S_k), nb1_qkv, nb1_qkv * n_seq_tokens, 0);
+        ggml_tensor * k = ggml_view_4d(ctx, conv, S_k, H_k, n_seq_tokens, n_seqs,
+                ggml_row_size(conv->type, S_k), nb1_qkv, nb1_qkv * n_seq_tokens,
+                S_k * H_k * ggml_element_size(conv));
+        ggml_tensor * v = ggml_view_4d(ctx, conv, S_v, H_v, n_seq_tokens, n_seqs,
+                ggml_row_size(conv->type, S_v), nb1_qkv, nb1_qkv * n_seq_tokens,
+                S_k * H_k * 2 * ggml_element_size(conv));
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+
+        // q/k l2 norm as in build_gdn_l2_norm
+        const float eps = 1e-5f;
+        q = ggml_scale(ctx, ggml_rms_norm(ctx, q, eps/S_k), 1.0f/sqrtf((float) S_k));
+        k = ggml_scale(ctx, ggml_rms_norm(ctx, k, eps/S_k), 1.0f/sqrtf((float) S_k));
+
+        // the gating is computed ahead of the normalization in the model graph, here it is an input
+        ggml_tensor * g    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H_v, n_seq_tokens, n_seqs);
+        ggml_tensor * beta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H_v, n_seq_tokens, n_seqs);
+        ggml_set_name(g,    "g");
+        ggml_set_name(beta, "beta");
+
+        ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, S_v, H_v, n_seqs);
+        ggml_set_name(state, "state");
+
+        ggml_tensor * out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
+        ggml_set_name(out, "gdn_out");
+        return out;
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GDN_PROLOGUE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        const uint64_t S_v = head_size;
+        const uint64_t H_v = head_count_v;
+        const uint64_t T   = n_seq_tokens;
+        const uint64_t B   = n_seqs;
+        return (4ull*S_v + 2ull*S_v*S_v) * H_v * T * B;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -2.0f, -0.05f); // log of the decay, negative
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.05f, 0.95f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -11460,6 +11551,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
 
+    // gdn prologue fusion: q/k norm + gating computed in the gdn kernel
+    test_cases.emplace_back(new test_gdn_prologue(4, 12, 128, 1, 1, 1));
+    test_cases.emplace_back(new test_gdn_prologue(4, 12, 128, 1, 1, 8));
+    test_cases.emplace_back(new test_gdn_prologue(4, 12, 128, 8, 1, 1));
+    test_cases.emplace_back(new test_gdn_prologue(4, 12, 128, 8, 1, 8));
+
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
     test_cases.emplace_back(new test_llama(2, true));
@@ -11973,6 +12070,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
+
+    // GDN prologue fusion at the per-device TP4 verify shape
+    test_cases.emplace_back(new test_gdn_prologue(4, 12, 128, 8, 1, 8));
 
     // lightning_indexer
     for (int kv : { 256, 4096, 65536 }) {
