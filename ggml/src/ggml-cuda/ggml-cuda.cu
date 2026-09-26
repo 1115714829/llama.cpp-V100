@@ -2819,6 +2819,33 @@ static bool ggml_cuda_should_fuse_add_rms_norm(const ggml_tensor * add,
     return mul_src->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(mul_src);
 }
 
+// Memory check for the ADD -> RMS_NORM -> MUL fusion. The generic check rejects any overlap of an output
+// with an input, but ggml-alloc usually computes the residual sum in place of the input that dies there.
+// The kernel handles one row per block: the first pass reads a and b and writes the sum at the same
+// element, the second pass (after the block reduction) reads the sum and writes the normalized row. So
+// the sum may alias a or b exactly, and so may the normalized output (a and b are no longer read by
+// then); any other overlap is rejected.
+static bool ggml_cuda_add_rms_norm_ranges_ok(const ggml_tensor * add, const ggml_tensor * mul, const ggml_tensor * weight) {
+    auto overlap = [](const ggml_tensor * x, const ggml_tensor * y) {
+        const uintptr_t x0 = (uintptr_t) x->data;
+        const uintptr_t y0 = (uintptr_t) y->data;
+        return x0 < y0 + ggml_nbytes(y) && y0 < x0 + ggml_nbytes(x);
+    };
+    auto same = [](const ggml_tensor * x, const ggml_tensor * y) {
+        return x->data == y->data && ggml_are_same_shape(x, y) && ggml_are_same_stride(x, y);
+    };
+    const ggml_tensor * a = add->src[0];
+    const ggml_tensor * b = add->src[1];
+    for (const ggml_tensor * out : { add, mul }) {
+        for (const ggml_tensor * in : { a, b }) {
+            if (overlap(out, in) && !same(out, in)) {
+                return false;
+            }
+        }
+    }
+    return !overlap(mul, add) && !overlap(weight, add) && !overlap(weight, mul);
+}
+
 static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm,
                                                     const ggml_tensor * mul,
                                                     const ggml_tensor * rope) {
@@ -4285,8 +4312,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // ADD -> RMS_NORM -> MUL: the residual add feeds the norm, and both results are kept
     if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }, { i, i + 2 }) &&
             ggml_cuda_should_fuse_add_rms_norm(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
-        int out_nodes[] = { i, i + 2 };
-        if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out_nodes, 2)) {
+        const ggml_tensor * mul    = cgraph->nodes[i + 2];
+        const ggml_tensor * weight = mul->src[0] == cgraph->nodes[i + 1] ? mul->src[1] : mul->src[0];
+        if (ggml_cuda_add_rms_norm_ranges_ok(node, mul, weight)) {
             ggml_cuda_op_add_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
             return 2;
         }
