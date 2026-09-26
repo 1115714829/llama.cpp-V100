@@ -3961,6 +3961,76 @@ struct test_add_rms_norm : public test_case {
     }
 };
 
+// GGML_OP_ADD + GGML_OP_RMS_NORM + GGML_OP_MUL (fused residual add -> rms norm -> weight mul)
+struct test_add_rms_norm_mul : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+    const float eps;
+    ggml_tensor * add_result = nullptr;
+    ggml_tensor * mul_result = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ADD_RMS_NORM_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    // both outputs of the fusion are used outside of it, so compare both
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { add_result, mul_result }; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(type, ne, eps);
+    }
+
+    test_add_rms_norm_mul(ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne = {64, 5, 4, 3},
+            float eps = 1e-6f)
+        : type(type), ne(ne), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_tensor * b = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, type, ne[0]);
+
+        ggml_set_param(a);
+        ggml_set_name(a, "a");
+        ggml_set_param(b);
+        ggml_set_name(b, "b");
+        ggml_set_param(w);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * s = ggml_add(ctx, a, b);
+        ggml_set_name(s, "add_result");
+
+        ggml_tensor * m = ggml_mul(ctx, ggml_rms_norm(ctx, s, eps), w);
+        ggml_set_name(m, "mul_result");
+
+        // use the add result outside the fusion, as the residual in a transformer block
+        ggml_tensor * out = ggml_add(ctx, m, s);
+        ggml_set_name(out, "out");
+
+        add_result = s;
+        mul_result = m;
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -10.f, 10.f);
+        }
+    }
+
+    float grad_eps() override {
+        return 1.0f;
+    }
+
+    bool grad_precise() override {
+        return true;
+    }
+};
+
 // GGML_OP_UNARY(RELU) + GGML_OP_SQR (fused operation)
 struct test_relu_sqr : public test_case {
     const ggml_type type;
@@ -9910,6 +9980,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false));
     }
+
+    // residual add -> rms norm -> weight mul, the add result feeds the next residual
+    test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, { 5120,  1, 1, 1 }, 1e-6f));
+    test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, { 5120,  8, 1, 1 }, 1e-6f));
+    test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, { 5120, 16, 1, 1 }, 1e-6f));
+    test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, { 4096,  3, 1, 1 }, 1e-6f));
+
     for (uint32_t n : {64, 1025}) {
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F32, GGML_TYPE_F32, { n, 5, 4, 3 }, false, false));
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F32, GGML_TYPE_F32, { n, 5, 4, 3 }, true, false));
@@ -11399,6 +11476,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {4096, 1, 1, 1}, {1,   1, 1, 1}));
     test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {4096, 1, 1, 1}, {1, 512, 1, 1}));
+    // residual add -> rms norm -> weight mul at the DFlash2 verify width
+    test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, {5120, 8, 1, 1}, 1e-6f));
 
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32,  GGML_TYPE_F16,  {512, 3072, 1, 1}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32,  GGML_TYPE_F32,  {8192, 512, 2, 1}, {-1,-1,-1,-1}, {0, 2, 1, 3}));

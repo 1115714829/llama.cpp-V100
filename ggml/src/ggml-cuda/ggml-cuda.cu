@@ -2780,6 +2780,45 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
     return true;
 }
 
+// match ADD -> RMS_NORM -> MUL, the residual add of a transformer block followed by norm and weight mul
+// the ADD result is kept because later nodes use it as a residual
+static bool ggml_cuda_should_fuse_add_rms_norm(const ggml_tensor * add,
+                                               const ggml_tensor * rms_norm,
+                                               const ggml_tensor * mul) {
+    if (add->op != GGML_OP_ADD || rms_norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL) {
+        return false;
+    }
+
+    if (add->type != GGML_TYPE_F32 || rms_norm->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const ggml_tensor * a = add->src[0];
+    const ggml_tensor * b = add->src[1];
+
+    // no broadcast, the kernel reads contiguous rows of a and b
+    if (a == nullptr || b == nullptr || a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(a, b) || !ggml_is_contiguous_rows(a) || !ggml_is_contiguous_rows(b)) {
+        return false;
+    }
+
+    if (rms_norm->src[0] != add) {
+        return false;
+    }
+
+    // the kernel writes both outputs with the layout of the add result
+    if (!ggml_are_same_shape(add, mul) || !ggml_is_contiguous_rows(add) || !ggml_is_contiguous(mul)) {
+        return false;
+    }
+
+    const ggml_tensor * mul_src = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+    if ((mul->src[0] == rms_norm) == (mul->src[1] == rms_norm)) {
+        return false;
+    }
+
+    return mul_src->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(mul_src);
+}
+
 static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm,
                                                     const ggml_tensor * mul,
                                                     const ggml_tensor * rope) {
@@ -4241,6 +4280,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (fused_mul_mat_vec) {
         return fused_node_count - 1;
+    }
+
+    // ADD -> RMS_NORM -> MUL: the residual add feeds the norm, and both results are kept
+    if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }, { i, i + 2 }) &&
+            ggml_cuda_should_fuse_add_rms_norm(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
+        int out_nodes[] = { i, i + 2 };
+        if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out_nodes, 2)) {
+            ggml_cuda_op_add_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+            return 2;
+        }
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
