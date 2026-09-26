@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cfloat>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -45,6 +46,18 @@ const char * ggml_backend_meta_split_axis_name(enum ggml_backend_meta_split_axis
         default:
             GGML_ABORT("fatal error");
     }
+}
+
+// TOP_K over an AXIS_0 (class-sharded) input: each backend only holds a slice of the classes,
+// the per-shard candidates are merged across backends during graph compute.
+static bool ggml_backend_meta_topk_collective(enum ggml_backend_meta_split_axis src0_axis, enum ggml_type src0_type) {
+    return src0_axis == GGML_BACKEND_SPLIT_AXIS_0 && src0_type == GGML_TYPE_F32;
+}
+
+// GET_ROWS from an AXIS_1 (row-sharded) input with replicated ids: each row is present on one
+// backend only, the rows are collected across backends during graph compute.
+static bool ggml_backend_meta_getrows_collective(enum ggml_backend_meta_split_axis src0_axis, enum ggml_backend_meta_split_axis src1_axis, enum ggml_type type) {
+    return src0_axis == GGML_BACKEND_SPLIT_AXIS_1 && src1_axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && type == GGML_TYPE_F32;
 }
 
 //
@@ -747,6 +760,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return src_ss[0];
         }
+        if (ggml_backend_meta_getrows_collective(src_ss[0].axis, src_ss[1].axis, tensor->type)) {
+            // rows spread across backends, collected during graph compute
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+        }
         return handle_generic(src_ss, /*scalar_only =*/ true);
     };
 
@@ -996,9 +1013,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_TIMESTEP_EMBEDDING: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
-            case GGML_OP_ARGSORT:
-            case GGML_OP_TOP_K: {
+            case GGML_OP_ARGSORT: {
                 split_state = handle_per_row(src_ss);
+            } break;
+            case GGML_OP_TOP_K: {
+                if (ggml_backend_meta_topk_collective(src_ss[0].axis, tensor->src[0]->type)) {
+                    // classes spread across backends, merged during graph compute
+                    split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+                } else {
+                    split_state = handle_per_row(src_ss);
+                }
             } break;
             case GGML_OP_LEAKY_RELU: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
@@ -1680,6 +1704,194 @@ bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf) {
     return buf != nullptr && buf->iface.free_buffer == ggml_backend_meta_buffer_iface.free_buffer;
 }
 
+//
+// cross-shard collectives for ggml_backend_meta_topk_collective / ggml_backend_meta_getrows_collective
+//
+
+// Candidate slot padding, ranks after every real candidate under (value desc, id asc).
+// Ids stay exact in F32 for id < 2^24 so the padding id only has to exceed all real ids.
+static constexpr float GGML_META_COLLECT_PAD_VAL = -FLT_MAX;
+static constexpr float GGML_META_COLLECT_PAD_ID  = 16777215.0f;
+
+enum ggml_backend_meta_collect_kind {
+    GGML_BACKEND_META_COLLECT_ALLREDUCE = 0, // PARTIAL node, summed in place
+    GGML_BACKEND_META_COLLECT_TOPK,          // sharded TOP_K, candidates merged across backends
+    GGML_BACKEND_META_COLLECT_GETROWS,       // sharded GET_ROWS, rows summed across backends
+};
+
+// output that has to land on [dst] at [offset] instead of into the per-backend scratch buffer
+struct ggml_backend_meta_aux_bind {
+    ggml_tensor * tensor;
+    ggml_tensor * dst;
+    size_t        offset;
+};
+
+struct ggml_backend_meta_aux_graph {
+    ggml_cgraph *                                graph = nullptr;
+    std::vector<ggml_backend_meta_aux_bind>      binds;
+};
+
+struct ggml_backend_meta_collect {
+    int                                      kind   = GGML_BACKEND_META_COLLECT_ALLREDUCE;
+    int                                      i_node = -1;
+    std::vector<ggml_backend_meta_aux_graph> local;
+    std::vector<ggml_backend_meta_aux_graph> merge;
+    std::vector<ggml_tensor *>               reduce; // per-backend tensors summed across backends
+};
+
+static bool ggml_backend_meta_node_topk_collective(const struct ggml_tensor * node) {
+    return node->op == GGML_OP_TOP_K && node->src[0] != nullptr && node->src[0]->buffer != nullptr &&
+           ggml_backend_buffer_is_meta(node->src[0]->buffer) &&
+           ggml_backend_meta_topk_collective(ggml_backend_meta_get_split_state(node->src[0], /*assume_sync =*/ true).axis, node->src[0]->type);
+}
+
+static bool ggml_backend_meta_node_getrows_collective(const struct ggml_tensor * node) {
+    return node->op == GGML_OP_GET_ROWS && node->src[0] != nullptr && node->src[1] != nullptr &&
+           node->src[0]->buffer != nullptr && ggml_backend_buffer_is_meta(node->src[0]->buffer) &&
+           node->src[1]->buffer != nullptr && ggml_backend_buffer_is_meta(node->src[1]->buffer) &&
+           ggml_backend_meta_getrows_collective(
+               ggml_backend_meta_get_split_state(node->src[0], /*assume_sync =*/ true).axis,
+               ggml_backend_meta_get_split_state(node->src[1], /*assume_sync =*/ true).axis, node->type);
+}
+
+// Shapes of one collective: [k] rows over [n_cols] trailing columns. TOP_K additionally stores
+// [n_slots] candidate slots of [k] rows in a [n_slots, n_cols, 2] (values, ids) buffer.
+struct ggml_backend_meta_collect_plan {
+    int64_t k;
+    int64_t n_cols;
+    int64_t n_slots;
+    int64_t n_rows; // rows of the split input on this backend
+    int64_t row0;   // first global row of this backend's slice
+};
+
+// copy [tensor] into [view] keeping the strides of [view] (ggml_cpy() resets them)
+static ggml_tensor * ggml_backend_meta_aux_copy(ggml_context * ctx, ggml_tensor * tensor, ggml_tensor * view) {
+    ggml_tensor * result = ggml_view_4d(ctx, view, view->ne[0], view->ne[1], view->ne[2], view->ne[3],
+            view->nb[1], view->nb[2], view->nb[3], 0);
+    result->op     = GGML_OP_CPY;
+    result->src[0] = tensor;
+    result->src[1] = result; // CUDA copies into src[1], self-reference as in ggml_cast()
+    return result;
+}
+
+// Leaf with the shape, strides and data of the main graph tensor [t] but without its sources,
+// so that building the aux graph does not pull in the main graph.
+static ggml_tensor * ggml_backend_meta_aux_input(ggml_context * ctx, ggml_tensor * t, ggml_backend_meta_aux_graph & aux) {
+    ggml_tensor * leaf = ggml_new_tensor(ctx, t->type, GGML_MAX_DIMS, t->ne);
+    std::copy(t->nb, t->nb + GGML_MAX_DIMS, leaf->nb);
+    aux.binds.push_back({leaf, t, 0});
+    return leaf;
+}
+
+// Per-backend local top-k over one vocab shard: zero the candidate buffer, fill (value, global id)
+// into the shard's slot and pad the rest of the slot with markers that rank last.
+static void ggml_backend_meta_build_topk_local(
+        ggml_context * ctx, const ggml_backend_meta_collect_plan & p,
+        ggml_tensor * src, ggml_tensor * cand, int64_t i_slot, ggml_backend_meta_aux_graph & aux) {
+    const int64_t slot_off  = i_slot * p.k;
+    const int64_t k_loc     = std::min(p.k, p.n_rows);
+    const size_t  plane_off = (size_t) p.n_slots * (size_t) p.n_cols * sizeof(float);
+
+    aux.graph = ggml_new_graph_custom(ctx, 64, /*grads =*/ false);
+    src = ggml_backend_meta_aux_input(ctx, src, aux);
+
+    // the candidate buffer still holds the summed result of the previous collective
+    ggml_tensor * zero = ggml_fill(ctx, cand, 0.0f);
+    aux.binds.push_back({zero, cand, 0});
+    ggml_build_forward_expand(aux.graph, zero);
+
+    if (k_loc > 0) {
+        ggml_tensor * loc = ggml_top_k(ctx, ggml_reshape_2d(ctx, src, p.n_rows, p.n_cols), k_loc);
+        ggml_tensor * gids = ggml_backend_meta_aux_copy(ctx,
+                ggml_scale_bias(ctx, ggml_cast(ctx, loc, GGML_TYPE_F32), 1.0f, (float) p.row0),
+                ggml_view_2d(ctx, cand, k_loc, p.n_cols, (size_t) p.n_slots * sizeof(float),
+                    plane_off + (size_t) slot_off * sizeof(float)));
+        ggml_tensor * vals = ggml_backend_meta_aux_copy(ctx,
+                ggml_get_rows(ctx, ggml_reshape_3d(ctx, src, 1, p.n_rows, p.n_cols), ggml_reshape_3d(ctx, loc, k_loc, p.n_cols, 1)),
+                ggml_view_3d(ctx, cand, 1, k_loc, p.n_cols, sizeof(float), (size_t) p.n_slots * sizeof(float),
+                    (size_t) slot_off * sizeof(float)));
+
+        ggml_build_forward_expand(aux.graph, gids);
+        ggml_build_forward_expand(aux.graph, vals);
+    }
+
+    for (int i_plane = 0; i_plane < 2 && k_loc < p.k; i_plane++) {
+        ggml_tensor * tmpl = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, p.k - k_loc, p.n_cols);
+        ggml_tensor * view = ggml_view_3d(ctx, cand, 1, p.k - k_loc, p.n_cols, sizeof(float),
+                (size_t) p.n_slots * sizeof(float),
+                (size_t) i_plane * plane_off + (size_t) (slot_off + k_loc) * sizeof(float));
+        ggml_tensor * pad = ggml_backend_meta_aux_copy(ctx,
+                ggml_fill(ctx, tmpl, i_plane == 0 ? GGML_META_COLLECT_PAD_VAL : GGML_META_COLLECT_PAD_ID), view);
+        ggml_build_forward_expand(aux.graph, pad);
+    }
+}
+
+// Per-backend row gather for one row shard: ids outside the shard map to the zero row that ggml_pad
+// appends, the sum over backends then yields the full result.
+static void ggml_backend_meta_build_getrows_local(
+        ggml_context * ctx, const ggml_backend_meta_collect_plan & p,
+        ggml_tensor * src,         ggml_tensor * ids, ggml_tensor * dst, ggml_backend_meta_aux_graph & aux) {
+    aux.graph = ggml_new_graph_custom(ctx, 64, /*grads =*/ false);
+
+    if (p.n_rows == 0) {
+        ggml_tensor * zero = ggml_fill(ctx, ggml_backend_meta_aux_input(ctx, dst, aux), 0.0f);
+        aux.binds.push_back({zero, dst, 0});
+        ggml_build_forward_expand(aux.graph, zero);
+        return;
+    }
+    src = ggml_backend_meta_aux_input(ctx, src, aux);
+    ids = ggml_backend_meta_aux_input(ctx, ids, aux);
+
+    ggml_tensor * loc = ggml_scale_bias(ctx, ggml_cast(ctx, ids, GGML_TYPE_F32), 1.0f, -(float) p.row0);
+    // in_shard = (loc >= 0) * (loc <= n_rows - 1); out-of-shard ids select the padded zero row
+    ggml_tensor * lo = ggml_clamp(ctx, ggml_scale_bias(ctx, ggml_sgn(ctx, loc), 1.0f, 1.0f), 0.0f, 1.0f);
+    ggml_tensor * hi = ggml_clamp(ctx, ggml_scale_bias(ctx,
+            ggml_sgn(ctx, ggml_scale_bias(ctx, loc, -1.0f, (float) (p.n_rows - 1))), 1.0f, 1.0f), 0.0f, 1.0f);
+    ggml_tensor * in_shard = ggml_mul(ctx, lo, hi);
+    // in_shard ? loc : n_rows
+    ggml_tensor * sel = ggml_clamp(ctx,
+            ggml_add(ctx, ggml_mul(ctx, in_shard, loc), ggml_scale_bias(ctx, in_shard, -(float) p.n_rows, (float) p.n_rows)),
+            0.0f, (float) p.n_rows);
+    ggml_tensor * out = ggml_get_rows(ctx, ggml_pad(ctx, src, 0, 1, 0, 0), ggml_cast(ctx, sel, GGML_TYPE_I32));
+    aux.binds.push_back({out, dst, 0});
+    ggml_build_forward_expand(aux.graph, out);
+}
+
+// Deterministic merge of the gathered candidates into the global top-k. The rank of a candidate is
+// the number of candidates sorted before it under (value desc, id asc), the k smallest ranks are
+// the result. The rank is unique per candidate so the output does not depend on the sort order.
+static void ggml_backend_meta_build_topk_merge(
+        ggml_context * ctx, const ggml_backend_meta_collect_plan & p,
+        ggml_tensor * cand, ggml_tensor * dst, ggml_backend_meta_aux_graph & aux) {
+    const int64_t M = p.n_slots;
+
+    aux.graph = ggml_new_graph_custom(ctx, 64, /*grads =*/ false);
+
+    ggml_tensor * vals = ggml_view_2d(ctx, cand, M, p.n_cols, (size_t) M * sizeof(float), 0);
+    ggml_tensor * gids = ggml_view_2d(ctx, cand, M, p.n_cols, (size_t) M * sizeof(float),
+            (size_t) M * (size_t) p.n_cols * sizeof(float));
+    ggml_tensor * tmpl = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, M, M, p.n_cols);
+
+    // clamp: +/-inf logits must not turn the differences below into NaN
+    ggml_tensor * v = ggml_clamp(ctx, vals, -FLT_MAX, FLT_MAX);
+    ggml_tensor * vq = ggml_repeat(ctx, ggml_reshape_3d(ctx, v, M, 1, p.n_cols), tmpl);          // val[q]
+    ggml_tensor * vp = ggml_repeat(ctx, ggml_reshape_3d(ctx, v, 1, M, p.n_cols), tmpl);          // val[p]
+    ggml_tensor * s  = ggml_sgn(ctx, ggml_sub(ctx, vq, vp));
+    ggml_tensor * gt = ggml_clamp(ctx, s, 0.0f, 1.0f);                                           // val[q] >  val[p]
+    ggml_tensor * eq = ggml_scale_bias(ctx, ggml_mul(ctx, s, s), -1.0f, 1.0f);                  // val[q] == val[p]
+    ggml_tensor * iq = ggml_repeat(ctx, ggml_reshape_3d(ctx, gids, M, 1, p.n_cols), tmpl);       // id[q]
+    ggml_tensor * ip = ggml_repeat(ctx, ggml_reshape_3d(ctx, gids, 1, M, p.n_cols), tmpl);       // id[p]
+    ggml_tensor * lt = ggml_clamp(ctx, ggml_sgn(ctx, ggml_sub(ctx, ip, iq)), 0.0f, 1.0f);        // id[q] < id[p]
+    ggml_tensor * rank = ggml_reshape_2d(ctx,
+            ggml_sum_rows(ctx, ggml_add(ctx, gt, ggml_mul(ctx, eq, lt))), M, p.n_cols);
+    ggml_tensor * perm = ggml_argsort(ctx, rank, GGML_SORT_ORDER_ASC);
+    ggml_tensor * got = ggml_get_rows(ctx, ggml_reshape_3d(ctx, gids, 1, M, p.n_cols),
+            ggml_view_2d(ctx, perm, p.k, p.n_cols, perm->nb[1], 0));
+    ggml_tensor * out = ggml_cast(ctx, got, GGML_TYPE_I32);
+    aux.binds.push_back({out, dst, 0});
+    ggml_build_forward_expand(aux.graph, out);
+}
+
 void ggml_backend_meta_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage) {
     GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
@@ -1791,14 +2003,17 @@ struct ggml_backend_meta_context {
         std::vector<cgraph_config>           cgraphs;
         std::vector<ggml_tensor *>           nodes;
         std::vector<ggml_backend_buffer_ptr> bufs;
+        ggml_backend_buffer_ptr              buf_collect; // scratch for the cross-shard collectives
 
         backend_config(ggml_backend_t backend, const size_t n_reduce_steps) : backend(backend) {
             bufs.resize(n_reduce_steps);
         }
     };
-    std::string                 name;
-    std::vector<backend_config> backend_configs;
-    ggml_context_ptr            ctx;
+    std::string                       name;
+    std::vector<backend_config>       backend_configs;
+    std::vector<ggml_backend_meta_collect> collects;
+    std::vector<ggml_context_ptr>     ctx_collect;
+    ggml_context_ptr                  ctx;
     std::vector<ggml_cgraph *>  cgraphs_aux;
     std::vector<ggml_tensor *>  nodes_aux;
     size_t                      n_reduce_steps;
@@ -2152,6 +2367,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     if (next->view_src != nullptr && next->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(next->view_src->buffer)) {
                         continue;
                     }
+                    if (ggml_backend_meta_node_topk_collective(next) || ggml_backend_meta_node_getrows_collective(next)) {
+                        // collective boundaries have to stay at subgraph ends
+                        return i_delayed;
+                    }
                     if (ggml_backend_meta_get_split_state(next, false).axis != GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
                         continue;
                     }
@@ -2186,6 +2405,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             };
 
             int i_start = 0;
+            backend_ctx->collects.clear();
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer)) {
@@ -2195,12 +2415,19 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
                     max_tmp_size = std::max(max_tmp_size, ggml_nbytes(node));
                 }
-                const bool new_subgraph = i + 1 == cgraph->n_nodes || split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
+                int collect_kind = GGML_BACKEND_META_COLLECT_ALLREDUCE;
+                if (ggml_backend_meta_node_topk_collective(node)) {
+                    collect_kind = GGML_BACKEND_META_COLLECT_TOPK;
+                } else if (ggml_backend_meta_node_getrows_collective(node)) {
+                    collect_kind = GGML_BACKEND_META_COLLECT_GETROWS;
+                }
+                const bool new_subgraph = i + 1 == cgraph->n_nodes || split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL ||
+                                          collect_kind != GGML_BACKEND_META_COLLECT_ALLREDUCE;
                 if (!new_subgraph) {
                     continue;
                 }
 
-                const int i_delayed = get_i_delayed(i);
+                const int i_delayed = collect_kind == GGML_BACKEND_META_COLLECT_ALLREDUCE ? get_i_delayed(i) : i;
 
                 // If we can delay the AllReduce we need to consider the interaction with zero-sized tensor slices.
                 // A backend with such a slice would normally have valid data after participating in the AllReduce with a node that has
@@ -2223,6 +2450,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     auto & bcj = backend_ctx->backend_configs[j];
                     bcj.cgraphs[n_subgraphs].offset = i_start;
                 }
+                backend_ctx->collects.emplace_back();
+                backend_ctx->collects.back().kind   = collect_kind;
+                backend_ctx->collects.back().i_node = i;
                 n_subgraphs++;
                 i_start = i + 1;
             }
@@ -2277,9 +2507,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 ggml_cgraph * cgraph_ij = bcj.cgraphs[i_graph].cgraph_main;
                 const size_t i_node_start = bcj.cgraphs[i_graph].offset;
                 const size_t i_node_stop = i_graph + 1 < n_subgraphs ? bcj.cgraphs[i_graph + 1].offset : cgraph->n_nodes;
-                cgraph_ij->n_nodes = i_node_stop - i_node_start;
+                size_t n_nodes_ij = i_node_stop - i_node_start;
+                if (backend_ctx->collects[i_graph].kind != GGML_BACKEND_META_COLLECT_ALLREDUCE) {
+                    // the boundary node itself is computed by the collective
+                    GGML_ASSERT(backend_ctx->collects[i_graph].i_node == (int) i_node_stop - 1);
+                    n_nodes_ij--;
+                }
+                cgraph_ij->n_nodes = n_nodes_ij;
                 ggml_hash_set_reset(&cgraph_ij->visited_hash_set);
-                for (size_t i_node = i_node_start; i_node < i_node_stop; i_node++) {
+                for (size_t i_node = i_node_start; i_node < i_node_start + n_nodes_ij; i_node++) {
                     ggml_tensor * node_ij = bcj.nodes[i_node];
                     cgraph_ij->nodes[i_node - i_node_start] = node_ij;
                     const size_t hash_pos_orig = ggml_hash_find(&cgraph->visited_hash_set, cgraph->nodes[i_node]);
@@ -2287,6 +2523,123 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     cgraph_ij->use_counts[hash_pos_ij] = cgraph->use_counts[hash_pos_orig];
                 }
                 cgraph_ij->uid = ggml_graph_next_uid();
+            }
+        }
+
+        // Build the auxiliary graphs of the cross-shard collectives and assign their memory.
+        bool any_collective = false;
+        for (const auto & collect : backend_ctx->collects) {
+            any_collective = any_collective || collect.kind != GGML_BACKEND_META_COLLECT_ALLREDUCE;
+        }
+        backend_ctx->ctx_collect.clear();
+        backend_ctx->ctx_collect.resize(n_backends);
+        if (any_collective) {
+            const size_t collect_mem_size = backend_ctx->collects.size() *
+                (64*ggml_tensor_overhead() + 2*ggml_graph_overhead_custom(64, /*grads =*/ false));
+            for (size_t j = 0; j < n_backends; j++) {
+                const ggml_init_params params = {
+                    /*.mem_size   =*/ collect_mem_size,
+                    /*.mem_buffer =*/ nullptr,
+                    /*.no_alloc   =*/ true,
+                };
+                backend_ctx->ctx_collect[j].reset(ggml_init(params));
+            }
+        }
+
+        for (auto & collect : backend_ctx->collects) {
+            collect.local.resize(n_backends);
+            collect.merge.resize(n_backends);
+            collect.reduce.resize(n_backends, nullptr);
+            if (collect.kind == GGML_BACKEND_META_COLLECT_ALLREDUCE) {
+                for (size_t j = 0; j < n_backends; j++) {
+                    collect.reduce[j] = backend_ctx->backend_configs[j].nodes[collect.i_node];
+                }
+                continue;
+            }
+            ggml_tensor * node = cgraph->nodes[collect.i_node];
+            ggml_backend_meta_collect_plan plan = {};
+            plan.k       = collect.kind == GGML_BACKEND_META_COLLECT_TOPK ? node->ne[0] : 0;
+            plan.n_cols  = ggml_nrows(node);
+            plan.n_slots = (int64_t) n_backends * plan.k;
+
+            const ggml_backend_meta_split_state src_ss = ggml_backend_meta_get_split_state(node->src[0], /*assume_sync =*/ true);
+            // one contiguous row range per backend: piecewise segments would need per-row offsets
+            GGML_ASSERT(src_ss.n_segments == 1 && src_ss.nr[0] == 1);
+            GGML_ASSERT(node->src[0]->ne[src_ss.axis] < 0xFFFFFF); // ids must stay exact in F32
+
+            for (size_t j = 0; j < n_backends; j++) {
+                ggml_context * ctx_j = backend_ctx->ctx_collect[j].get();
+                ggml_tensor  * node_j = backend_ctx->backend_configs[j].nodes[collect.i_node];
+                plan.n_rows = src_ss.ne[j];
+                plan.row0   = 0;
+                for (size_t jj = 0; jj < j; jj++) {
+                    plan.row0 += src_ss.ne[jj];
+                }
+                if (collect.kind == GGML_BACKEND_META_COLLECT_TOPK) {
+                    ggml_tensor * cand = ggml_new_tensor_3d(ctx_j, GGML_TYPE_F32, plan.n_slots, plan.n_cols, 2);
+                    // every backend contributes its own slot, so never zero the buffer during the all-reduce
+                    cand->flags |= GGML_TENSOR_FLAG_COMPUTE;
+                    collect.reduce[j] = cand;
+                    ggml_backend_meta_build_topk_local(ctx_j, plan, node_j->src[0], cand, (int64_t) j, collect.local[j]);
+                    ggml_backend_meta_build_topk_merge(ctx_j, plan, cand, node_j, collect.merge[j]);
+                } else {
+                    ggml_backend_meta_build_getrows_local(ctx_j, plan, node_j->src[0], node_j->src[1], node_j, collect.local[j]);
+                    collect.reduce[j] = node_j;
+                }
+            }
+        }
+
+        for (size_t j = 0; j < n_backends; j++) {
+            if (backend_ctx->ctx_collect[j] == nullptr) {
+                continue;
+            }
+            auto &       bcj   = backend_ctx->backend_configs[j];
+            ggml_context * ctx_j = backend_ctx->ctx_collect[j].get();
+
+            std::set<ggml_tensor *> bound;
+            std::vector<ggml_backend_meta_aux_graph *> aux_graphs;
+            for (auto & collect : backend_ctx->collects) {
+                for (ggml_backend_meta_aux_graph * aux : { &collect.local[j], &collect.merge[j] }) {
+                    if (aux->graph == nullptr) {
+                        continue;
+                    }
+                    aux_graphs.push_back(aux);
+                    for (const auto & b : aux->binds) {
+                        bound.insert(b.tensor);
+                    }
+                }
+            }
+
+            size_t needed = 0;
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx_j); t != nullptr; t = ggml_get_next_tensor(ctx_j, t)) {
+                if (t->buffer == nullptr && t->view_src == nullptr) {
+                    needed = (needed + 15) & ~size_t(15);
+                    needed += ggml_nbytes(t);
+                }
+            }
+            if (!bcj.buf_collect || ggml_backend_buffer_get_size(bcj.buf_collect.get()) < needed) {
+                bcj.buf_collect.reset(ggml_backend_alloc_buffer(bcj.backend, needed));
+            }
+
+            size_t offset = 0;
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx_j); t != nullptr; t = ggml_get_next_tensor(ctx_j, t)) {
+                if (t->buffer != nullptr || t->view_src != nullptr || bound.count(t) != 0) {
+                    continue;
+                }
+                offset = (offset + 15) & ~size_t(15);
+                ggml_backend_tensor_alloc(bcj.buf_collect.get(), t, (char *) ggml_backend_buffer_get_base(bcj.buf_collect.get()) + offset);
+                offset += ggml_nbytes(t);
+            }
+            for (ggml_backend_meta_aux_graph * aux : aux_graphs) {
+                for (const auto & b : aux->binds) {
+                    ggml_backend_tensor_alloc(b.dst->buffer, b.tensor, (char *) b.dst->data + b.offset);
+                }
+            }
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx_j); t != nullptr; t = ggml_get_next_tensor(ctx_j, t)) {
+                if (t->buffer == nullptr) {
+                    GGML_ASSERT(t->view_src != nullptr);
+                    ggml_backend_view_init(t);
+                }
             }
         }
     }
@@ -2321,13 +2674,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
     // Preferentially use backend-specific allreduce_tensor_async (e.g. NCCL for CUDA), use a generic fallback if unavailable:
-    auto allreduce_fallback = [&](size_t i) -> ggml_status {
+    auto allreduce_fallback = [&](std::vector<ggml_tensor *> & nodes) -> ggml_status {
         std::vector<ggml_cgraph *> step_cgraphs(n_backends, nullptr);
 
         // Zero out nodes that were disabled due to having a zero-sized slice:
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
-            ggml_tensor * node = bcj.cgraphs[i].cgraph_main->nodes[bcj.cgraphs[i].cgraph_main->n_nodes - 1];
+            ggml_tensor * node = nodes[j];
             if (node->flags & GGML_TENSOR_FLAG_COMPUTE) {
                 continue;
             }
@@ -2354,8 +2707,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             auto & bcj_src = backend_ctx->backend_configs[j_src];
             auto & bcj_dst = backend_ctx->backend_configs[j_dst];
 
-            ggml_tensor * node_src = bcj_src.cgraphs[i].cgraph_main->nodes[bcj_src.cgraphs[i].cgraph_main->n_nodes - 1];
-            ggml_tensor * node_dst = bcj_dst.cgraphs[i].cgraph_main->nodes[bcj_dst.cgraphs[i].cgraph_main->n_nodes - 1];
+            ggml_tensor * node_src = nodes[j_src];
+            ggml_tensor * node_dst = nodes[j_dst];
             GGML_ASSERT(ggml_is_contiguous(node_src));
             GGML_ASSERT(ggml_is_contiguous(node_dst));
 
@@ -2428,42 +2781,61 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             auto & bcj_src = backend_ctx->backend_configs[j - 2*offset_j_max];
             auto & bcj_dst = backend_ctx->backend_configs[j];
 
-            ggml_tensor * node_src = bcj_src.cgraphs[i].cgraph_main->nodes[bcj_src.cgraphs[i].cgraph_main->n_nodes - 1];
-            ggml_tensor * node_dst = bcj_dst.cgraphs[i].cgraph_main->nodes[bcj_dst.cgraphs[i].cgraph_main->n_nodes - 1];
-            ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_dst);
+            ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, nodes[j - 2*offset_j_max], nodes[j]);
         }
 
         return GGML_STATUS_SUCCESS;
+    };
+
+    auto allreduce = [&](std::vector<ggml_tensor *> & nodes) -> ggml_status {
+        if (backend_ctx->comm_ctx != nullptr && backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data())) {
+            return GGML_STATUS_SUCCESS;
+        }
+        return allreduce_fallback(nodes);
     };
 
 
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
+            if (bcj.cgraphs[i].cgraph_main->n_nodes == 0) {
+                continue;
+            }
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
             }
         }
 
-        if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
-            bool backend_allreduce_success = false;
-            if (backend_ctx->comm_ctx) {
-                std::vector<ggml_tensor *> nodes;
-                nodes.reserve(n_backends);
-                for (size_t j = 0; j < n_backends; j++) {
-                    auto & bcj = backend_ctx->backend_configs[j];
-                    ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
-                    nodes.push_back(cgraph_ij->nodes[cgraph_ij->n_nodes-1]);
+        ggml_backend_meta_collect & collect = backend_ctx->collects[i];
+        if (collect.kind != GGML_BACKEND_META_COLLECT_ALLREDUCE) {
+            for (size_t j = 0; j < n_backends; j++) {
+                if (collect.local[j].graph == nullptr) {
+                    continue;
                 }
-                backend_allreduce_success = backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
-            }
-
-            if (!backend_allreduce_success) {
-                const ggml_status status = allreduce_fallback(i);
+                const ggml_status status = ggml_backend_graph_compute_async(backend_ctx->backend_configs[j].backend, collect.local[j].graph);
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;
                 }
+            }
+            if (n_backends > 1) {
+                const ggml_status status = allreduce(collect.reduce);
+                if (status != GGML_STATUS_SUCCESS) {
+                    return status;
+                }
+            }
+            if (collect.kind == GGML_BACKEND_META_COLLECT_TOPK) {
+                for (size_t j = 0; j < n_backends; j++) {
+                    const ggml_status status = ggml_backend_graph_compute_async(backend_ctx->backend_configs[j].backend, collect.merge[j].graph);
+                    if (status != GGML_STATUS_SUCCESS) {
+                        return status;
+                    }
+                }
+            }
+        } else if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
+            const ggml_status status = allreduce(collect.reduce);
+            if (status != GGML_STATUS_SUCCESS) {
+                return status;
             }
         }
     }
