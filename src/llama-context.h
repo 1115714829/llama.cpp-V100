@@ -237,7 +237,7 @@ private:
 
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
     // from backend into host-side embd_layer_inp buffers
-    void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+    void extract_layer_inputs(ggml_backend_sched_t sched, const llm_graph_result * res, size_t token_offset, size_t n_tokens);
 
     //
     // graph
@@ -260,15 +260,24 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
-    llm_graph_result * get_gf_res_prev();
+    llm_graph_result * get_gf_res_prev(int slot);
+
+    // slot of the previous-graph cache for this ubatch
+    int gf_res_slot(const llama_ubatch & ubatch) const;
+
+    // scheduler that holds the graph state of the given slot
+    ggml_backend_sched_t sched_for_slot(int slot) const;
 
     llm_graph_params graph_params(
-                        llm_graph_result * res,
+                     ggml_backend_sched_t sched,
+                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const;
 
-    llm_graph_cb graph_get_cb() const;
+    llm_graph_cb graph_get_cb(ggml_backend_sched_t sched) const;
+
+    ggml_status graph_compute_impl(ggml_backend_sched_t sched, ggml_cgraph * gf, bool batched);
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
@@ -352,6 +361,10 @@ private:
 
     ggml_backend_sched_ptr sched;
 
+    // DFlash drafts keep the embd injection graph on a separate scheduler so that
+    // the alternating inject/block passes do not invalidate each other's graph state
+    ggml_backend_sched_ptr sched_slot0;
+
     bool sched_need_reserve = true;
 
     ggml_backend_t backend_cpu = nullptr;
@@ -373,11 +386,12 @@ private:
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
-    // Separate arenas give batches with and without outputs distinct CUDA graph cache keys.
+    // Separate arenas give batches with different graph layouts distinct CUDA graph cache keys:
+    // by outputs for regular contexts, by input kind (embd/token) for DFlash drafts
     std::array<llm_graph_result_ptr, 2> gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
 
-    llm_graph_result * gf_res_prev_active = nullptr;
+    std::array<llm_graph_result *, 2> gf_res_prev_active = { nullptr, nullptr };
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
