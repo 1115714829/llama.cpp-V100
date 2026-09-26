@@ -253,8 +253,9 @@ public:
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
     // reserve a graph with a dummy ubatch of the specified size
+    // n_embd > 0 reserves the graph of an embd ubatch with that row width (e.g. DFlash feature injection)
     ggml_cgraph * graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr, uint32_t n_embd = 0);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 

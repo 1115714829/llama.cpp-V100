@@ -422,18 +422,19 @@ bool llama_batch_allocr::init(
     return true;
 }
 
-llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t n_seqs) {
+llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t n_seqs, uint32_t n_embd) {
     const uint32_t n_tokens = n_seq_tokens*n_seqs;
 
     clear();
     split_reset();
 
-    const int64_t n_pos_all = (int64_t) n_tokens*n_pos_per_embd;
+    const int64_t n_pos_all  = (int64_t) n_tokens*n_pos_per_embd;
+    const int64_t n_embd_all = (int64_t) n_tokens*n_embd;
 
     auto udata = std::make_shared<llama_ubatch::data_t>();
 
-    udata->token     .resize(n_tokens);
-    udata->embd      .clear();
+    udata->token     .resize(n_embd == 0 ? n_tokens : 0);
+    udata->embd      .resize(n_embd_all);
     udata->pos       .resize(n_pos_all);
     udata->n_seq_id  .resize(n_tokens);
     udata->seq_id    .resize(n_tokens);
@@ -454,8 +455,8 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
         /*.n_seqs_unq   =*/ n_seqs,
         /*.n_pos        =*/ n_pos_per_embd,
 
-        /*.token        =*/ udata->token.data(),
-        /*.embd         =*/ nullptr,
+        /*.token        =*/ n_embd == 0 ? udata->token.data() : nullptr,
+        /*.embd         =*/ n_embd != 0 ? udata->embd.data()  : nullptr,
         /*.pos          =*/ udata->pos.data(),
         /*.n_seq_id     =*/ udata->n_seq_id.data(),
         /*.seq_id       =*/ udata->seq_id.data(),

@@ -165,8 +165,8 @@ public:
     llama_ubatch split_seq(uint32_t n_ubatch);
 
     // a helper method for creating a well-defined ubatch of tokens
-    // TODO: support embeddings if needed in the future
-    llama_ubatch ubatch_reserve(uint32_t n_seq_tokens, uint32_t n_seqs);
+    // n_embd > 0 creates an embd ubatch with that row width (e.g. for graph reserve)
+    llama_ubatch ubatch_reserve(uint32_t n_seq_tokens, uint32_t n_seqs, uint32_t n_embd = 0);
 
 private:
     void clear();
