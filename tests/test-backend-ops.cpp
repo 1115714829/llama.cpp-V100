@@ -3297,6 +3297,105 @@ struct test_cpy_batch : public test_case {
     }
 };
 
+// GET_ROWS + CONCAT + CPY x K + SSM_CONV + SILU, the conv-state rollback window that
+// build_conv_state() emits for gated delta net layers. The CUDA backend fuses the whole sequence
+// into one kernel, so this test checks that the fused output matches the unfused node order.
+// With self_write, the first snapshot overwrites the state row read by GET_ROWS: the fused kernel
+// must load the row before writing the snapshots, just like the node order does on the CPU.
+struct test_ssm_conv_rollback : public test_case {
+    const int64_t C;
+    const int64_t n_tok;
+    const int64_t K;
+    const bool self_write;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_CONV_ROLLBACK";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(C, n_tok, K, self_write);
+    }
+
+    test_ssm_conv_rollback(int64_t C = 64, int64_t n_tok = 8, int64_t K = 1, bool self_write = false)
+        : C(C), n_tok(n_tok), K(K), self_write(self_write) {}
+
+    bool run_whole_graph() override { return true; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            if (t->type == GGML_TYPE_I32) {
+                const int32_t row = 5;
+                ggml_backend_tensor_set(t, &row, 0, sizeof(row));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_rows     = 16;
+        const int64_t row        = 5;
+        const int64_t first_slot = self_write ? row : n_rows - K;
+
+        ggml_tensor * states_all = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3 * C, n_rows);
+        ggml_set_name(states_all, "states_all");
+        ggml_tensor * row_idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_set_name(row_idx, "row_idx");
+        ggml_tensor * qkv = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, n_tok, 1);
+        ggml_set_name(qkv, "qkv");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, C);
+        ggml_set_name(w, "w");
+
+        // build_rs: gather the state row
+        ggml_tensor * state_rows = ggml_get_rows(ctx, ggml_reshape_2d(ctx, states_all, 3 * C, n_rows), row_idx);
+        ggml_set_name(state_rows, "state_rows");
+        ggml_tensor * conv_states = ggml_reshape_3d(ctx, state_rows, 3, C, 1);
+        ggml_set_name(conv_states, "conv_states");
+
+        // build_conv_state: concat the state window with the transposed qkv projection
+        ggml_tensor * conv_input = ggml_concat(ctx, conv_states, ggml_transpose(ctx, qkv), 0);
+        ggml_set_name(conv_input, "conv_input");
+
+        // chain the copies through their dst views so that they stay in the graph in order
+        ggml_tensor * cpy_chain = nullptr;
+        for (int64_t k = 0; k < K; ++k) {
+            const int64_t slot  = first_slot + k;
+            const int64_t s_idx = std::max<int64_t>(0, n_tok - K + k + 1);
+
+            ggml_tensor * src = ggml_view_3d(ctx, conv_input, 3, C, 1,
+                    conv_input->nb[1], conv_input->nb[2], s_idx * sizeof(float));
+            ggml_set_name(src, "snap_src");
+            ggml_tensor * dst = k == 0 ?
+                ggml_view_2d(ctx, states_all, 3 * C, 1, states_all->nb[1], slot * states_all->nb[1]) :
+                ggml_view_2d(ctx, cpy_chain,  3 * C, 1, cpy_chain->nb[1],  states_all->nb[1]);
+            ggml_set_name(dst, "snap_dst");
+
+            cpy_chain = ggml_cpy(ctx, src, dst);
+            ggml_set_name(cpy_chain, "snap_cpy");
+            if (mode == MODE_TEST) {
+                ggml_build_forward_expand(gf, cpy_chain);
+            }
+        }
+
+        ggml_tensor * conv_out = ggml_ssm_conv(ctx, conv_input, w);
+        ggml_set_name(conv_out, "conv_out");
+        ggml_tensor * silu = ggml_silu(ctx, conv_out);
+        ggml_set_name(silu, "silu");
+
+        // cover the conv output and all snapshot rows
+        ggml_tensor * snaps = ggml_reshape_2d(ctx,
+                ggml_view_2d(ctx, states_all, 3 * C, K, states_all->nb[1], first_slot * states_all->nb[1]),
+                3 * C * K, 1);
+        ggml_tensor * out = ggml_concat(ctx, cpy_chain, ggml_concat(ctx, ggml_reshape_2d(ctx, silu, C * n_tok, 1), snaps, 0), 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_CONT
 // permute = {0, 0, 0, 0} means no permutation: the source is transposed (or
 // view-sliced). A non-identity permute applies ggml_permute before ggml_cont.
@@ -10112,6 +10211,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // SSM_CONV_ROLLBACK - conv-state gather + concat + snapshot copies + conv + silu in one kernel
+    for (int64_t C : {64, 2560}) {
+        for (int64_t n_tok : {1, 8}) {
+            for (int64_t K : {1, 8}) {
+                test_cases.emplace_back(new test_ssm_conv_rollback(C, n_tok, K));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_ssm_conv_rollback(2560, 8, 8, true));
+
     // CPY - different src/dst shapes (reshaping via CPY)
     // Use permutations of {3, 5, 7, 32}. Total elements: 3*5*7*32 = 3360.
     // Each src permutation is tested against canonical sorted and reverse dst (skip self).
@@ -11839,6 +11948,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // CPY_BATCH - consecutive same-layout CPYs, one kernel launch instead of one per copy
     test_cases.emplace_back(new test_cpy_batch(2560, 8, 8));
+
+    // SSM_CONV_ROLLBACK - conv-state gather + concat + snapshot copies + conv + silu in one kernel
+    test_cases.emplace_back(new test_ssm_conv_rollback(2560, 8, 8));
 
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {4096, 4096, 5, 1}, false, false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {12888, 256, 5, 1}, false, false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));

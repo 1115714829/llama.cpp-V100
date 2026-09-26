@@ -4158,6 +4158,203 @@ static int ggml_cuda_try_cpy_batch(ggml_backend_cuda_context * cuda_ctx, const g
     return last - i;
 }
 
+// resolve views to the tensor that produced their data
+static const ggml_tensor * ggml_cuda_view_base(const ggml_tensor * t) {
+    while (t->view_src != nullptr) {
+        t = t->view_src;
+    }
+    return t;
+}
+
+// count consumers of `t` among compute nodes at index `from` or later; reads through views count
+// as a use of the view source
+static int ggml_cuda_use_count(const ggml_cgraph * cgraph, const ggml_tensor * t, int from) {
+    int uses = 0;
+    for (int j = from; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(node)) {
+            continue;
+        }
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            if (node->src[k] != nullptr && ggml_cuda_view_base(node->src[k]) == t) {
+                ++uses;
+            }
+        }
+    }
+    return uses;
+}
+
+// match GET_ROWS -> CONCAT -> CPY x K -> SSM_CONV -> SILU, the conv-state rollback window built by
+// build_conv_state() for gated delta net layers, and run it as one fused kernel. The kernel reads
+// the state row and the qkv projection directly, so the gather, the concat and all snapshots can
+// be skipped. Returns the number of nodes to skip, 0 if the pattern does not match.
+static int ggml_cuda_try_ssm_conv_rollback_fusion(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i) {
+    const ggml_tensor * get_rows = cgraph->nodes[i];
+    if (get_rows->op != GGML_OP_GET_ROWS) {
+        return 0;
+    }
+
+    const ggml_tensor * state_rows = get_rows->src[0];
+    const ggml_tensor * row_idx    = get_rows->src[1];
+
+    if (get_rows->type != GGML_TYPE_F32 || (get_rows->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+        state_rows == nullptr || state_rows->type != GGML_TYPE_F32 || state_rows->data == nullptr ||
+        state_rows->nb[0] != sizeof(float) || state_rows->nb[1] % sizeof(float) != 0 ||
+        row_idx == nullptr || row_idx->type != GGML_TYPE_I32 || row_idx->data == nullptr ||
+        ggml_nelements(row_idx) != 1) {
+        return 0;
+    }
+
+    int pos = i + 1;
+
+    // index of the next node that is not a view, empty or a no-op
+    auto next_node = [&]() -> const ggml_tensor * {
+        while (pos < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[pos])) {
+            ++pos;
+        }
+        return pos < cgraph->n_nodes ? cgraph->nodes[pos] : nullptr;
+    };
+
+    const ggml_tensor * concat = next_node();
+    if (concat == nullptr || concat->op != GGML_OP_CONCAT || concat->type != GGML_TYPE_F32 ||
+        (concat->flags & GGML_TENSOR_FLAG_OUTPUT) || concat->data == nullptr ||
+        concat->src[0] == nullptr || ggml_get_op_params_i32(concat, 0) != 0 ||
+        ggml_cuda_view_base(concat->src[0]) != get_rows) {
+        return 0;
+    }
+    ++pos;
+
+    const int64_t C     = concat->ne[1];
+    const int64_t n_tok = concat->ne[0] - 3;
+
+    // the state part of the concat is the gathered row, reshaped to [3, C, 1]
+    const ggml_tensor * state_window = concat->src[0];
+    if (state_window->ne[0] != 3 || state_window->ne[1] != C || state_window->ne[2] != 1 ||
+        state_window->ne[3] != 1 || !ggml_is_contiguous(state_window) ||
+        state_window->data != get_rows->data) {
+        return 0;
+    }
+
+    // src1 is the transposed qkv projection; n_tok is kept small so the fused kernel does not
+    // replace the long-token kernel for large batches
+    const ggml_tensor * qkv = concat->src[1];
+    if (qkv == nullptr || qkv->op != GGML_OP_TRANSPOSE || qkv->type != GGML_TYPE_F32 ||
+        qkv->data == nullptr || qkv->ne[0] != n_tok || qkv->ne[1] != C || qkv->ne[2] != 1 ||
+        qkv->ne[3] != 1 || n_tok < 1 || n_tok > 32 ||
+        qkv->nb[0] != C * sizeof(float) || qkv->nb[1] != sizeof(float)) {
+        return 0;
+    }
+
+    const ggml_tensor * state_base = ggml_cuda_view_base(state_rows);
+    if (state_rows->ne[0] != 3 * C || state_rows->nb[1] < 3 * sizeof(float) ||
+        state_rows->nb[1] % (3 * sizeof(float)) != 0 || ggml_cuda_view_base(qkv) == state_base ||
+        ((const char *) state_rows->data - (const char *) state_base->data) % state_rows->nb[1] != 0) {
+        return 0;
+    }
+
+    const float * concat_d = (const float *) concat->data;
+
+    ggml_cuda_ssm_conv_rollback_params params = {};
+    params.state        = (const float *) state_rows->data;
+    params.state_stride = state_rows->nb[1] / sizeof(float);
+    params.row          = (const int32_t *) row_idx->data;
+    params.qkv          = (const float *) qkv->data;
+    params.qkv_nb0      = qkv->nb[0] / sizeof(float);
+    params.qkv_nb1      = qkv->nb[1] / sizeof(float);
+    params.n_tok        = n_tok;
+
+    // the snapshot copies between the concat and the conv
+    const ggml_tensor * snap_dsts[16];
+    while (params.n_snap < (int) (sizeof(params.snap_off) / sizeof(params.snap_off[0]))) {
+        const ggml_tensor * cpy = next_node();
+        if (cpy == nullptr || cpy->op != GGML_OP_CPY) {
+            break;
+        }
+
+        const ggml_tensor * src = cpy->src[0];
+        const ggml_tensor * dst = cpy->src[1];
+
+        if (cpy->type != GGML_TYPE_F32 || (cpy->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            src == nullptr || dst == nullptr || src->view_src == nullptr || dst->view_src == nullptr ||
+            ggml_cuda_view_base(src) != concat || src->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+            src->ne[0] != 3 || src->ne[1] != C || src->ne[2] != 1 || src->ne[3] != 1 ||
+            src->nb[0] != sizeof(float) || src->nb[1] != concat->nb[1] ||
+            ggml_nelements(dst) != 3 * C || !ggml_is_contiguous(dst) ||
+            src->data == nullptr || dst->data == nullptr ||
+            ggml_cuda_view_base(dst) != state_base ||
+            ((const char *) dst->data - (const char *) state_base->data) % state_rows->nb[1] != 0) {
+            return 0;
+        }
+
+        // offset of the window inside the concat output
+        const int64_t off = (const float *) src->data - concat_d;
+        if (off < 0 || off > n_tok) {
+            return 0;
+        }
+
+        params.snap_off[params.n_snap] = off;
+        params.snap_dst[params.n_snap] = (float *) dst->data;
+        snap_dsts[params.n_snap]       = dst;
+        params.n_snap++;
+        ++pos;
+    }
+
+    if (params.n_snap == 0) {
+        return 0;
+    }
+
+    // the kernel writes all snapshots concurrently, overlapping ranges would be unordered
+    for (int k = 0; k < params.n_snap; ++k) {
+        for (int l = k + 1; l < params.n_snap; ++l) {
+            if (ggml_cuda_cpy_ranges_overlap(snap_dsts[k], snap_dsts[l])) {
+                return 0;
+            }
+        }
+    }
+
+    const ggml_tensor * conv = next_node();
+    if (conv == nullptr || conv->op != GGML_OP_SSM_CONV || (conv->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+        conv->src[0] == nullptr || ggml_cuda_view_base(conv->src[0]) != concat || conv->src[1] == nullptr ||
+        conv->src[1]->type != GGML_TYPE_F32 || conv->src[1]->data == nullptr ||
+        conv->src[1]->ne[0] != 4 || conv->src[1]->ne[1] != C || conv->src[1]->nb[0] != sizeof(float) ||
+        conv->src[1]->nb[1] % sizeof(float) != 0) {
+        return 0;
+    }
+    ++pos;
+
+    const ggml_tensor * silu = next_node();
+    if (silu == nullptr || silu->op != GGML_OP_UNARY || ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU ||
+        silu->type != GGML_TYPE_F32 || silu->src[0] != conv || silu->data == nullptr ||
+        silu->ne[0] != C || silu->ne[1] != n_tok || silu->ne[2] != 1 ||
+        silu->nb[0] != sizeof(float) || silu->nb[1] % sizeof(float) != 0 || !ggml_is_contiguous(silu)) {
+        return 0;
+    }
+
+    // the skipped outputs must not be consumed anywhere else
+    if (ggml_cuda_use_count(cgraph, get_rows, i + 1) != 1 ||
+        ggml_cuda_use_count(cgraph, concat,   i + 1) != params.n_snap + 1 ||
+        ggml_cuda_use_count(cgraph, conv,     i + 1) != 1) {
+        return 0;
+    }
+
+    // the kernel writes the silu output at the position of the get_rows node, so it must not
+    // partially overlap the qkv projection it reads; a full overlap is safe because the kernel
+    // reads each value before writing it
+    if (silu->data != qkv->data && ggml_cuda_cpy_ranges_overlap(silu, qkv)) {
+        return 0;
+    }
+
+    params.w          = (const float *) conv->src[1]->data;
+    params.w_nb1      = conv->src[1]->nb[1] / sizeof(float);
+    params.dst        = (float *) silu->data;
+    params.dst_nb1    = silu->nb[1] / sizeof(float);
+    params.n_channels = C;
+
+    ggml_cuda_op_ssm_conv_rollback_fused(*cuda_ctx, params);
+
+    return pos - i;
+}
+
 // Collects up to four MUL_MAT nodes starting at node_idx that share one src1 and read only
 // weights the q8 skinny multi-weight kernel can handle: repacked weights, or narrow row-major
 // Q8_0 weights (N is not a multiple of 32) that the kernel dot path reads directly.
@@ -4206,6 +4403,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     if (disable_fusion) {
         return 0;
+    }
+
+    const int n_conv_rollback = ggml_cuda_try_ssm_conv_rollback_fusion(cuda_ctx, cgraph, i);
+    if (n_conv_rollback > 0) {
+        return n_conv_rollback;
     }
 
     const int n_cpy_batch = ggml_cuda_try_cpy_batch(cuda_ctx, cgraph, i);
