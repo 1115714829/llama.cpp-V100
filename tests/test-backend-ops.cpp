@@ -10102,6 +10102,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
 
+    // Q8_0 skinny GEMM (repacked QPN8 layout, sm_70) on the DFlash2 verify shapes. M <= 16 uses
+    // the new kernel, M = 17/32 the dequant fallback; N = 256 is too small and stays on the old path.
+    const std::vector<std::pair<int64_t, int64_t>> q8_0_skinny_shapes = {
+        { 4352, 5120}, { 5120, 4352}, { 2560, 5120}, { 1536, 5120}, { 5120, 1536}, { 3072, 5120}, {62080, 5120},
+    };
+    for (const auto & [n_out, k_red] : q8_0_skinny_shapes) {
+        for (int64_t n_tokens : {1, 2, 4, 7, 8, 9, 16, 17, 32}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, n_out, n_tokens, k_red, {1, 1}, {1, 1}));
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, 5120, {1, 1}, {1, 1}));
+
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
     for (int64_t n : {1, 7, 8, 9, 16, 127, 128, 511, 512}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1, n, 2048, {1, 1}, {1, 1}));
@@ -11261,6 +11273,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // Q8_0 weights of Qwen3.8-27B split over 4 GPUs at decode (1), DFlash2 verify (8) and 16 rows
+    for (const auto & [n_out, k_red] : std::vector<std::pair<int64_t, int64_t>>{
+            {4352, 5120}, {5120, 4352}, {2560, 5120}, {1536, 5120}, {5120, 1536}, {3072, 5120}, {62080, 5120}}) {
+        for (int64_t n_tokens : {1, 8, 16}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, n_out, n_tokens, k_red, {1, 1}, {1, 1}));
+        }
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
