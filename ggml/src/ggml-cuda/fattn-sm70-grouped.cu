@@ -1,0 +1,149 @@
+#include "common.cuh"
+#include "fattn-common.cuh"
+#include "fattn-sm70-grouped.cuh"
+
+bool ggml_cuda_flash_attn_ext_sm70_grouped_supported(const ggml_tensor * dst, int cc) {
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+
+    if (!volta_mma_available(cc)) {
+        return false;
+    }
+    if (Q->type != GGML_TYPE_F32 || Q->ne[0] != 256) {
+        return false;
+    }
+    for (const ggml_tensor * t : {K, V}) {
+        if ((t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_Q8_0) || t->ne[0] != 256) {
+            return false;
+        }
+        if (reinterpret_cast<uintptr_t>(t->data) % 16 != 0) {
+            return false;
+        }
+        for (int i = 1; i < 4; ++i) {
+            if (t->nb[i] % 16 != 0) {
+                return false;
+            }
+        }
+    }
+    if (K->ne[2] != V->ne[2] || Q->ne[2] != 6*K->ne[2]) {
+        return false;
+    }
+    // single-token decode stays on the vec kernel, which is faster there
+    if (Q->ne[1] < 2 || Q->ne[1] > 16) {
+        return false;
+    }
+    if (K->ne[3] != Q->ne[3] || V->ne[3] != Q->ne[3]) {
+        return false;
+    }
+
+    float max_bias      = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    if (max_bias != 0.0f || logit_softcap != 0.0f) {
+        return false;
+    }
+
+    if (sinks != nullptr) {
+        return false;
+    }
+    if (mask && mask->type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (ggml_get_op_params_i32(dst, 4) != 0) { // n_kv_max hint
+        return false;
+    }
+
+    return true;
+}
+
+template <int MAX_QUERY_TOKENS, ggml_type type_K, ggml_type type_V>
+static void ggml_cuda_flash_attn_ext_sm70_grouped_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    const int n_q        = (int) Q->ne[1];
+    const int n_heads    = (int) Q->ne[2];
+    const int n_seq      = (int) Q->ne[3];
+    const int n_kv       = (int) K->ne[1];
+    const int n_kv_heads = (int) K->ne[2];
+
+    constexpr int head_groups = GroupedVerifyTraits<MAX_QUERY_TOKENS>::kHeadGroups;
+    const int grid_x = n_kv_heads * head_groups;
+    const int splits = std::max(1, std::min(80 / grid_x, (n_kv + 63) / 64));
+
+    float scale = 1.0f;
+    memcpy(&scale, (const float *) dst->op_params, sizeof(float));
+
+    const int64_t n_rows = (int64_t) n_q * n_heads * n_seq;
+
+    ggml_cuda_pool & pool = ctx.pool();
+    cudaStream_t stream = ctx.stream();
+
+    ggml_cuda_pool_alloc<float>  dst_partial(pool, n_rows * splits * kGroupedVerifyHeadDim);
+    ggml_cuda_pool_alloc<float2> dst_meta(pool, n_rows * splits);
+
+    const dim3 blocks_num(grid_x, splits, n_seq);
+    const dim3 block_dim(kGroupedVerifyThreads, 1, 1);
+    const size_t nbytes_shared = sizeof(GroupedVerifySmem);
+
+    CUDA_SET_SHARED_MEMORY_LIMIT((flash_attn_ext_sm70_grouped<MAX_QUERY_TOKENS, type_K, type_V>), nbytes_shared);
+    const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, nbytes_shared, stream);
+    ggml_cuda_kernel_launch(flash_attn_ext_sm70_grouped<MAX_QUERY_TOKENS, type_K, type_V>, launch_params,
+        (const char *) Q->data,
+        (const char *) K->data,
+        (const char *) V->data,
+        mask ? (const char *) mask->data : nullptr,
+        dst_partial.ptr, dst_meta.ptr,
+        scale,
+        n_q, n_kv, n_heads, splits,
+        mask ? (int32_t) mask->ne[3] : (int32_t) 0,
+        (int64_t) Q->nb[1], (int64_t) Q->nb[2], (int64_t) Q->nb[3],
+        (int64_t) K->nb[1], (int64_t) K->nb[2], (int64_t) K->nb[3],
+        (int64_t) V->nb[1], (int64_t) V->nb[2], (int64_t) V->nb[3],
+        mask ? (int64_t) mask->nb[1] : (int64_t) 0,
+        mask ? (int64_t) mask->nb[3] : (int64_t) 0);
+
+    const dim3 blocks_num_combine(n_q, n_heads, n_seq);
+    const dim3 block_dim_combine(kGroupedVerifyHeadDim, 1, 1);
+    const size_t nbytes_shared_combine = splits*sizeof(float2);
+
+    const ggml_cuda_kernel_launch_params launch_params_combine(blocks_num_combine, block_dim_combine, nbytes_shared_combine, stream);
+    ggml_cuda_kernel_launch(flash_attn_combine_results<kGroupedVerifyHeadDim>, launch_params_combine,
+        dst_partial.ptr, dst_meta.ptr, (float *) dst->data, splits);
+}
+
+void ggml_cuda_flash_attn_ext_sm70_grouped(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    GGML_ASSERT(ggml_cuda_flash_attn_ext_sm70_grouped_supported(dst, ggml_cuda_info().devices[ggml_cuda_get_device()].cc));
+
+    if (Q->ne[1] <= 8) {
+        if (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) {
+            ggml_cuda_flash_attn_ext_sm70_grouped_launch<8, GGML_TYPE_F16,  GGML_TYPE_F16 >(ctx, dst);
+        } else if (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_Q8_0) {
+            ggml_cuda_flash_attn_ext_sm70_grouped_launch<8, GGML_TYPE_F16,  GGML_TYPE_Q8_0>(ctx, dst);
+        } else if (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_F16) {
+            ggml_cuda_flash_attn_ext_sm70_grouped_launch<8, GGML_TYPE_Q8_0, GGML_TYPE_F16 >(ctx, dst);
+        } else {
+            ggml_cuda_flash_attn_ext_sm70_grouped_launch<8, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
+        }
+    } else {
+        if (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) {
+            ggml_cuda_flash_attn_ext_sm70_grouped_launch<16, GGML_TYPE_F16,  GGML_TYPE_F16 >(ctx, dst);
+        } else if (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_Q8_0) {
+            ggml_cuda_flash_attn_ext_sm70_grouped_launch<16, GGML_TYPE_F16,  GGML_TYPE_Q8_0>(ctx, dst);
+        } else if (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_F16) {
+            ggml_cuda_flash_attn_ext_sm70_grouped_launch<16, GGML_TYPE_Q8_0, GGML_TYPE_F16 >(ctx, dst);
+        } else {
+            ggml_cuda_flash_attn_ext_sm70_grouped_launch<16, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
+        }
+    }
+}

@@ -1,6 +1,7 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
+#include "fattn-sm70-grouped.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
@@ -515,10 +516,11 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
 
 // Best FlashAttention kernel for a specific GPU:
 enum best_fattn_kernel {
-    BEST_FATTN_KERNEL_NONE    =   0,
-    BEST_FATTN_KERNEL_TILE    = 200,
-    BEST_FATTN_KERNEL_VEC     = 100,
-    BEST_FATTN_KERNEL_MMA_F16 = 400,
+    BEST_FATTN_KERNEL_NONE          =   0,
+    BEST_FATTN_KERNEL_TILE          = 200,
+    BEST_FATTN_KERNEL_VEC           = 100,
+    BEST_FATTN_KERNEL_MMA_F16       = 400,
+    BEST_FATTN_KERNEL_SM70_GROUPED  = 500,
 };
 
 // K/V types for which there is a vector kernel template instance, other kernels convert these to f16:
@@ -543,6 +545,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     GGML_UNUSED(device); GGML_UNUSED(dst);
     return BEST_FATTN_KERNEL_NONE;
 #endif// FLASH_ATTN_AVAILABLE
+
+    const int cc = ggml_cuda_info().devices[device].cc;
+
+    if (ggml_cuda_flash_attn_ext_sm70_grouped_supported(dst, cc)) {
+        return BEST_FATTN_KERNEL_SM70_GROUPED;
+    }
 
     const ggml_tensor * KQV   = dst;
     const ggml_tensor * Q     = dst->src[0];
@@ -570,8 +578,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             }
         }
     }
-
-    const int cc = ggml_cuda_info().devices[device].cc;
 
     switch (K->ne[0]) {
         case  40:
@@ -742,6 +748,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;
             need_f16_V = V->type == GGML_TYPE_F32 || f16_fallback;
         } break;
+        case BEST_FATTN_KERNEL_SM70_GROUPED: // K/V are read directly
+            break;
         case BEST_FATTN_KERNEL_NONE:
             break;
     }
@@ -765,6 +773,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_SM70_GROUPED:
+            ggml_cuda_flash_attn_ext_sm70_grouped(ctx, dst);
             break;
     }
 }
