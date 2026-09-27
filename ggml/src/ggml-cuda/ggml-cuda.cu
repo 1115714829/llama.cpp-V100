@@ -1851,6 +1851,16 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
     }
 }
 
+// True when ggml_cuda_mul_mat_cublas() computes in F16 for F16 weights, so that a shared
+// input conversion to F16 is valid.
+static bool ggml_cuda_mul_mat_cublas_compute_f16(const ggml_backend_cuda_context & ctx) {
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!fast_fp16_hardware_available(cc)) {
+        return false;
+    }
+    return getenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE") == nullptr;
+}
+
 static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                           const ggml_tensor * ffn_gate,
                                           const ggml_tensor * glu,
@@ -4581,6 +4591,103 @@ static int ggml_cuda_match_mul_mat_multi(const ggml_cgraph * cgraph, int node_id
     return n >= 2 ? n : 0;
 }
 
+// Large-M version of ggml_cuda_match_mul_mat_multi(): same shared src1, but any number of rows.
+// Weights can be repacked Q8, plain contiguous Q8_0, or contiguous F16.
+static int ggml_cuda_match_mul_mat_multi_large(const ggml_cgraph * cgraph, int node_idx,
+                                               const ggml_tensor * src0s[4], ggml_tensor * dsts[4]) {
+    const ggml_tensor * first = cgraph->nodes[node_idx];
+    if (first->op != GGML_OP_MUL_MAT) {
+        return 0;
+    }
+    const ggml_tensor * src1 = first->src[1];
+    if (src1 == nullptr || src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) ||
+            src1->ne[2] != 1 || src1->ne[3] != 1 || src1->ne[1] <= 16) {
+        return 0;
+    }
+    const int64_t k = first->src[0]->ne[0];
+    int n = 0;
+    while (n < 4 && node_idx + n < cgraph->n_nodes) {
+        ggml_tensor * node = cgraph->nodes[node_idx + n];
+        if (node->op != GGML_OP_MUL_MAT || node->src[1] != src1 ||
+                (node->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
+            break;
+        }
+        const ggml_tensor * w = node->src[0];
+        const bool repacked = ggml_cuda_q8_skinny_is_repacked(w);
+        const bool q8_0 = w->type == GGML_TYPE_Q8_0 && w->view_src == nullptr && w->op == GGML_OP_NONE &&
+                          ggml_is_contiguous(w);
+        const bool f16 = w->type == GGML_TYPE_F16 && ggml_is_contiguous(w);
+        if (w->ne[0] != k || (!repacked && !q8_0 && !f16)) {
+            break;
+        }
+        if (node->type != GGML_TYPE_F32 || !ggml_is_contiguous(node) || node->op_params[0] == GGML_PREC_F32) {
+            break;
+        }
+        src0s[n] = w;
+        dsts[n]  = node;
+        ++n;
+    }
+    return n >= 2 ? n : 0;
+}
+
+// Runs several MUL_MAT nodes that share one F32 src1: the input is converted to F16 once,
+// each weight is densified to F16, and each product uses cuBLAS.
+static bool ggml_cuda_mul_mat_multi_shared_src1(ggml_backend_cuda_context & ctx,
+                                                 const ggml_tensor * const src0s[4], ggml_tensor * const dsts[4],
+                                                 const int n_nodes, const ggml_tensor * src1) {
+    if (!ggml_cuda_mul_mat_cublas_compute_f16(ctx)) {
+        return false;
+    }
+
+    const int64_t k = src1->ne[0];
+    const int64_t m = src1->ne[1];
+
+    ggml_cuda_pool_alloc<half> src1_f16(ctx.pool(), ggml_nelements(src1));
+    const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
+    GGML_ASSERT(to_fp16 != nullptr);
+    to_fp16(src1->data, src1_f16.get(), ggml_nelements(src1), ctx.stream());
+
+    ggml_tensor src1_tmp = *src1;
+    src1_tmp.type = GGML_TYPE_F16;
+    src1_tmp.data = src1_f16.get();
+    src1_tmp.extra = nullptr;
+    src1_tmp.nb[0] = sizeof(half);
+    src1_tmp.nb[1] = src1_tmp.nb[0] * k;
+    src1_tmp.nb[2] = src1_tmp.nb[1] * m;
+    src1_tmp.nb[3] = src1_tmp.nb[2];
+
+    for (int i = 0; i < n_nodes; ++i) {
+        const ggml_tensor * w = src0s[i];
+        if (w->type == GGML_TYPE_F16) {
+            ggml_cuda_mul_mat_cublas(ctx, w, &src1_tmp, dsts[i]);
+            continue;
+        }
+
+        // the weight buffer is released at the end of every iteration
+        ggml_cuda_pool_alloc<half> src0_f16(ctx.pool(), ggml_nelements(w));
+        if (ggml_cuda_q8_skinny_is_repacked(w)) {
+            ggml_cuda_q8_skinny_to_f16(w, src0_f16.get(), ctx.stream());
+        } else {
+            const to_fp16_cuda_t to_fp16_w = ggml_get_to_fp16_cuda(w->type);
+            GGML_ASSERT(to_fp16_w != nullptr);
+            to_fp16_w(w->data, src0_f16.get(), ggml_nelements(w), ctx.stream());
+        }
+
+        ggml_tensor src0_tmp = *w;
+        src0_tmp.type = GGML_TYPE_F16;
+        src0_tmp.data = src0_f16.get();
+        src0_tmp.extra = nullptr;
+        src0_tmp.nb[0] = sizeof(half);
+        src0_tmp.nb[1] = src0_tmp.nb[0] * w->ne[0];
+        src0_tmp.nb[2] = src0_tmp.nb[1] * w->ne[1];
+        src0_tmp.nb[3] = src0_tmp.nb[2] * w->ne[2];
+
+        ggml_cuda_mul_mat_cublas(ctx, &src0_tmp, &src1_tmp, dsts[i]);
+    }
+
+    return true;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -5200,6 +5307,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (ggml_can_fuse_subgraph(cgraph, i, n_multi, ops, out_nodes, n_multi) &&
                     ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_multi, out_nodes, n_multi) &&
                     ggml_cuda_q8_skinny_mul_mat_multi(*cuda_ctx, multi_src0, multi_dst, n_multi, node->src[1])) {
+                return n_multi - 1;
+            }
+        }
+    }
+
+    // Same fusion for a large M, where no multi-weight kernel exists: one shared input
+    // conversion, then one cuBLAS call per weight.
+    if (node->op == GGML_OP_MUL_MAT) {
+        const ggml_tensor * multi_src0[4];
+        ggml_tensor * multi_dst[4];
+        const int n_multi = ggml_cuda_match_mul_mat_multi_large(cgraph, i, multi_src0, multi_dst);
+        if (n_multi > 0) {
+            ggml_op ops[4] = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT };
+            int out_nodes[4] = { i, i + 1, i + 2, i + 3 };
+            if (ggml_can_fuse_subgraph(cgraph, i, n_multi, ops, out_nodes, n_multi) &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_multi, out_nodes, n_multi) &&
+                    ggml_cuda_mul_mat_multi_shared_src1(*cuda_ctx, multi_src0, multi_dst, n_multi, node->src[1])) {
                 return n_multi - 1;
             }
         }

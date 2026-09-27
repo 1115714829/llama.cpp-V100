@@ -5623,14 +5623,16 @@ struct test_mul_mat : public test_case {
     }
 };
 
-// Multiple Q8_0 matmuls that share one input, run by one multi-weight kernel
+// Multiple matmuls that share one input, run by one multi-weight kernel (small M) or by
+// sharing one input conversion across cuBLAS calls (large M)
 struct test_mul_mat_multi : public test_case {
     const std::vector<int64_t> ns; // output columns of each matmul, 2 to 4 entries
     const int64_t m;
     const int64_t k;
+    const ggml_type type_w;
 
     std::string vars() override {
-        return VARS_TO_STR3(ns, m, k);
+        return VARS_TO_STR4(ns, m, k, type_w);
     }
 
     double max_nmse_err() override {
@@ -5646,8 +5648,9 @@ struct test_mul_mat_multi : public test_case {
         return flops;
     }
 
-    test_mul_mat_multi(std::vector<int64_t> ns, int64_t m, int64_t k)
-        : ns(ns), m(m), k(k) {
+    test_mul_mat_multi(std::vector<int64_t> ns, int64_t m, int64_t k,
+                       ggml_type type_w = GGML_TYPE_Q8_0)
+        : ns(ns), m(m), k(k), type_w(type_w) {
         GGML_ASSERT(ns.size() >= 2 && ns.size() <= 4);
     }
 
@@ -5658,7 +5661,7 @@ struct test_mul_mat_multi : public test_case {
         std::vector<ggml_tensor *> outs;
         outs.reserve(ns.size());
         for (int64_t n : ns) {
-            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k, n);
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, type_w, k, n);
             ggml_set_name(w, "w");
             outs.push_back(ggml_mul_mat(ctx, w, x));
         }
@@ -10795,6 +10798,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_multi({3072, 256, 256}, n_tokens, 5120));
     }
 
+    // the same matmuls with a large M: one shared input conversion across cuBLAS calls
+    for (int64_t n_tokens : {64, 512}) {
+        test_cases.emplace_back(new test_mul_mat_multi({2560, 1536, 12, 12}, n_tokens, 5120));
+        test_cases.emplace_back(new test_mul_mat_multi({3072, 256, 256}, n_tokens, 5120));
+        test_cases.emplace_back(new test_mul_mat_multi({4352, 4352}, n_tokens, 5120));
+    }
+    test_cases.emplace_back(new test_mul_mat_multi({256, 128, 12}, 64, 512, GGML_TYPE_F16));
+
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
     for (int64_t n : {1, 7, 8, 9, 16, 127, 128, 511, 512}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1, n, 2048, {1, 1}, {1, 1}));
@@ -12027,6 +12038,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // the multi-weight kernel in the GDN (qkv/z/beta/alpha) and full attention (q/k/v) shapes
     test_cases.emplace_back(new test_mul_mat_multi({2560, 1536, 12, 12}, 8, 5120));
     test_cases.emplace_back(new test_mul_mat_multi({3072, 256, 256}, 8, 5120));
+
+    // the same shapes at prefill M: one shared input conversion across cuBLAS calls
+    test_cases.emplace_back(new test_mul_mat_multi({2560, 1536, 12, 12}, 2048, 5120));
+    test_cases.emplace_back(new test_mul_mat_multi({3072, 256, 256}, 2048, 5120));
+    test_cases.emplace_back(new test_mul_mat_multi({4352, 4352}, 2048, 5120));
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
