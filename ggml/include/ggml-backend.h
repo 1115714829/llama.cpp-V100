@@ -428,6 +428,15 @@ extern "C" {
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
 
+    // returns true if the buffer belongs to a meta backend
+    GGML_API bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf);
+
+    // Copies nbytes from src (at byte offset src_offs) to dst (at dst_offs) asynchronously on every
+    // device of the meta backend. src and dst are static (non-view) meta tensors that are MIRRORED,
+    // so every device holds a full copy of each; the copy is device local.
+    GGML_API void ggml_backend_meta_copy_mirrored_async(ggml_backend_t backend,
+            const struct ggml_tensor * src, size_t src_offs, struct ggml_tensor * dst, size_t dst_offs, size_t nbytes);
+
     //
     // Utils
     //
