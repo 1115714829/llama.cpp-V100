@@ -604,7 +604,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
     const int64_t nt                       = cur->ne[1];
 
     GGML_ASSERT(inp_lid.kq_mask);
-    GGML_ASSERT(inp_lid.k_rot);
+    GGML_ASSERT(inp_dsv4->get_lid_k_rot(il));
     GGML_ASSERT(n_embd_indexer_head >= n_embd_indexer_head_rope);
 
     ggml_tensor * indexer_q = build_lora_mm(layer.indexer_attn_q_b, qr);
@@ -617,7 +617,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
     indexer_q = ggml_rope_set_offset(indexer_q, n_embd_indexer_head_nope);
     cb(indexer_q, "lid_q_rope", il);
 
-    indexer_q = llama_mul_mat_hadamard(ctx0, indexer_q, inp_lid.k_rot);
+    indexer_q = llama_mul_mat_hadamard(ctx0, indexer_q, inp_dsv4->get_lid_k_rot(il));
     cb(indexer_q, "lid_q_rot", il);
 
     ggml_tensor * indexer_weights = build_lora_mm(layer.indexer_proj, cur);
@@ -722,7 +722,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
 
     ggml_tensor * top_k = build_lid_top_k(model, inp_dsv4, qr, cur, inp_pos, il);
 
-    ggml_tensor * k_rot = inp_attn->self_k_rot;
+    ggml_tensor * k_rot = inp_attn->get_k_rot(il);
     if (k_rot) {
         q  = llama_mul_mat_hadamard(ctx0, q, k_rot);
         kv = llama_mul_mat_hadamard(ctx0, kv, k_rot);
@@ -778,7 +778,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
     const auto & inp_hca = inp_dsv4->get_hca();
     GGML_ASSERT(inp_hca.kq_mask);
 
-    ggml_tensor * k_rot = inp_attn->self_k_rot;
+    ggml_tensor * k_rot = inp_attn->get_k_rot(il);
     if (k_rot) {
         q  = llama_mul_mat_hadamard(ctx0, q, k_rot);
         kv = llama_mul_mat_hadamard(ctx0, kv, k_rot);
@@ -831,7 +831,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_raw_attention(
         int il) const {
     GGML_ASSERT(hparams.is_swa(il));
 
-    ggml_tensor * k_rot = inp_attn->self_k_rot;
+    ggml_tensor * k_rot = inp_attn->get_k_rot(il);
 
     if (k_rot) {
         q  = llama_mul_mat_hadamard(ctx0, q, k_rot);
@@ -994,8 +994,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
                 "csa_state_compress",
                 il);
 
-        if (inp_dsv4->get_csa().k_rot) {
-            kv_comp_csa_state = llama_mul_mat_hadamard(ctx0, kv_comp_csa_state, inp_dsv4->get_csa().k_rot);
+        ggml_tensor * csa_rot = inp_dsv4->get_csa_k_rot(il);
+        if (csa_rot) {
+            kv_comp_csa_state = llama_mul_mat_hadamard(ctx0, kv_comp_csa_state, csa_rot);
             cb(kv_comp_csa_state, "csa_state_compress_rot", il);
         }
 
@@ -1063,8 +1064,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
                 "lid_state_compress",
                 il);
 
-        if (inp_dsv4->get_lid().k_rot) {
-            kv_comp_lid_state = llama_mul_mat_hadamard(ctx0, kv_comp_lid_state, inp_dsv4->get_lid().k_rot);
+        ggml_tensor * lid_rot = inp_dsv4->get_lid_k_rot(il);
+        if (lid_rot) {
+            kv_comp_lid_state = llama_mul_mat_hadamard(ctx0, kv_comp_lid_state, lid_rot);
             cb(kv_comp_lid_state, "lid_state_compress_rot", il);
         }
 
@@ -1123,8 +1125,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
                 "hca_state_compress",
                 il);
 
-        if (inp_dsv4->get_hca().k_rot) {
-            kv_comp_hca = llama_mul_mat_hadamard(ctx0, kv_comp_hca, inp_dsv4->get_hca().k_rot);
+        ggml_tensor * hca_rot = inp_dsv4->get_hca_k_rot(il);
+        if (hca_rot) {
+            kv_comp_hca = llama_mul_mat_hadamard(ctx0, kv_comp_hca, hca_rot);
             cb(kv_comp_hca, "hca_state_compress_rot", il);
         }
 
@@ -1189,7 +1192,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
     } else if (ratio == DSV4_CSA_RATIO &&
             inp_dsv4->get_csa().kq_mask &&
             inp_dsv4->get_lid().kq_mask &&
-            inp_dsv4->get_lid().k_rot) {
+            inp_dsv4->get_lid_k_rot(il)) {
         out = build_csa_lid_attention(model, inp_dsv4, inp_attn, q, kv, qr, cur, inp_pos, layer.attn_sinks,
                 1.0f/sqrtf(float(n_embd_head)), il);
     } else if (ratio == DSV4_HCA_RATIO &&

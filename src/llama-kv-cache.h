@@ -221,8 +221,9 @@ public:
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
 
-    ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
-    ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
+    // the Hadamard rotation matrices are stored in the KV cache buffers - no graph inputs
+    ggml_tensor * build_input_k_rot(int32_t il) const;
+    ggml_tensor * build_input_v_rot(int32_t il) const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
@@ -231,9 +232,6 @@ public:
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
-
-    void set_input_k_rot(ggml_tensor * dst) const;
-    void set_input_v_rot(ggml_tensor * dst) const;
 
     // true if llama_kv_cell_ext holds information that has to survive a state save/restore
     bool has_cell_ext() const;
@@ -257,6 +255,10 @@ private:
 
         ggml_tensor * k;
         ggml_tensor * v;
+
+        // Hadamard rotation matrices, allocated in the same buffer as K/V
+        ggml_tensor * k_rot = nullptr;
+        ggml_tensor * v_rot = nullptr;
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
@@ -282,8 +284,11 @@ private:
     int32_t n_embd_head_k_all = 0;
     int32_t n_embd_head_v_all = 0;
 
-    // pre-computed hadamard martrices
+    // pre-computed hadamard matrices, kept in host memory for the initial upload and for re-upload after a buffer clear
     std::unordered_map<int64_t, std::vector<float>> attn_rot_hadamard;
+
+    // the tensors in the K/V buffers that hold the rotation matrices, one K and one V per buffer type
+    std::vector<ggml_tensor *> attn_rot_tensors;
 
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
@@ -320,6 +325,9 @@ private:
 
     size_t size_k_bytes() const;
     size_t size_v_bytes() const;
+
+    // copy the pre-computed Hadamard matrices into the K/V buffers
+    void upload_rot_tensors() const;
 
     ggml_tensor * build_rope_shift(
             const llama_cparams & cparams,
@@ -418,8 +426,8 @@ public:
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
 
-    ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
-    ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
+    ggml_tensor * build_input_k_rot(int32_t il) const;
+    ggml_tensor * build_input_v_rot(int32_t il) const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
@@ -427,9 +435,6 @@ public:
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
-
-    void set_input_k_rot(ggml_tensor * dst) const;
-    void set_input_v_rot(ggml_tensor * dst) const;
 
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;

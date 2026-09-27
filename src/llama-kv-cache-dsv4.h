@@ -208,11 +208,10 @@ public:
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
 
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
-    ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
+    ggml_tensor * build_input_k_rot(int32_t il) const;
 
     void set_input_k_idxs(ggml_tensor * dst) const;
     void set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
-    void set_input_k_rot(ggml_tensor * dst) const;
 
 private:
     size_t i_next = 0;
@@ -252,8 +251,7 @@ public:
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
 
-    ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
-    void set_input_k_rot(ggml_tensor * dst) const;
+    ggml_tensor * build_input_k_rot(int32_t il) const;
 
 private:
     llama_kv_cache * kv;
