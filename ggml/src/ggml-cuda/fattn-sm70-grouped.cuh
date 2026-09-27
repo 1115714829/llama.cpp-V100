@@ -404,10 +404,11 @@ struct GroupedVerifyMaskPair {
 
 // Load the mask pair of one row. The result feeds the softmax after QK, so the global
 // latency of this load overlaps the tensor core work. mask == nullptr makes every
-// column below n_kv visible.
+// column below n_kv visible. mask_is_range makes the row an [lo, hi) pair instead.
 __device__ __forceinline__ GroupedVerifyMaskPair grouped_verify_load_mask_pair(
         const char * __restrict__ mask, const int64_t seq_mask_off, const int64_t nb31,
-        const int token_idx, const int n_q, const int kv_idx, const int n_kv) {
+        const int token_idx, const int n_q, const int kv_idx, const int n_kv,
+        const bool mask_is_range) {
     GroupedVerifyMaskPair pair;
     pair.value[0]   = 0.0f;
     pair.value[1]   = 0.0f;
@@ -419,6 +420,14 @@ __device__ __forceinline__ GroupedVerifyMaskPair grouped_verify_load_mask_pair(
     if (mask == nullptr) {
         pair.visible[0] = true;
         pair.visible[1] = kv_idx + 1 < n_kv;
+        return pair;
+    }
+    if (mask_is_range) {
+        const int32_t * r = reinterpret_cast<const int32_t *>(mask + seq_mask_off + nb31 * token_idx);
+        const int lo = r[0];
+        const int hi = r[1];
+        pair.visible[0] = kv_idx >= lo && kv_idx < hi;
+        pair.visible[1] = kv_idx + 1 < n_kv && kv_idx + 1 >= lo && kv_idx + 1 < hi;
         return pair;
     }
     const __half * mask_row = reinterpret_cast<const __half *>(mask + seq_mask_off + nb31 * token_idx);
@@ -488,7 +497,8 @@ static __global__ void flash_attn_ext_sm70_grouped(
         const int64_t nb01, const int64_t nb02, const int64_t nb03,
         const int64_t nb11, const int64_t nb12, const int64_t nb13,
         const int64_t nb21, const int64_t nb22, const int64_t nb23,
-        const int64_t nb31, const int64_t nb33) {
+        const int64_t nb31, const int64_t nb33,
+        const int32_t mask_is_range) {
     ggml_cuda_pdl_lc();
 #if defined(FLASH_ATTN_AVAILABLE) && defined(VOLTA_MMA_AVAILABLE)
     const char * GGML_CUDA_RESTRICT Q            = Q_ptr;
@@ -606,7 +616,8 @@ static __global__ void flash_attn_ext_sm70_grouped(
             const int row = warp_id + i * kGroupedVerifyWarps;
             row_mask[i] = grouped_verify_load_mask_pair(
                 mask, seq_mask_off, nb31, row / kHeadsPerCta, n_q,
-                tile_start + kGroupedVerifyColsPerLane * lane_id, n_kv);
+                tile_start + kGroupedVerifyColsPerLane * lane_id, n_kv,
+                mask_is_range != 0);
         }
 
         grouped_verify_qk(shared_q, shared_kv, shared_scores, scale);

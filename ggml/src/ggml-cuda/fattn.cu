@@ -586,16 +586,25 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_NONE;
 #endif// FLASH_ATTN_AVAILABLE
 
+    const int cc = ggml_cuda_info().devices[device].cc;
+
     if (dst->src[3] && dst->src[3]->type == GGML_TYPE_I32) {
-        // a range mask is expanded to an equivalent dense f16 mask at compute time; the kernel
-        // selection only inspects the mask layout, so select for the dense mask description
+        // the sm70 kernels read a range mask directly; the others need the dense f16
+        // mask it describes, and their selection only inspects the mask layout, so
+        // select them for a dense mask description
+        if (ggml_cuda_flash_attn_ext_sm70_grouped_supported(dst, cc)) {
+            return BEST_FATTN_KERNEL_SM70_GROUPED;
+        }
+        if constexpr (GGML_CUDA_SM70_D256_COMPILED) {
+            if (ggml_cuda_sm70_d256_supported(cc, dst)) {
+                return BEST_FATTN_KERNEL_SM70_D256;
+            }
+        }
         ggml_tensor d = *dst;
         ggml_tensor m = ggml_cuda_fattn_dense_mask_desc(dst->src[3], dst->src[1]->ne[1]);
         d.src[3] = &m;
         return ggml_cuda_get_best_fattn_kernel(device, &d);
     }
-
-    const int cc = ggml_cuda_info().devices[device].cc;
 
     if (ggml_cuda_flash_attn_ext_sm70_grouped_supported(dst, cc)) {
         return BEST_FATTN_KERNEL_SM70_GROUPED;
@@ -830,7 +839,14 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
     const ggml_tensor * mask = dst->src[3];
     if (mask && mask->type == GGML_TYPE_I32) {
-        // expand the range mask into the dense f16 mask the kernels expect, then run the regular path
+        // the sm70 kernels read the range natively, every other kernel needs the dense f16 mask
+        const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+        if (kernel == BEST_FATTN_KERNEL_SM70_GROUPED || kernel == BEST_FATTN_KERNEL_SM70_D256) {
+            ggml_cuda_flash_attn_ext_impl(ctx, dst);
+            return;
+        }
+
+        // expand the range mask into the dense f16 mask the other kernels expect, then run the regular path
         const int64_t n_kv = dst->src[1]->ne[1];
 
         ggml_cuda_pool_alloc<half> mask_f16(ctx.pool(), n_kv*mask->ne[1]*mask->ne[2]*mask->ne[3]);

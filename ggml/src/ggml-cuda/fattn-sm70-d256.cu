@@ -189,6 +189,63 @@ __global__ void sm70_d256_mask_bounds_kernel(
     }
 }
 
+// Per q-block bounds of a range mask, the same int2 the dense pre-scan produces (see above).
+// One CTA per (q block, batch), one thread per row (blockDim.x == SM70_D256_BLOCK_M).
+__global__ void sm70_d256_range_bounds_kernel(
+        const int2 * __restrict__ range, int2 * __restrict__ bounds,
+        const int q_len, const int kv_len,
+        const int64_t range_row_stride, const int64_t range_batch_stride) {
+    const int q_block = blockIdx.x;
+    const int batch   = blockIdx.y;
+    const int row     = q_block * SM70_D256_BLOCK_M + threadIdx.x;
+
+    // Neutral element for rows outside q_len (Q pad rows).
+    int first_nz = kv_len;
+    int last_fin = -1;
+    if (row < q_len) {
+        const int2 r = range[(int64_t) batch * range_batch_stride + (int64_t) row * range_row_stride];
+        const int lo = r.x < 0 ? 0 : (r.x > kv_len ? kv_len : r.x);
+        const int hi = r.y < 0 ? 0 : (r.y > kv_len ? kv_len : r.y);
+        if (hi > lo) {
+            first_nz = lo > 0 ? 0 : (hi < kv_len ? hi : kv_len);
+            last_fin = hi - 1;
+        } else {
+            // Empty row: every column is -inf, so column 0 is the first non-zero one.
+            first_nz = 0;
+        }
+    }
+
+    for (int off = 16; off > 0; off >>= 1) {
+        const int other_first = __shfl_down_sync(0xffffffffu, first_nz, off);
+        const int other_last = __shfl_down_sync(0xffffffffu, last_fin, off);
+        if (other_first < first_nz) {
+            first_nz = other_first;
+        }
+        if (other_last > last_fin) {
+            last_fin = other_last;
+        }
+    }
+    __shared__ int smem_first[SM70_D256_BLOCK_M / 32];
+    __shared__ int smem_last[SM70_D256_BLOCK_M / 32];
+    if ((threadIdx.x & 31) == 0) {
+        smem_first[threadIdx.x / 32] = first_nz;
+        smem_last[threadIdx.x / 32] = last_fin;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int w = 1; w < SM70_D256_BLOCK_M / 32; ++w) {
+            if (smem_first[w] < first_nz) {
+                first_nz = smem_first[w];
+            }
+            if (smem_last[w] > last_fin) {
+                last_fin = smem_last[w];
+            }
+        }
+        // Every (batch, q block) is written exactly once, no memset needed.
+        bounds[(int64_t) batch * gridDim.x + q_block] = make_int2(kv_len - first_nz, last_fin + 1);
+    }
+}
+
 // Scratch layout, carved from the graph extra region after dst->data:
 //   [f16 K mirror][f16 V mirror]   (ggml_cuda_flash_attn_ext_get_f16_extra_data)
 //   PAD(., 128)
@@ -303,9 +360,18 @@ bool ggml_cuda_sm70_d256_supported(int cc, const ggml_tensor * dst) {
     if (Q->ne[2] % K->ne[2] != 0 || K->ne[2] != V->ne[2] || K->ne[3] != Q->ne[3] || V->ne[3] != Q->ne[3]) {
         return false;
     }
-    // The kernel consumes the explicit f16 mask; a missing mask would silently
-    // drop llama.cpp's causal/padding semantics.
-    if (!mask || mask->type != GGML_TYPE_F16 || mask->ne[2] != 1 || mask->nb[0] != sizeof(half)) {
+    // The kernel consumes the explicit mask (f16, or an I32 range); a missing mask
+    // would silently drop llama.cpp's causal/padding semantics.
+    const bool mask_range = mask && mask->type == GGML_TYPE_I32;
+    if (!mask || (mask->type != GGML_TYPE_F16 && !mask_range) || mask->ne[2] != 1) {
+        return false;
+    }
+    if (mask_range) {
+        // [lo, hi) pairs read as int2
+        if (mask->ne[0] != 2 || mask->nb[0] != sizeof(int32_t) || mask->nb[1] != sizeof(int2) || (uintptr_t) mask->data % sizeof(int2) != 0) {
+            return false;
+        }
+    } else if (mask->nb[0] != sizeof(half)) {
         return false;
     }
     if (mask->ne[1] != Q->ne[1]) {
@@ -314,8 +380,9 @@ bool ggml_cuda_sm70_d256_supported(int cc, const ggml_tensor * dst) {
     if (mask->ne[3] != Q->ne[3] && mask->ne[3] != 1) {
         return false;
     }
-    // kv_len is the real length; the K/V views must cover it.
-    if (mask->ne[0] < Q->ne[1] || mask->ne[0] > K->ne[1] || mask->ne[0] > V->ne[1]) {
+    // kv_len is the real length; the K/V views must cover it. A range mask spans the whole K/V view.
+    const int64_t kv_len = mask_range ? K->ne[1] : mask->ne[0];
+    if (kv_len < Q->ne[1] || kv_len > K->ne[1] || kv_len > V->ne[1]) {
         return false;
     }
     float max_bias = 0.0f;
@@ -349,16 +416,17 @@ bool ggml_cuda_sm70_d256_supported(int cc, const ggml_tensor * dst) {
 }
 
 // Raw launcher for the dense staged-f16 path: packed f16 Q (q_pad rows), f16
-// K/V, f16 mask, f32 output. q_len_real = kv_len - kv_offset; q_pad >=
-// q_len_real and q_pad % 64 == 0. mask_scale = 1/scale (the mask is added to
-// the raw QK domain, see the kernel). mask/mask_bounds may be null (no mask).
+// K/V, f16 or I32-range mask, f32 output. q_len_real = kv_len - kv_offset;
+// q_pad >= q_len_real and q_pad % 64 == 0. mask_scale = 1/scale (the mask is
+// added to the raw QK domain, see the kernel). mask/mask_bounds may be null (no
+// mask). With mask_is_range the mask strides are in int2 units, else in halfs.
 void ggml_cuda_sm70_d256_launch_raw(
         const void * q, const void * k, const void * v, void * out,
         const void * mask, const int2 * mask_bounds,
         int64_t q_batch_stride, int64_t q_row_stride, int64_t q_head_stride,
         int64_t k_outer_stride, int64_t k_row_stride, int64_t k_head_stride,
         int64_t v_outer_stride, int64_t v_row_stride, int64_t v_head_stride,
-        int64_t mask_row_stride, int64_t mask_batch_stride,
+        int64_t mask_row_stride, int64_t mask_batch_stride, bool mask_is_range,
         int q_pad, int kv_len, int heads_q, int heads_kv, int batch, int kv_offset,
         float softmax_scale, float mask_scale, cudaStream_t stream) {
     using Traits = FLASH_NAMESPACE::Sm70D256SplitDTraits;
@@ -378,7 +446,7 @@ void ggml_cuda_sm70_d256_launch_raw(
         (int) q_batch_stride, (int) q_row_stride, (int) q_head_stride,
         (int) k_outer_stride, (int) k_row_stride, (int) k_head_stride,
         (int) v_outer_stride, (int) v_row_stride, (int) v_head_stride,
-        mask_row_stride, mask_batch_stride, (const int2 *) mask_bounds,
+        mask_row_stride, mask_batch_stride, mask_is_range, (const int2 *) mask_bounds,
         q_pad, kv_len, heads_q, heads_kv, kv_offset,
         softmax_scale * float(M_LOG2E), mask_scale,
         /*partial_out*/ nullptr, /*partial_max*/ nullptr, /*partial_sum*/ nullptr);
@@ -395,8 +463,10 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
 
+    const bool mask_range = mask->type == GGML_TYPE_I32;
+
     const int q_len   = (int) Q->ne[1];
-    const int kv_len  = (int) mask->ne[0];
+    const int kv_len  = mask_range ? (int) K->ne[1] : (int) mask->ne[0];
     const int heads_q = (int) Q->ne[2];
     const int hkv     = (int) K->ne[2];
     const int gqa     = heads_q / hkv;
@@ -463,7 +533,16 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
         CUDA_CHECK(cudaGetLastError());
     }
 
-    {
+    if (mask_range) {
+        // One CTA per (q block, batch) computes the int2 bounds the dense pre-scan produces.
+        const dim3 grid(scratch.n_q_blocks, batch);
+        sm70_d256_range_bounds_kernel<<<grid, SM70_D256_BLOCK_M, 0, stream>>>(
+            (const int2 *) mask->data, mask_bounds,
+            q_len, kv_len,
+            mask->nb[1] / sizeof(int2),
+            mask->ne[3] == 1 ? 0 : (int64_t) mask->nb[3] / sizeof(int2));
+        CUDA_CHECK(cudaGetLastError());
+    } else {
         const int n_splits = (kv_len + SM70_D256_MASK_SPLIT - 1) / SM70_D256_MASK_SPLIT;
         const dim3 grid(scratch.n_q_blocks, batch, n_splits);
         // The split CTAs accumulate into bounds with atomicMax; zero first on
@@ -491,8 +570,9 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
         /*q_head_stride  */ (int64_t) q_pad * SM70_D256_D,
         k_outer_stride, k_row_stride, k_head_stride,
         v_outer_stride, v_row_stride, v_head_stride,
-        /*mask_row_stride  */ mask->nb[1] / sizeof(half),
-        /*mask_batch_stride*/ mask->ne[3] == 1 ? 0 : (int64_t) mask->nb[3] / sizeof(half),
+        /*mask_row_stride  */ mask_range ? mask->nb[1] / sizeof(int2)   : mask->nb[1] / sizeof(half),
+        /*mask_batch_stride*/ mask->ne[3] == 1 ? 0 : (int64_t) mask->nb[3] / (mask_range ? sizeof(int2) : sizeof(half)),
+        mask_range,
         q_pad, kv_len, heads_q, hkv, batch, kv_offset,
         scale, 1.0f / scale, stream);
 

@@ -30,7 +30,8 @@
 //  * the causal Mask is replaced by a range mask (col >= kv_len -> -inf): the
 //    llama.cpp mask carries the causal/padding semantics and test masks are
 //    arbitrary;
-//  * one explicit f16 mask add after the range mask;
+//  * one explicit mask add after the range mask: an f16 mask is added, an I32
+//    range mask sets every column outside [lo, hi) to -inf;
 //  * a mask pre-scan (sm70_d256_mask_bounds_kernel) gives, per (batch, q
 //    block), the first non-zero and the last above -inf column: the explicit
 //    mask add skips the all-zero prefix and the KV walk stops at the last
@@ -462,6 +463,74 @@ __device__ __forceinline__ void splitd_add_explicit_mask(
     }
 }
 
+// Range mask: the row's [lo, hi) KV window stays visible, every other column
+// is -inf. Row and column traversal are identical to splitd_add_explicit_mask;
+// the pair is read once per row (8-byte load) before the column loop.
+template <typename TensorScores>
+__device__ __forceinline__ void splitd_apply_range_mask(
+    TensorScores &acc_s,
+    const int2 *__restrict__ range,
+    const int64_t range_row_stride,
+    const int64_t range_batch_offset,
+    const int q_len_real,
+    const int kv_len,
+    const int row_base,
+    const int col_base) {
+    auto scores = make_tensor(
+        acc_s.data(),
+        FLASH_NAMESPACE::convert_layout_acc_rowcol(acc_s.layout()));
+    static_assert(decltype(size<0, 0>(scores))::value == 2,
+                  "unexpected SM70 QK row-inner layout");
+    static_assert(decltype(size<0, 1>(scores))::value == 1,
+                  "unexpected SM70 QK row-outer layout");
+    static_assert(decltype(size<1, 0>(scores))::value == 2,
+                  "unexpected SM70 QK col-inner layout");
+    static_assert(decltype(size<1, 1>(scores))::value == 2,
+                  "unexpected SM70 QK col-middle layout");
+    static_assert(decltype(size<1, 2>(scores))::value == 1,
+                  "unexpected SM70 QK col-outer layout");
+
+    const int lane_id = threadIdx.x % 32;
+    const int lane_row_base = (lane_id & 0x1) | ((lane_id & 0x10) >> 2);
+    const int lane_col_base =
+        (((lane_id >> 1) & 0x1) << 1) |
+        (((lane_id >> 2) & 0x1) << 3) |
+        (((lane_id >> 3) & 0x1) << 4);
+    const int2 *range_batch = range + range_batch_offset;
+#pragma unroll
+    for (int mi = 0; mi < size<0, 1>(scores); ++mi) {
+#pragma unroll
+        for (int i = 0; i < size<0, 0>(scores); ++i) {
+            const int row = FLASH_NAMESPACE::sm70_mask_row_idx<8>(
+                lane_row_base, row_base, i, mi);
+            const bool row_ok = row < q_len_real;
+            int lo = 0;
+            int hi = 0;
+            if (row_ok) {
+                const int2 r = range_batch[(int64_t) row * range_row_stride];
+                lo = r.x < 0 ? 0 : (r.x > kv_len ? kv_len : r.x);
+                hi = r.y < 0 ? 0 : (r.y > kv_len ? kv_len : r.y);
+            }
+#pragma unroll
+            for (int n = 0; n < size<1, 2>(scores); ++n) {
+#pragma unroll
+                for (int nj = 0; nj < size<1, 1>(scores); ++nj) {
+#pragma unroll
+                    for (int j = 0; j < size<1, 0>(scores); ++j) {
+                        const int col = FLASH_NAMESPACE::sm70_mask_col_idx<32>(
+                            lane_col_base, col_base, j, nj, n);
+                        auto coord = make_coord(
+                            make_coord(i, mi), make_coord(j, nj, n));
+                        if (row_ok && col < kv_len && (col < lo || col >= hi)) {
+                            scores(coord) = -INFINITY;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ElementOut (default = Element): output element type. The llama.cpp launcher
 // instantiates ElementOut=float so the attention output is written as f32
 // directly (the f16 output staging was a per-layer rounding source). Q/K/V
@@ -489,6 +558,7 @@ void sm70_d256_splitd_dense_kernel(
     int v_head_stride,
     int64_t mask_row_stride,
     int64_t mask_batch_stride,
+    bool mask_is_range,
     const int2 *__restrict__ mask_bounds,
     int query_len,
     int kv_len,
@@ -722,12 +792,20 @@ void sm70_d256_splitd_dense_kernel(
             0);
         // Skip the explicit mask add where the mask is identically zero.
         if (mask != nullptr && n_block >= mask_z_end) {
-            splitd_add_explicit_mask(
-                acc_s, mask, mask_row_stride,
-                static_cast<int64_t>(batch) * mask_batch_stride,
-                kv_len - kv_offset, kv_len,
-                query_row_base + qk_row_base, n_block * kBlockN,
-                mask_scale);
+            if (mask_is_range) {
+                splitd_apply_range_mask(
+                    acc_s, reinterpret_cast<const int2 *>(mask), mask_row_stride,
+                    static_cast<int64_t>(batch) * mask_batch_stride,
+                    kv_len - kv_offset, kv_len,
+                    query_row_base + qk_row_base, n_block * kBlockN);
+            } else {
+                splitd_add_explicit_mask(
+                    acc_s, mask, mask_row_stride,
+                    static_cast<int64_t>(batch) * mask_batch_stride,
+                    kv_len - kv_offset, kv_len,
+                    query_row_base + qk_row_base, n_block * kBlockN,
+                    mask_scale);
+            }
         }
 
         Element *p_smem_ptr =
