@@ -517,15 +517,28 @@ static __global__ void flash_attn_ext_sm70_grouped(
     const int split_id   = blockIdx.y;
     const int seq        = blockIdx.z;
 
-    const int total_tiles    = (n_kv + kGroupedVerifyBlockN - 1) / kGroupedVerifyBlockN;
+    const int64_t seq_mask_off = mask ? nb33 * (seq % ne33) : 0;
+
+    // With a range mask only the KV rows below the widest [lo, hi) of this sequence's query rows can
+    // contribute, so the tiles are split over [0, kv_end) instead of the whole view: a verify batch that
+    // views the whole cache keeps the parallelism of its real length.
+    int kv_end = n_kv;
+    if (mask_is_range) {
+        int hi_max = 0;
+        for (int t = 0; t < n_q; ++t) {
+            const int32_t * r = reinterpret_cast<const int32_t *>(mask + seq_mask_off + nb31 * t);
+            hi_max = max(hi_max, r[1]);
+        }
+        kv_end = min(n_kv, max(hi_max, 0));
+    }
+
+    const int total_tiles    = (kv_end + kGroupedVerifyBlockN - 1) / kGroupedVerifyBlockN;
     const int base_tiles     = total_tiles / n_splits;
     const int extra_tiles    = total_tiles % n_splits;
     const int split_tile_start = split_id * base_tiles + min(split_id, extra_tiles);
     const int split_tiles    = base_tiles + (split_id < extra_tiles ? 1 : 0);
     const int split_start    = split_tile_start * kGroupedVerifyBlockN;
-    const int split_end      = min(n_kv, split_start + split_tiles * kGroupedVerifyBlockN);
-
-    const int64_t seq_mask_off = mask ? nb33 * (seq % ne33) : 0;
+    const int split_end      = min(kv_end, split_start + split_tiles * kGroupedVerifyBlockN);
 
     const int tid     = threadIdx.x;
     const int warp_id = tid / WARP_SIZE;

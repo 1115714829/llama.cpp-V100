@@ -2984,9 +2984,10 @@ bool llama_kv_cache_context::apply() {
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     kq_range = kv->get_kq_range_ok(sinfos[i_cur], ubatches[i_cur]);
-    // a prompt ubatch with a range mask attends the whole cache: the range bounds the work, and every
-    // prompt ubatch then shares one graph (no rebuild per ubatch or per request)
-    n_kv = kv->get_n_kv(sinfos[i_cur], kq_range && sinfos[i_cur].size() > 256);
+    // with a range mask an ubatch of 2+ tokens attends the whole cache: the range bounds the work (the
+    // sm70 prompt and verify kernels split by it), and the graph no longer depends on the context length,
+    // so prompt ubatches and verify batches are each built once (single-token ubatches keep the grain)
+    n_kv = kv->get_n_kv(sinfos[i_cur], kq_range && sinfos[i_cur].size() >= 2);
 
     return true;
 }
