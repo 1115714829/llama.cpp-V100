@@ -2534,8 +2534,14 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
     GGML_ASSERT(ggml_is_contiguous(tensor));
 
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
-    GGML_ASSERT(split_state.n_segments == 1);
-    GGML_ASSERT(split_state.nr[0]      == 1);
+
+    // multi-segment and PARTIAL layouts are staged on the host (PARTIAL scales the values into a temporary buffer),
+    // so they cannot be copied asynchronously: wait for the queued work of all ranks, then copy synchronously
+    if (split_state.n_segments != 1 || split_state.nr[0] != 1 || split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+        ggml_backend_synchronize(backend);
+        ggml_backend_meta_buffer_set_tensor(tensor->buffer, tensor, data, offset, size);
+        return;
+    }
 
     switch (split_state.axis) {
         case GGML_BACKEND_SPLIT_AXIS_0:
