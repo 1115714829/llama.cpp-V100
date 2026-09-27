@@ -95,6 +95,11 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
 
 void ggml_cuda_op_cont_sigmoid_mul(ggml_backend_cuda_context & ctx, ggml_tensor * cont, ggml_tensor * sigmoid, ggml_tensor * mul);
 
+void ggml_cuda_op_gdn_gating(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * beta_in, ggml_tensor * beta_out,
+        const ggml_tensor * alpha_in, const ggml_tensor * dt, const ggml_tensor * a,
+        ggml_tensor * gate_out);
+
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
 
 __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {

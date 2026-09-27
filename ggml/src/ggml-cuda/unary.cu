@@ -758,6 +758,78 @@ void ggml_cuda_op_cont_sigmoid_mul(ggml_backend_cuda_context & ctx, ggml_tensor 
         gate->nb[1] / sizeof(float), gate->nb[2] / sizeof(float), gate->nb[3] / sizeof(float), stream);
 }
 
+/* fused gated delta net gating */
+
+// beta_out = sigmoid(beta) and gate = softplus(alpha + dt) * a, the gating of the GDN layers.
+// The two chains are independent. When their sizes match, thread i handles element i of both
+// chains and reads all inputs before writing, so either output may alias either input. Otherwise
+// the chains take two halves of the launch and an output may only alias its own input.
+static __global__ void gdn_gating_kernel(
+        const float * beta, float * beta_out, const int64_t n_beta,
+        const float * alpha, float * gate, const int64_t n_alpha,
+        const float * dt, const float * a, const int64_t n_heads) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+
+    if (n_beta == n_alpha) {
+        if (i >= n_beta) {
+            return;
+        }
+
+        ggml_cuda_pdl_sync();
+        const float b = beta[i];
+        const float x = alpha[i];
+        const int64_t h = i % n_heads;
+        const float d = dt[h];
+        const float w = a[h];
+        beta_out[i] = op_sigmoid(b);
+        gate[i]     = op_softplus(x + d) * w;
+        return;
+    }
+
+    if (i >= n_beta + n_alpha) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+    if (i < n_beta) {
+        beta_out[i] = op_sigmoid(beta[i]);
+        return;
+    }
+
+    const int64_t j = i - n_beta;
+    const int64_t h = j % n_heads;
+    gate[j] = op_softplus(alpha[j] + dt[h]) * a[h];
+}
+
+static void gdn_gating_cuda(
+        const float * beta, float * beta_out, const int64_t n_beta,
+        const float * alpha, float * gate, const int64_t n_alpha,
+        const float * dt, const float * a, const int64_t n_heads, cudaStream_t stream) {
+    // paired chains share one thread per element, see gdn_gating_kernel
+    const int64_t n = n_beta == n_alpha ? n_beta : n_beta + n_alpha;
+    const int64_t num_blocks = (n + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream);
+    ggml_cuda_kernel_launch(gdn_gating_kernel, launch_params, beta, beta_out, n_beta, alpha, gate, n_alpha, dt, a, n_heads);
+}
+
+void ggml_cuda_op_gdn_gating(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * beta_in, ggml_tensor * beta_out,
+        const ggml_tensor * alpha_in, const ggml_tensor * dt, const ggml_tensor * a,
+        ggml_tensor * gate_out) {
+    GGML_ASSERT(beta_in->type  == GGML_TYPE_F32 && beta_out->type  == GGML_TYPE_F32);
+    GGML_ASSERT(alpha_in->type == GGML_TYPE_F32 && gate_out->type == GGML_TYPE_F32);
+    GGML_ASSERT(dt->type == GGML_TYPE_F32 && a->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(beta_in) && ggml_is_contiguous(alpha_in));
+
+    cudaStream_t stream = ctx.stream();
+
+    gdn_gating_cuda((const float *) beta_in->data,  (float *) beta_out->data,  ggml_nelements(beta_out),
+                    (const float *) alpha_in->data, (float *) gate_out->data, ggml_nelements(gate_out),
+                    (const float *) dt->data, (const float *) a->data, alpha_in->ne[0], stream);
+}
+
 /* fused relu + sqr */
 
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node) {

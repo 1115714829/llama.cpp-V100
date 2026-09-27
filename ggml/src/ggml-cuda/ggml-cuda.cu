@@ -3471,6 +3471,170 @@ static bool ggml_cuda_match_gdn_prologue(
     return true;
 }
 
+struct ggml_cuda_gdn_gating_match {
+    const ggml_tensor * beta_in  = nullptr;
+    ggml_tensor *       beta_out = nullptr;
+    const ggml_tensor * alpha_in = nullptr;
+    const ggml_tensor * dt       = nullptr;
+    const ggml_tensor * a        = nullptr;
+    ggml_tensor *       gate_out = nullptr;
+    int                 last     = 0;
+};
+
+// a per-head bias or weight: 1D f32 [n_heads]
+static bool ggml_cuda_gdn_gating_vector(const ggml_tensor * t, int64_t n_heads) {
+    return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) &&
+           t->ne[0] == n_heads && ggml_nelements(t) == n_heads;
+}
+
+// match the GDN gating: UNARY(SIGMOID) on beta next to ADD -> UNARY(SOFTPLUS) -> MUL on alpha.
+// The chains are independent; either one may come first and views may separate the nodes.
+static bool ggml_cuda_match_gdn_gating(
+        const ggml_cgraph * cgraph, int node_idx, ggml_cuda_gdn_gating_match & match) {
+    int idxs[4];
+    int count = 0;
+    for (int j = node_idx; j < cgraph->n_nodes && count < 4; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(n)) {
+            continue;
+        }
+        idxs[count++] = j;
+    }
+    if (count < 4) {
+        return false;
+    }
+
+    const ggml_tensor * n0 = cgraph->nodes[idxs[0]];
+    const ggml_tensor * n1 = cgraph->nodes[idxs[1]];
+    const ggml_tensor * n2 = cgraph->nodes[idxs[2]];
+    const ggml_tensor * n3 = cgraph->nodes[idxs[3]];
+
+    const auto is_sigmoid  = [](const ggml_tensor * t) {
+        return t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == GGML_UNARY_OP_SIGMOID;
+    };
+    const auto is_softplus = [](const ggml_tensor * t) {
+        return t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == GGML_UNARY_OP_SOFTPLUS;
+    };
+
+    const ggml_tensor * sigmoid  = nullptr;
+    const ggml_tensor * add      = nullptr;
+    const ggml_tensor * softplus = nullptr;
+    const ggml_tensor * mul      = nullptr;
+
+    if (is_sigmoid(n0) && n1->op == GGML_OP_ADD && is_softplus(n2) && n3->op == GGML_OP_MUL) {
+        sigmoid  = n0;
+        add      = n1;
+        softplus = n2;
+        mul      = n3;
+    } else if (n0->op == GGML_OP_ADD && is_softplus(n1) && n2->op == GGML_OP_MUL && is_sigmoid(n3)) {
+        add      = n0;
+        softplus = n1;
+        mul      = n2;
+        sigmoid  = n3;
+    } else {
+        return false;
+    }
+
+    if (softplus->src[0] != add) {
+        return false;
+    }
+
+    // one mul operand is the softplus output, the other one is the per-head ssm_a weight
+    if ((mul->src[0] == softplus) == (mul->src[1] == softplus)) {
+        return false;
+    }
+    const ggml_tensor * a = mul->src[0] == softplus ? mul->src[1] : mul->src[0];
+
+    // the add has the per-head ssm_dt bias and the alpha operand
+    const int64_t n_heads = add->ne[0];
+    const ggml_tensor * dt    = nullptr;
+    const ggml_tensor * alpha = nullptr;
+    if (add->src[0] == nullptr || add->src[1] == nullptr) {
+        return false;
+    }
+    if (ggml_cuda_gdn_gating_vector(add->src[1], n_heads)) {
+        dt    = add->src[1];
+        alpha = add->src[0];
+    } else if (ggml_cuda_gdn_gating_vector(add->src[0], n_heads)) {
+        dt    = add->src[0];
+        alpha = add->src[1];
+    } else {
+        return false;
+    }
+
+    const ggml_tensor * beta_in = sigmoid->src[0];
+    if (beta_in == nullptr || alpha == nullptr || a == nullptr) {
+        return false;
+    }
+
+    // every tensor of the chain is f32 and contiguous
+    for (const ggml_tensor * t : { beta_in, sigmoid, alpha, add, softplus, mul, dt, a }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
+            return false;
+        }
+    }
+
+    if (!ggml_cuda_gdn_gating_vector(a, n_heads) || !ggml_are_same_shape(add, softplus) ||
+        !ggml_are_same_shape(softplus, mul)) {
+        return false;
+    }
+
+    // the fused kernel runs at the position of the first node of the chain, so its inputs must
+    // be computed before it
+    if (!ggml_cuda_tensor_ready_before(cgraph, beta_in, node_idx) ||
+        !ggml_cuda_tensor_ready_before(cgraph, alpha,   node_idx) ||
+        !ggml_cuda_tensor_ready_before(cgraph, dt,      node_idx) ||
+        !ggml_cuda_tensor_ready_before(cgraph, a,       node_idx)) {
+        return false;
+    }
+
+    // alpha_biased and alpha_softplus have no users outside the chain; beta_out and gate_out are kept
+    const enum ggml_op ops[] = { n0->op, n1->op, n2->op, n3->op };
+    const int out_nodes[] = { sigmoid == n0 ? idxs[0] : idxs[3], mul == n2 ? idxs[2] : idxs[3] };
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, 4, ops, out_nodes, 2)) {
+        return false;
+    }
+
+    // the kernel reads each element before writing it. With equal element counts both chains use
+    // the same thread index, so either output may exactly alias either input; with different
+    // counts the chains run in separate halves of the launch and only the matching input may
+    // alias. Outputs never overlap each other, dt or a.
+    auto overlap = [](const ggml_tensor * x, const ggml_tensor * y) {
+        const uintptr_t x0 = (uintptr_t) x->data;
+        const uintptr_t y0 = (uintptr_t) y->data;
+        return x0 < y0 + ggml_nbytes(y) && y0 < x0 + ggml_nbytes(x);
+    };
+    const auto same_range = [](const ggml_tensor * x, const ggml_tensor * y) {
+        // all four tensors are contiguous, so an exact alias shares the pointer and byte range
+        return x->data == y->data && ggml_nbytes(x) == ggml_nbytes(y);
+    };
+    bool ranges_ok;
+    if (ggml_nelements(beta_in) == ggml_nelements(alpha)) {
+        ranges_ok = (!overlap(sigmoid, beta_in) || same_range(sigmoid, beta_in)) &&
+                    (!overlap(sigmoid, alpha)   || same_range(sigmoid, alpha))   &&
+                    (!overlap(mul, beta_in)     || same_range(mul, beta_in))     &&
+                    (!overlap(mul, alpha)       || same_range(mul, alpha));
+    } else {
+        ranges_ok = ggml_cuda_fused_output_ranges_ok(sigmoid, { beta_in }) &&
+                    ggml_cuda_fused_output_ranges_ok(mul,     { alpha });
+    }
+    if (!ranges_ok ||
+        overlap(sigmoid, mul) || overlap(sigmoid, dt) || overlap(sigmoid, a) ||
+        overlap(mul, dt) || overlap(mul, a)) {
+        return false;
+    }
+
+    // the graph nodes themselves are mutable, the matcher only looks at them through const pointers
+    match.beta_in  = beta_in;
+    match.beta_out = const_cast<ggml_tensor *>(sigmoid);
+    match.alpha_in = alpha;
+    match.dt       = dt;
+    match.a        = a;
+    match.gate_out = const_cast<ggml_tensor *>(mul);
+    match.last     = idxs[3];
+    return true;
+}
+
 static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int node_idx, ggml_cuda_topk_moe_args & args) {
     args.sigmoid         = false;
     args.sqrt_softplus   = false;
@@ -4475,6 +4639,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 #endif
             ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy);
             return nodes_to_skip;
+        }
+    }
+
+    // GDN gating: beta = sigmoid(beta) and gate = softplus(alpha + dt) * a in one kernel.
+    // Either chain may come first in the graph.
+    if (node->op == GGML_OP_ADD ||
+            (node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID)) {
+        ggml_cuda_gdn_gating_match match;
+        if (ggml_cuda_match_gdn_gating(cgraph, i, match)) {
+            ggml_cuda_op_gdn_gating(*cuda_ctx, match.beta_in, match.beta_out,
+                match.alpha_in, match.dt, match.a, match.gate_out);
+            return match.last - i;
         }
     }
 

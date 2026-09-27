@@ -4103,6 +4103,62 @@ struct test_rms_norm_mul_silu_mul : public test_case {
     }
 };
 
+// UNARY(SIGMOID) next to ADD + UNARY(SOFTPLUS) + MUL (fused GDN gating)
+struct test_gdn_gating : public test_case {
+    const int64_t n_heads;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+    const bool swap; // the alpha chain comes first in the graph
+
+    ggml_tensor * beta_out = nullptr;
+    ggml_tensor * gate_out = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GDN_GATING";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    // both outputs of the fusion are used outside of it, so compare both
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { beta_out, gate_out }; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_heads, n_seq_tokens, n_seqs, swap);
+    }
+
+    test_gdn_gating(int64_t n_heads = 12, int64_t n_seq_tokens = 8, int64_t n_seqs = 1, bool swap = false)
+        : n_heads(n_heads), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), swap(swap) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * beta  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_heads, n_seq_tokens*n_seqs);
+        ggml_tensor * alpha = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_heads, n_seq_tokens*n_seqs);
+        ggml_tensor * dt    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_heads);
+        ggml_tensor * a     = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_heads);
+        ggml_set_name(beta,  "beta");
+        ggml_set_name(alpha, "alpha");
+        ggml_set_name(dt,    "dt");
+        ggml_set_name(a,     "a");
+
+        beta = ggml_reshape_4d(ctx, beta, 1, n_heads, n_seq_tokens, n_seqs);
+        beta_out = ggml_sigmoid(ctx, beta);
+        ggml_set_name(beta_out, "beta_out");
+
+        alpha = ggml_reshape_3d(ctx, alpha, n_heads, n_seq_tokens, n_seqs);
+        ggml_tensor * alpha_biased   = ggml_add(ctx, alpha, dt);
+        ggml_tensor * alpha_softplus = ggml_softplus(ctx, alpha_biased);
+        gate_out = ggml_mul(ctx, alpha_softplus, a);
+        ggml_set_name(gate_out, "gate_out");
+
+        ggml_tensor * gate = ggml_reshape_4d(ctx, gate_out, 1, n_heads, n_seq_tokens, n_seqs);
+
+        ggml_tensor * out = swap ? ggml_add(ctx, gate, beta_out) : ggml_add(ctx, beta_out, gate);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_ADD + GGML_OP_ADD (fused residual chain)
 struct test_add_add : public test_case {
     const ggml_type type;
@@ -10499,6 +10555,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_rms_norm_mul_silu_mul({ 128, 12, n_tokens, 1 }, 1e-6f, false));
         test_cases.emplace_back(new test_rms_norm_mul_silu_mul({ 128, 12, n_tokens, 1 }, 1e-6f, true));
     }
+
+    // GDN gating: sigmoid(beta) and softplus(alpha + dt) * a in one kernel
+    for (int64_t n_heads : { 12, 48 }) {
+        for (int64_t n_seq_tokens : { 1, 8, 17 }) {
+            for (int64_t n_seqs : { 1, 2 }) {
+                test_cases.emplace_back(new test_gdn_gating(n_heads, n_seq_tokens, n_seqs, false));
+            }
+        }
+    }
+    // the alpha chain may also come first in the graph
+    test_cases.emplace_back(new test_gdn_gating(12, 8, 1, true));
+    test_cases.emplace_back(new test_gdn_gating(48, 1, 2, true));
 
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}));
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}, 1e-6f, false, true));
