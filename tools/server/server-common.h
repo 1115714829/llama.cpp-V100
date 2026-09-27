@@ -212,6 +212,10 @@ public:
 
     llama_tokens get_text_tokens() const;
 
+    // the token list itself when it holds only text tokens (no media chunks), nullptr otherwise;
+    // lets callers avoid the copy made by get_text_tokens()
+    const llama_tokens * text_tokens_or_null() const;
+
     std::vector<char> serialize() const;
     static server_tokens deserialize(const llama_tokens & packed, bool has_mtmd);
 
