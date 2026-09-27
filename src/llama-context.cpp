@@ -922,11 +922,13 @@ void llama_context::synchronize() {
         return;
     }
 
+    // the schedulers are built on the same set of backends, synchronizing one of them is enough;
+    // the extra schedulers are only synchronized to reset their copy index for pipeline parallelism
     ggml_backend_sched_synchronize(sched.get());
-    if (sched_slot0) {
+    if (sched_slot0 && ggml_backend_sched_get_n_copies(sched_slot0.get()) > 1) {
         ggml_backend_sched_synchronize(sched_slot0.get());
     }
-    if (sched_dec) {
+    if (sched_dec && ggml_backend_sched_get_n_copies(sched_dec.get()) > 1) {
         ggml_backend_sched_synchronize(sched_dec.get());
     }
 
