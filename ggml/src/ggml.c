@@ -5510,8 +5510,14 @@ struct ggml_tensor * ggml_flash_attn_ext(
     GGML_ASSERT(q->ne[3] == v->ne[3]);
 
     if (mask) {
-        GGML_ASSERT(mask->type == GGML_TYPE_F16);
+        GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_I32);
         GGML_ASSERT(ggml_is_contiguous(mask));
+        if (mask->type == GGML_TYPE_I32) {
+            // range mask: one [lo, hi) pair of visible KV columns per query row
+            GGML_ASSERT(mask->ne[0] == 2);
+            GGML_ASSERT(mask->ne[1] >= q->ne[1]);
+            GGML_ASSERT(max_bias == 0.0f);
+        }
         //GGML_ASSERT(ggml_can_repeat_rows(mask, qk));
 
         GGML_ASSERT(q->ne[2] % mask->ne[2] == 0);
@@ -5563,6 +5569,7 @@ void ggml_flash_attn_ext_set_n_kv_max(
         int32_t              n_kv_max) {
     GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
     GGML_ASSERT(n_kv_max >= 0);
+    GGML_ASSERT(n_kv_max == 0 || a->src[3] == NULL || a->src[3]->type == GGML_TYPE_F16);
 
     ggml_set_op_params_i32(a, 4, n_kv_max);
 }
