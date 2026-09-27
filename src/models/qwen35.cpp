@@ -146,7 +146,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
     cb(inpL, "model.input_embed", -1);
 
-    auto * inp = build_inp_mem_hybrid();
+    auto * inp = build_inp_mem_hybrid(/*range_mask =*/ true);
 
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();

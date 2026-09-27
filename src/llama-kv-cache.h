@@ -233,6 +233,14 @@ public:
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
+    // the KQ mask of this ubatch is exactly one [lo, hi) range of visible cells per token:
+    // a non-SWA cache, one stream, one sequence, and cells [0, n_used) all holding that sequence
+    // at consecutive positions (O(n_used) check)
+    bool get_kq_range_ok(const slot_info & sinfo, const llama_ubatch & ubatch) const;
+
+    // fills an I32 [2, n_tokens, 1, 1] range mask: [0, pos - pos(cell 0) + 1) for every token
+    void set_input_kq_range(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
     // true if llama_kv_cell_ext holds information that has to survive a state save/restore
     bool has_cell_ext() const;
 
@@ -404,6 +412,11 @@ public:
 
     uint32_t get_n_kv() const;
 
+    // true if the KQ mask of the current ubatch is a single [lo, hi) range per token
+    bool get_kq_range() const {
+        return kq_range;
+    }
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 
@@ -471,4 +484,7 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+
+    // true if the current ubatch can use a range mask (see llama_kv_cache::get_kq_range_ok)
+    bool kq_range = false;
 };

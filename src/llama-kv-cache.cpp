@@ -1875,6 +1875,68 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
 }
 
+bool llama_kv_cache::get_kq_range_ok(const slot_info & sinfo, const llama_ubatch & ubatch) const {
+    if (swa_type != LLAMA_SWA_TYPE_NONE) {
+        return false;
+    }
+
+    if (sinfo.n_stream() != 1) {
+        return false;
+    }
+
+    if (ubatch.n_seqs_unq != 1 || ubatch.n_tokens == 0) {
+        return false;
+    }
+
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (ubatch.n_seq_id[i] != 1) {
+            return false;
+        }
+    }
+
+    const llama_seq_id s = ubatch.seq_id_unq[0];
+
+    const auto & cells = v_cells[sinfo.strm[0]];
+
+    const uint32_t n_used = cells.get_used();
+
+    if (n_used == 0 || n_used != cells.used_max_p1()) {
+        return false;
+    }
+
+    if (cells.seq_n_cells(s) != n_used) {
+        return false;
+    }
+
+    const llama_pos pos0 = cells.pos_get(0);
+
+    for (uint32_t j = 1; j < n_used; ++j) {
+        if (cells.pos_get(j) != pos0 + (llama_pos) j) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void llama_kv_cache::set_input_kq_range(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->ne[0] == 2);
+    GGML_ASSERT(dst->ne[1] == ubatch->n_tokens);
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+
+    const auto & cells = v_cells[seq_to_stream[ubatch->seq_id[0][0]]];
+
+    const llama_pos pos0 = cells.pos_get(0);
+
+    int32_t * data = (int32_t *) dst->data;
+
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        data[2*i + 0] = 0;
+        data[2*i + 1] = ubatch->pos[i] - pos0 + 1;
+    }
+}
+
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     const int64_t n_tokens = ubatch->n_tokens;
 
@@ -2907,6 +2969,7 @@ bool llama_kv_cache_context::apply() {
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv = kv->get_n_kv(sinfos[i_cur]);
+    kq_range = kv->get_kq_range_ok(sinfos[i_cur], ubatches[i_cur]);
 
     return true;
 }
@@ -2978,6 +3041,12 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 }
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    if (dst->type == GGML_TYPE_I32) {
+        kv->set_input_kq_range(dst, ubatch);
+
+        return;
+    }
+
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
 }
 
