@@ -114,6 +114,25 @@ LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
 
+// DFlash2: keep the target layer inputs in a device sink instead of host buffers. The order of
+// lids is the row order within the sink and must match the draft's target_layer_ids. Returns
+// false if unsupported or the allocation failed - the caller then uses the host path.
+LLAMA_API bool llama_enable_layer_inp_sink(struct llama_context * ctx, const uint32_t * lids, uint32_t n_layers);
+
+// DFlash2: link a target and a draft context for the direct device transfer of the layer inputs.
+// Creates the events and allocates the draft staging sink. Returns false if the devices are not
+// compatible or the allocation failed - the caller then uses the host path.
+LLAMA_API bool llama_context_link_embd(struct llama_context * ctx_tgt, struct llama_context * ctx_dft);
+
+// DFlash2: select the source of the next embd batch of a linked draft: true reads the staging
+// sink (token_offset selects the first target-sink column to copy, and is ignored for the graph),
+// false uses the host input. No-op when the context is not linked.
+LLAMA_API void llama_set_embd_source(struct llama_context * ctx, bool enable, int32_t token_offset);
+
+// DFlash2 host fallback: copy the sink rows [token_offset, token_offset + n_tokens) into dst,
+// in the same per-token layer order as the injection embd rows. Requires a sink.
+LLAMA_API bool llama_layer_inp_sink_get(struct llama_context * ctx, size_t token_offset, size_t n_tokens, float * dst);
+
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
 //

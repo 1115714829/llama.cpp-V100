@@ -33,6 +33,61 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     throw std::runtime_error("Unsupported ctx type");
 }
 
+// the DFlash2 link pairs devices by index, so both contexts must use the same device set in the same
+// order; the meta device name lists its simple devices in order and meta devices are created per model
+static bool llm_devices_compatible(ggml_backend_t a, ggml_backend_t b) {
+    ggml_backend_dev_t dev_a = ggml_backend_get_device(a);
+    ggml_backend_dev_t dev_b = ggml_backend_get_device(b);
+
+    if (dev_a == nullptr || dev_b == nullptr) {
+        return false;
+    }
+    if (dev_a == dev_b) {
+        return true; // same simple device
+    }
+
+    return ggml_backend_dev_type(dev_a) == GGML_BACKEND_DEVICE_TYPE_META &&
+           ggml_backend_dev_type(dev_b) == GGML_BACKEND_DEVICE_TYPE_META &&
+           strcmp(ggml_backend_dev_name(dev_a), ggml_backend_dev_name(dev_b)) == 0;
+}
+
+// copy n_tokens columns [src_col, src_col + n_tokens) of the target sink into the draft staging
+// sink, starting at column 0; both tensors are static and MIRRORED
+static void llm_embd_src_copy(ggml_backend_t backend, ggml_tensor * src, size_t src_col, ggml_tensor * dst, size_t n_tokens) {
+    GGML_ASSERT(src->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(src->ne[0] == dst->ne[0]);
+
+    const size_t row_bytes = (size_t) src->ne[0] * sizeof(float);
+    const size_t src_offs  = src_col * row_bytes;
+    const size_t nbytes    = n_tokens * row_bytes;
+    GGML_ASSERT(src_offs + nbytes <= ggml_nbytes(src));
+    GGML_ASSERT(nbytes <= ggml_nbytes(dst));
+
+    if (ggml_backend_buffer_is_meta(src->buffer)) {
+        GGML_ASSERT(ggml_backend_buffer_is_meta(dst->buffer));
+        // each device copies only its local slice of the MIRRORED tensors
+        ggml_backend_meta_copy_mirrored_async(backend, src, src_offs, dst, 0, nbytes);
+        return;
+    }
+
+    // same device on both sides: copy through 1D views over the static tensors
+    const ggml_init_params params = {
+        /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx(ggml_init(params));
+
+    const int64_t nel = (int64_t) (nbytes / sizeof(float));
+    ggml_tensor * src_view = ggml_view_1d(ctx.get(), src, nel, src_offs);
+    ggml_tensor * dst_view = ggml_view_1d(ctx.get(), dst, nel, 0);
+    GGML_ASSERT(ggml_backend_view_init(src_view) == GGML_STATUS_SUCCESS);
+    GGML_ASSERT(ggml_backend_view_init(dst_view) == GGML_STATUS_SUCCESS);
+
+    ggml_backend_tensor_copy_async(backend, backend, src_view, dst_view);
+}
+
 struct llm_fused_op_probe {
     llm_fused_op op;
     const char * name;
@@ -1168,6 +1223,10 @@ float * llama_context::get_embeddings_nextn_ith(int32_t i) {
 }
 
 float * llama_context::get_embeddings_layer_inp(uint32_t lid) {
+    if (t_layer_inp_sink != nullptr) {
+        GGML_ABORT("layer inputs are in the device sink, use llama_layer_inp_sink_get");
+    }
+
     output_reorder();
 
     GGML_ASSERT(lid < embd_layer_inp.size() && embd_layer_inp[lid].has_data());
@@ -1373,6 +1432,153 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     sched_need_reserve = true;
 }
 
+bool llama_context::enable_layer_inp_sink(const std::vector<uint32_t> & lids) {
+    if (t_layer_inp_sink != nullptr) {
+        return layer_inp_sink_layers == lids;
+    }
+
+    if (lids.empty() || backends.empty()) {
+        return false;
+    }
+
+    const int64_t n_embd = model.hparams.n_embd;
+
+    const ggml_init_params params = {
+        /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ctx_sink.reset(ggml_init(params));
+
+    ggml_tensor * sink = ggml_new_tensor_2d(ctx_sink.get(), GGML_TYPE_F32, n_embd * (int64_t) lids.size(), cparams.n_batch);
+    ggml_set_name(sink, "embd_layer_inp_sink");
+
+    // the main device buffer type (the meta buft with tensor parallelism) keeps one full copy per device
+    buf_sink.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_sink.get(), ggml_backend_get_default_buffer_type(backends[0].get())));
+    if (!buf_sink) {
+        LLAMA_LOG_WARN("%s: failed to allocate the layer input sink\n", __func__);
+        ctx_sink.reset();
+        return false;
+    }
+
+    t_layer_inp_sink      = sink;
+    layer_inp_sink_layers = lids;
+
+    sched_need_reserve = true;
+
+    return true;
+}
+
+bool llama_context::link_embd(llama_context * ctx_dft) {
+    if (t_layer_inp_sink == nullptr || ctx_dft == nullptr || ctx_dft == this) {
+        return false;
+    }
+
+    if (backends.empty() || ctx_dft->backends.empty()) {
+        return false;
+    }
+
+    if (embd_link || ctx_dft->embd_link) {
+        // already linked: report success only for the same pair (e.g. the speculative impl was rebuilt)
+        return embd_link != nullptr && embd_link == ctx_dft->embd_link;
+    }
+
+    if (!llm_devices_compatible(backends[0].get(), ctx_dft->backends[0].get())) {
+        LLAMA_LOG_WARN("%s: target and draft devices are not compatible for the device feature path\n", __func__);
+        return false;
+    }
+
+    // the staging sink holds a row of the target sink
+    if ((int64_t) ctx_dft->model.hparams.n_embd_inp_enc() != t_layer_inp_sink->ne[0]) {
+        LLAMA_LOG_WARN("%s: draft input width does not match the target sink\n", __func__);
+        return false;
+    }
+
+    ggml_backend_event_t ev_tgt_done  = ggml_backend_event_new(ggml_backend_get_device(backends[0].get()));
+    ggml_backend_event_t ev_copy_done = ggml_backend_event_new(ggml_backend_get_device(ctx_dft->backends[0].get()));
+    if (ev_tgt_done == nullptr || ev_copy_done == nullptr) {
+        ggml_backend_event_free(ev_tgt_done);
+        ggml_backend_event_free(ev_copy_done);
+        return false;
+    }
+
+    // allocate the staging sink of the draft, [n_embd_inp, n_ubatch]
+    {
+        const ggml_init_params params = {
+            /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ctx_dft->ctx_embd_src.reset(ggml_init(params));
+
+        ggml_tensor * sink = ggml_new_tensor_2d(ctx_dft->ctx_embd_src.get(), GGML_TYPE_F32,
+                ctx_dft->model.hparams.n_embd_inp_enc(), ctx_dft->cparams.n_ubatch);
+        ggml_set_name(sink, "embd_src_sink");
+
+        ctx_dft->buf_embd_src.reset(ggml_backend_alloc_ctx_tensors_from_buft(
+                ctx_dft->ctx_embd_src.get(), ggml_backend_get_default_buffer_type(ctx_dft->backends[0].get())));
+        if (!ctx_dft->buf_embd_src) {
+            LLAMA_LOG_WARN("%s: failed to allocate the draft staging sink\n", __func__);
+            ctx_dft->ctx_embd_src.reset();
+            ggml_backend_event_free(ev_tgt_done);
+            ggml_backend_event_free(ev_copy_done);
+            return false;
+        }
+
+        ctx_dft->t_embd_src_sink = sink;
+    }
+
+    auto link = std::make_shared<llama_embd_link>();
+    link->ev_tgt_done      = ev_tgt_done;
+    link->ev_copy_done     = ev_copy_done;
+    link->t_layer_inp_sink = t_layer_inp_sink;
+    link->t_embd_src_sink  = ctx_dft->t_embd_src_sink;
+
+    embd_link          = link;
+    ctx_dft->embd_link = link;
+
+    ctx_dft->embd_src_enable = false;
+
+    // the injection graph no longer has a host input tensor
+    ctx_dft->sched_need_reserve = true;
+
+    return true;
+}
+
+void llama_context::set_embd_source(bool enable, int32_t token_offset) {
+    if (!embd_link || t_embd_src_sink == nullptr) {
+        return;
+    }
+
+    if (embd_src_enable != enable) {
+        embd_src_enable = enable;
+
+        // the host input path and the device sink path are different graphs
+        sched_need_reserve = true;
+    }
+
+    embd_src_offset = token_offset;
+}
+
+bool llama_context::layer_inp_sink_get(size_t token_offset, size_t n_tokens, float * dst) {
+    if (t_layer_inp_sink == nullptr || dst == nullptr) {
+        return false;
+    }
+
+    const size_t row = (size_t) t_layer_inp_sink->ne[0];
+    GGML_ASSERT(row == (size_t) model.hparams.n_embd * layer_inp_sink_layers.size());
+
+    if (token_offset + n_tokens > (size_t) t_layer_inp_sink->ne[1]) {
+        return false;
+    }
+
+    // the sink may still be written by the target graph
+    synchronize();
+    ggml_backend_tensor_get(t_layer_inp_sink, dst, token_offset*row*sizeof(float), n_tokens*row*sizeof(float));
+
+    return true;
+}
+
 void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
@@ -1518,7 +1724,7 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
-llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret, size_t token_offset) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1534,7 +1740,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
-    const auto gparams = graph_params(sched_cur, res, ubatch, mctx, gtype);
+    const auto gparams = graph_params(sched_cur, res, ubatch, mctx, gtype, token_offset);
 
     if (!graph_reuse_disable && gf_res_prev_active[slot] == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
@@ -1587,7 +1793,32 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    // DFlash2 cross-context ordering. Waiting on an event that was never recorded is a no-op on CUDA,
+    // so the first target write and the first draft read find nothing to wait for.
+    const bool writes_sink = embd_link && t_layer_inp_sink != nullptr;
+    const bool copies_src  = embd_link && embd_src_enable && t_embd_src_sink != nullptr && ubatch.embd != nullptr;
+
+    if (writes_sink) {
+        // the draft may still be copying the previous write
+        ggml_backend_event_wait(backends[0].get(), embd_link->ev_copy_done);
+    }
+
+    if (copies_src) {
+        // wait for the target write, copy this ubatch into the staging sink, then release the sink
+        // for the next write (the copy runs on the same stream as the injection graph)
+        ggml_backend_event_wait(backends[0].get(), embd_link->ev_tgt_done);
+        // token_offset: this ubatch within the draft batch, whose first token is target-sink column embd_src_offset
+        llm_embd_src_copy(backends[0].get(), embd_link->t_layer_inp_sink, embd_src_offset + token_offset, embd_link->t_embd_src_sink, ubatch.n_tokens);
+        ggml_backend_event_record(embd_link->ev_copy_done, backends[0].get());
+    }
+
     const auto status = graph_compute_impl(sched_cur, res->get_gf(), ubatch.n_tokens > 1);
+
+    if (writes_sink) {
+        // the draft can copy the sink once this graph completed on the target stream
+        ggml_backend_event_record(embd_link->ev_tgt_done, backends[0].get());
+    }
+
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2022,7 +2253,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         ggml_status status;
 
-        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status, (size_t) n_tokens_prev);
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -2287,8 +2518,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         embd_nextn.size = (size_t) n_embd_out * n_batch;
     }
 
+    // DFlash2: with the device sink enabled the layer inputs stay on the device, no host buffers
     for (bool enabled : cparams.embeddings_layer_inp) {
-        if (enabled) {
+        if (enabled && t_layer_inp_sink == nullptr) {
             embd_layer_inp_float_count += (size_t) n_embd * n_batch;
         }
     }
@@ -2362,7 +2594,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     offset += embd_nextn.size * sizeof(float);
 
     for (uint32_t il = 0; il < embd_layer_inp.size(); ++il) {
-        if (cparams.embeddings_layer_inp[il]) {
+        if (cparams.embeddings_layer_inp[il] && t_layer_inp_sink == nullptr) {
             embd_layer_inp[il] = buffer_view<float>{(float *) (base + offset), (size_t) n_embd * n_batch};
             offset += embd_layer_inp[il].size * sizeof(float);
         } else {
@@ -2429,6 +2661,11 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 }
 
 void llama_context::extract_layer_inputs(ggml_backend_sched_t sched, const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
+    // DFlash2: the layer inputs are in the device sink, use llama_layer_inp_sink_get to read them
+    if (t_layer_inp_sink != nullptr) {
+        return;
+    }
+
     for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
         if (!cparams.embeddings_layer_inp[il]) {
             continue;
@@ -2739,7 +2976,8 @@ llm_graph_params llama_context::graph_params(
                          llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const {
+                          llm_graph_type   gtype,
+                             size_t        token_offset) const {
     return {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
@@ -2757,6 +2995,10 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(sched),
         /*.res         =*/ res,
+        /*.t_layer_inp_sink      =*/ t_layer_inp_sink,
+        /*.t_embd_src            =*/ embd_src_enable ? t_embd_src_sink : nullptr,
+        /*.layer_inp_sink_layers =*/ layer_inp_sink_layers,
+        /*.token_offset          =*/ t_layer_inp_sink != nullptr ? token_offset : 0,
     };
 }
 
@@ -4208,6 +4450,27 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
+}
+
+bool llama_enable_layer_inp_sink(struct llama_context * ctx, const uint32_t * lids, uint32_t n_layers) {
+    std::vector<uint32_t> lids_vec;
+    if (lids != nullptr) {
+        lids_vec.assign(lids, lids + n_layers);
+    }
+
+    return ctx->enable_layer_inp_sink(lids_vec);
+}
+
+bool llama_context_link_embd(struct llama_context * ctx_tgt, struct llama_context * ctx_dft) {
+    return ctx_tgt->link_embd(ctx_dft);
+}
+
+void llama_set_embd_source(struct llama_context * ctx, bool enable, int32_t token_offset) {
+    ctx->set_embd_source(enable, token_offset);
+}
+
+bool llama_layer_inp_sink_get(struct llama_context * ctx, size_t token_offset, size_t n_tokens, float * dst) {
+    return ctx->layer_inp_sink_get(token_offset, n_tokens, dst);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

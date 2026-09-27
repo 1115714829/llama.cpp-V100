@@ -819,6 +819,12 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // DFlash2 device feature sink, see llama_enable_layer_inp_sink
+    ggml_tensor * t_layer_inp_sink = nullptr;    // target: sink written by this graph
+    ggml_tensor * t_embd_src       = nullptr;    // draft: staging sink read by the injection graph
+    std::vector<uint32_t> layer_inp_sink_layers; // target: row order within the sink
+    size_t token_offset = 0;                     // target: first sink column written by this ubatch
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -889,7 +895,11 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
-            cross == other.cross;
+            cross == other.cross &&
+            t_layer_inp_sink      == other.t_layer_inp_sink      &&
+            t_embd_src            == other.t_embd_src            &&
+            token_offset          == other.token_offset          &&
+            layer_inp_sink_layers == other.layer_inp_sink_layers;
     }
 };
 
@@ -1048,6 +1058,12 @@ struct llm_graph_context {
     const llm_graph_cb & cb_func;
 
     llm_graph_result * res;
+
+    // DFlash2 device feature sink, copied from the graph parameters
+    ggml_tensor * const t_layer_inp_sink;    // target: sink written by this graph
+    ggml_tensor * const t_embd_src;          // draft: staging sink read by the injection graph
+    const std::vector<uint32_t> layer_inp_sink_layers;
+    const size_t token_offset;               // target: first sink column written by this ubatch
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
@@ -1402,6 +1418,13 @@ struct llm_graph_context {
             ggml_tensor * dense_2,
             ggml_tensor * dense_2_b,
             ggml_tensor * dense_3) const;
+
+    //
+    // DFlash2 device feature sink
+    //
+
+    // append copies of the extracted layer inputs into the device sink (target side, no-op when not enabled)
+    void build_layer_inp_sink() const;
 };
 
 // TODO: better name

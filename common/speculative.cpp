@@ -945,6 +945,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
 
+    // DFlash2 device path: target device sink + cross-context link
+    bool sink_ready = false;
+    bool link_ready = false;
+
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
         : common_speculative_impl(type, n_seq, params.draft.n_max)
@@ -1055,6 +1059,20 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
         }
 
+        // DFlash2: keep the target layer inputs on the device and copy them to the draft directly.
+        // If enable fails the regular host extraction stays; without a link the features are read
+        // back from the sink per chunk instead.
+        {
+            std::vector<uint32_t> lids(target_layer_ids, target_layer_ids + target_layer_ids_n);
+            sink_ready = llama_enable_layer_inp_sink(ctx_tgt, lids.data(), (uint32_t) lids.size());
+        }
+        if (sink_ready) {
+            link_ready = llama_context_link_embd(ctx_tgt, ctx_dft);
+            if (!link_ready) {
+                LOG_WRN("%s: device feature link unavailable, using the host fallback\n", __func__);
+            }
+        }
+
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2);
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
@@ -1135,6 +1153,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
+        // the device path needs the target sink, a token batch and a single active sequence: the
+        // staging copy always fills column 0 and the injection graph reads a fixed view there
+        int32_t n_active = 0;
+        for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+            n_active += (i_batch_beg[s] >= 0);
+        }
+        const bool dev_batch = sink_ready && link_ready && has_tokens && !has_embeddings && n_active == 1;
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
                 continue;
@@ -1150,19 +1176,38 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
+                const int32_t col_beg = i_batch_beg[seq_id] + offset;
 
-                // gather target features per extract layer; the fused decode encodes and
-                // injects them into the K/V cache at the target positions
+                // only a chunk starting at column 0 can use the device path; the fused decode
+                // encodes the features and injects them into the K/V cache at the target positions
+                const bool use_dev = dev_batch && col_beg == 0;
+
                 batch_inject.n_tokens = n_chunk;
-                for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-                    const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
-                    if (!layer) {
-                        GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
-                    }
-                    for (int32_t i = 0; i < n_chunk; ++i) {
-                        float       * dst = batch_inject.embd + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
-                        const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
-                        std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+
+                if (use_dev) {
+                    // batch_inject.embd stays as a placeholder; process_ubatch copies the sink
+                    llama_set_embd_source(ctx_dft, true, col_beg);
+                } else {
+                    llama_set_embd_source(ctx_dft, false, 0);
+
+                    if (sink_ready) {
+                        // the features are on the target device: read back the columns of this chunk
+                        if (!llama_layer_inp_sink_get(ctx_tgt, (size_t) col_beg, (size_t) n_chunk, batch_inject.embd)) {
+                            LOG_ERR("%s: failed to read the target feature sink\n", __func__);
+                            return false;
+                        }
+                    } else {
+                        for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                            const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                            if (!layer) {
+                                GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
+                            }
+                            for (int32_t i = 0; i < n_chunk; ++i) {
+                                float       * dst = batch_inject.embd + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
+                                const float * src = layer + (size_t) (col_beg + i) * n_embd_tgt;
+                                std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+                            }
+                        }
                     }
                 }
 
