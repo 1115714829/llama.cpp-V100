@@ -1,5 +1,6 @@
-// Adapted from 1Cat-vLLM flash-attention-v100: include/fused_mma.h (Volta WMMA wrapper)
-// and kernel/flash_decode_paged.cu (grouped verify kernel), https://github.com/1CatAI/1Cat-vLLM
+// Adapted from 1Cat-vLLM (Apache-2.0), https://github.com/1CatAI/1Cat-vLLM:
+//   include/fused_mma.h (Volta WMMA wrapper)
+//   csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu (grouped verify kernel)
 
 #pragma once
 
@@ -147,17 +148,31 @@ constexpr float kXQANegInf = -1.0e30f;
 constexpr int kGroupedVerifyHeads        = 6;
 constexpr int kGroupedVerifyHeadDim      = 256;
 constexpr int kGroupedVerifyRows         = 48;
-constexpr int kGroupedVerifyBlockN       = 32;
+constexpr int kGroupedVerifyBlockN       = 64;
 constexpr int kGroupedVerifyQStride      = 264; // half per row, 528 B, 16 B aligned
 constexpr int kGroupedVerifyKVStride     = 264;
-constexpr int kGroupedVerifyScoreStride  = 32;
-constexpr int kGroupedVerifyProbStride   = 40;
+constexpr int kGroupedVerifyScoreStride  = 64;
+constexpr int kGroupedVerifyProbStride   = 72; // BlockN + 8 half, keeps the WMMA A loads conflict free
 constexpr int kGroupedVerifyKVQ8RowBytes = 272; // 8 q8_0 blocks of 34 B
 constexpr int kGroupedVerifyThreads      = 512;
 constexpr int kGroupedVerifyWarps        = kGroupedVerifyThreads / WARP_SIZE;
 constexpr int kGroupedVerifyQKWarps      = (kGroupedVerifyRows / 16) * (kGroupedVerifyBlockN / 16);
 constexpr int kGroupedVerifyOutputTiles  = (kGroupedVerifyRows / 16) * (kGroupedVerifyHeadDim / 16);
 constexpr int kGroupedVerifyOutputTilesPerWarp = kGroupedVerifyOutputTiles / kGroupedVerifyWarps;
+constexpr int kGroupedVerifyRowsPerWarp  = kGroupedVerifyRows / kGroupedVerifyWarps;
+// Two adjacent KV columns per lane, so mask, scores and probabilities move in pairs.
+constexpr int kGroupedVerifyColsPerLane  = kGroupedVerifyBlockN / WARP_SIZE;
+// The q8_0 staging buffer is split into one row block per warp. A warp only reads
+// back its own rows, so the store and the dequantize need no block wide fence.
+constexpr int kGroupedVerifyStageRowsPerWarp = kGroupedVerifyBlockN / kGroupedVerifyWarps;
+
+static_assert(kGroupedVerifyBlockN % 16 == 0, "the KV tile must be a multiple of the WMMA N");
+static_assert(kGroupedVerifyQKWarps <= kGroupedVerifyWarps, "QK tiles must fit into the warps");
+static_assert(kGroupedVerifyColsPerLane == 2, "the softmax handles two adjacent columns per lane");
+static_assert(kGroupedVerifyRows % kGroupedVerifyWarps == 0, "softmax rows must divide evenly");
+static_assert(kGroupedVerifyWarps == kGroupedVerifyHeadDim / 16, "one warp per V output tile");
+static_assert(kGroupedVerifyOutputTilesPerWarp == kGroupedVerifyRows / 16, "one accumulator per M tile");
+static_assert(kGroupedVerifyBlockN % kGroupedVerifyWarps == 0, "staging rows must divide evenly");
 
 template <int MAX_QUERY_TOKENS>
 struct GroupedVerifyTraits {
@@ -167,6 +182,14 @@ struct GroupedVerifyTraits {
     static_assert(MAX_QUERY_TOKENS * kHeadsPerCta == kGroupedVerifyRows, "the CTA must keep 48 rows");
 };
 
+// Shared memory budget (Volta allows 96 KiB per block with opt-in):
+//   q        48 * 264 * 2 = 25344 B
+//   kv       64 * 264 * 2 = 33792 B  one K or V tile panel
+//   scores   48 *  64 * 4 = 12288 B
+//   probs    48 *  72 * 2 =  6912 B
+//   stage    64 * 272     = 17408 B  raw q8_0 tile
+//   rows          3 * 48 * 4 =  576 B
+//   total                  = 96512 B
 struct alignas(256) GroupedVerifySmem {
     union {
         struct {
@@ -183,7 +206,7 @@ struct alignas(256) GroupedVerifySmem {
     alignas(16) float row_scale[kGroupedVerifyRows];
 };
 
-static_assert(sizeof(GroupedVerifySmem) <= 64 * 1024, "grouped verify must fit Volta's 64 KiB opt-in budget");
+static_assert(sizeof(GroupedVerifySmem) <= 96 * 1024, "grouped verify must fit Volta's 96 KiB opt-in budget");
 static_assert(kGroupedVerifyOutputTiles % kGroupedVerifyWarps == 0, "output tiles must divide evenly across warps");
 
 #if defined(VOLTA_MMA_AVAILABLE)
@@ -205,15 +228,16 @@ __device__ __forceinline__ float warp_reduce_max(float val) {
 }
 
 // One raw KV tile held in registers between the global load and the shared write,
-// so the global latency of tile i+1 hides behind the compute of tile i.
+// so the global latency of tile i+1 hides behind the compute of tile i. Each warp
+// owns a contiguous row block of the staging buffer, see kGroupedVerifyStageRowsPerWarp.
 template <ggml_type type_KV>
 struct GroupedVerifyKVRegs {
     static constexpr int kRowBytes  = type_KV == GGML_TYPE_F16 ? kGroupedVerifyHeadDim * (int) sizeof(__half)
                                                                : kGroupedVerifyKVQ8RowBytes;
     static constexpr int kVecsPerRow  = kRowBytes / 16;
-    static constexpr int kVecsPerTile = kGroupedVerifyBlockN * kVecsPerRow;
-    static constexpr int kVecsPerThread = (kVecsPerTile + kGroupedVerifyThreads - 1) / kGroupedVerifyThreads;
-    static_assert(kVecsPerThread <= 2, "the prefetch must stay small");
+    static constexpr int kVecsPerWarp = kGroupedVerifyStageRowsPerWarp * kVecsPerRow;
+    static constexpr int kVecsPerThread = (kVecsPerWarp + WARP_SIZE - 1) / WARP_SIZE;
+    static_assert(kVecsPerThread <= 4, "the prefetch must stay small");
     uint4 vec[kVecsPerThread];
 };
 
@@ -231,7 +255,7 @@ __device__ __forceinline__ uint32_t grouped_verify_half2_uint(const __half2 h) {
     return u;
 }
 
-// Issue the global loads for one 32 x 256 KV tile. Rows with kv_idx >= n_kv load as zero.
+// Issue the global loads for the staging rows of this warp. Rows with kv_idx >= n_kv load as zero.
 template <ggml_type type_KV>
 __device__ __forceinline__ void flash_attn_sm70_grouped_prefetch_kv(
         GroupedVerifyKVRegs<type_KV> & regs,
@@ -239,20 +263,21 @@ __device__ __forceinline__ void flash_attn_sm70_grouped_prefetch_kv(
         const int seq, const int kv_head, const int tile_start, const int n_kv) {
     static_assert(type_KV == GGML_TYPE_F16 || type_KV == GGML_TYPE_Q8_0, "unsupported KV type");
     constexpr int kVecsPerRow  = GroupedVerifyKVRegs<type_KV>::kVecsPerRow;
-    constexpr int kVecsPerTile = GroupedVerifyKVRegs<type_KV>::kVecsPerTile;
-    const int tid = threadIdx.x;
+    constexpr int kVecsPerWarp = GroupedVerifyKVRegs<type_KV>::kVecsPerWarp;
+    const int warp_id  = threadIdx.x / WARP_SIZE;
+    const int lane_id  = threadIdx.x % WARP_SIZE;
+    const int row_base = warp_id * kGroupedVerifyStageRowsPerWarp;
     const char * tile_base = KV + int64_t(tile_start)*nb11 + kv_head*nb12 + int64_t(seq)*nb13;
 #pragma unroll
     for (int i = 0; i < GroupedVerifyKVRegs<type_KV>::kVecsPerThread; ++i) {
-        const int idx = tid + i * kGroupedVerifyThreads;
-        if (idx >= kVecsPerTile) {
+        const int idx = lane_id + i * WARP_SIZE;
+        if (idx >= kVecsPerWarp) {
             continue;
         }
-        const int row     = idx / kVecsPerRow;
+        const int row     = row_base + idx / kVecsPerRow;
         const int vec_col = idx % kVecsPerRow;
         if (tile_start + row < n_kv) {
-            const char * src = tile_base + row*nb11 + vec_col*16;
-            regs.vec[i] = __ldg(reinterpret_cast<const uint4 *>(src));
+            regs.vec[i] = __ldg(reinterpret_cast<const uint4 *>(tile_base + row*nb11 + vec_col*16));
         } else {
             regs.vec[i] = make_uint4(0, 0, 0, 0);
         }
@@ -264,26 +289,29 @@ template <ggml_type type_KV>
 __device__ __forceinline__ void flash_attn_sm70_grouped_store_kv(
         __half * shared_kv, uint8_t * kv_stage, const GroupedVerifyKVRegs<type_KV> & regs) {
     constexpr int kVecsPerRow  = GroupedVerifyKVRegs<type_KV>::kVecsPerRow;
-    constexpr int kVecsPerTile = GroupedVerifyKVRegs<type_KV>::kVecsPerTile;
+    constexpr int kVecsPerWarp = GroupedVerifyKVRegs<type_KV>::kVecsPerWarp;
     constexpr int kSharedStrideVec = kGroupedVerifyKVStride / 8;
-    const int tid = threadIdx.x;
+    const int warp_id  = threadIdx.x / WARP_SIZE;
+    const int lane_id  = threadIdx.x % WARP_SIZE;
+    const int row_base = warp_id * kGroupedVerifyStageRowsPerWarp;
 #pragma unroll
     for (int i = 0; i < GroupedVerifyKVRegs<type_KV>::kVecsPerThread; ++i) {
-        const int idx = tid + i * kGroupedVerifyThreads;
-        if (idx >= kVecsPerTile) {
+        const int idx = lane_id + i * WARP_SIZE;
+        if (idx >= kVecsPerWarp) {
             continue;
         }
+        const int row     = row_base + idx / kVecsPerRow;
+        const int vec_col = idx % kVecsPerRow;
         if constexpr (type_KV == GGML_TYPE_F16) {
-            const int row     = idx / kVecsPerRow;
-            const int vec_col = idx % kVecsPerRow;
             reinterpret_cast<uint4 *>(shared_kv)[row * kSharedStrideVec + vec_col] = regs.vec[i];
         } else {
-            reinterpret_cast<uint4 *>(kv_stage)[idx] = regs.vec[i];
+            reinterpret_cast<uint4 *>(kv_stage)[row * kVecsPerRow + vec_col] = regs.vec[i];
         }
     }
 }
 
 // Dequantize a staged q8_0 tile into the half panel. No-op for fp16, which is stored there directly.
+// Only the staging rows of this warp are read back, see kGroupedVerifyStageRowsPerWarp.
 template <ggml_type type_KV>
 __device__ __forceinline__ void flash_attn_sm70_grouped_dequant_kv(
         __half * shared_kv, const uint8_t * kv_stage) {
@@ -292,11 +320,13 @@ __device__ __forceinline__ void flash_attn_sm70_grouped_dequant_kv(
     }
     constexpr int kColsPerItem = 8;
     constexpr int kGroupsPerRow = kGroupedVerifyHeadDim / kColsPerItem;
-    constexpr int kSharedStrideVec = kGroupedVerifyKVStride / 8;
-    const int tid = threadIdx.x;
+    constexpr int kItemsPerWarp = kGroupedVerifyStageRowsPerWarp * kGroupsPerRow;
+    const int warp_id  = threadIdx.x / WARP_SIZE;
+    const int lane_id  = threadIdx.x % WARP_SIZE;
+    const int row_base = warp_id * kGroupedVerifyStageRowsPerWarp;
 #pragma unroll
-    for (int idx = tid; idx < kGroupedVerifyBlockN * kGroupsPerRow; idx += kGroupedVerifyThreads) {
-        const int row = idx / kGroupsPerRow;
+    for (int idx = lane_id; idx < kItemsPerWarp; idx += WARP_SIZE) {
+        const int row = row_base + idx / kGroupsPerRow;
         const int c   = (idx % kGroupsPerRow) * kColsPerItem;
         const int blk = c / 32;
         const int base = row * kGroupedVerifyKVQ8RowBytes + blk * 34;
@@ -314,6 +344,8 @@ __device__ __forceinline__ void flash_attn_sm70_grouped_dequant_kv(
     }
 }
 
+// One 16 x 16 QK tile per warp. BlockN = 64 gives 3 x 4 = 12 tiles for the first 12 warps,
+// twice the tensor core parallelism per KV token of a BlockN = 32 tile.
 __device__ __forceinline__ void grouped_verify_qk(
         const __half * __restrict__ shared_q, const __half * __restrict__ shared_k,
         float * __restrict__ shared_scores, const float qk_scale) {
@@ -362,6 +394,78 @@ __device__ __forceinline__ void grouped_verify_scale_output_fragment(
     fragment.x[5] *= first_scale;
     fragment.x[6] *= second_scale;
     fragment.x[7] *= second_scale;
+}
+
+// Additive mask values of the two adjacent columns handled by one lane.
+struct GroupedVerifyMaskPair {
+    float value[2];
+    bool  visible[2];
+};
+
+// Load the mask pair of one row. The result feeds the softmax after QK, so the global
+// latency of this load overlaps the tensor core work. mask == nullptr makes every
+// column below n_kv visible.
+__device__ __forceinline__ GroupedVerifyMaskPair grouped_verify_load_mask_pair(
+        const char * __restrict__ mask, const int64_t seq_mask_off, const int64_t nb31,
+        const int token_idx, const int n_q, const int kv_idx, const int n_kv) {
+    GroupedVerifyMaskPair pair;
+    pair.value[0]   = 0.0f;
+    pair.value[1]   = 0.0f;
+    pair.visible[0] = false;
+    pair.visible[1] = false;
+    if (token_idx >= n_q || kv_idx >= n_kv) {
+        return pair;
+    }
+    if (mask == nullptr) {
+        pair.visible[0] = true;
+        pair.visible[1] = kv_idx + 1 < n_kv;
+        return pair;
+    }
+    const __half * mask_row = reinterpret_cast<const __half *>(mask + seq_mask_off + nb31 * token_idx);
+    pair.value[0] = __half2float(mask_row[kv_idx]);
+    pair.visible[0] = pair.value[0] > -INFINITY;
+    if (kv_idx + 1 < n_kv) {
+        pair.value[1] = __half2float(mask_row[kv_idx + 1]);
+        pair.visible[1] = pair.value[1] > -INFINITY;
+    }
+    return pair;
+}
+
+// Online softmax for one BlockN tile. Warp w owns rows w, w+16, w+32 and each lane the
+// two adjacent columns (2*lane, 2*lane+1). FP32 max and sum, half probabilities, exactly
+// like the original per-row update; only the reduction order changed with the tile width.
+__device__ __forceinline__ void grouped_verify_softmax_tile(
+        const float * __restrict__ shared_scores, __half * __restrict__ shared_probs,
+        float * __restrict__ row_max, float * __restrict__ row_sum, float * __restrict__ row_scale,
+        const GroupedVerifyMaskPair * __restrict__ row_mask, const int warp_id, const int lane_id) {
+    const int col = kGroupedVerifyColsPerLane * lane_id;
+#pragma unroll
+    for (int i = 0; i < kGroupedVerifyRowsPerWarp; ++i) {
+        const int row = warp_id + i * kGroupedVerifyWarps;
+        const float2 score_pair = *reinterpret_cast<const float2 *>(
+            shared_scores + row * kGroupedVerifyScoreStride + col);
+        const float score0 = row_mask[i].visible[0] ? score_pair.x + row_mask[i].value[0] : kXQANegInf;
+        const float score1 = row_mask[i].visible[1] ? score_pair.y + row_mask[i].value[1] : kXQANegInf;
+        const float tile_max = __shfl_sync(0xffffffffu, warp_reduce_max(fmaxf(score0, score1)), 0);
+        const float old_max = row_max[row];
+        const float new_max = fmaxf(old_max, tile_max);
+        const float probability0 = row_mask[i].visible[0] ? __expf(fmaxf(score0 - new_max, -80.0f)) : 0.0f;
+        const float probability1 = row_mask[i].visible[1] ? __expf(fmaxf(score1 - new_max, -80.0f)) : 0.0f;
+        const float tile_sum = __shfl_sync(0xffffffffu, warp_reduce_sum(probability0 + probability1), 0);
+        const float exp_diff = tile_sum > 0.0f ? __expf(fmaxf(old_max - new_max, -80.0f)) : 1.0f;
+        *reinterpret_cast<__half2 *>(shared_probs + row * kGroupedVerifyProbStride + col) =
+            __floats2half2_rn(probability0, probability1);
+        // Finish every lane's shared-state reads before lane 0 overwrites the
+        // online maximum. Shuffle synchronization does not order memory.
+        __syncwarp();
+        if (lane_id == 0) {
+            if (tile_sum > 0.0f) {
+                row_sum[row] = row_sum[row] * exp_diff + tile_sum;
+                row_max[row] = new_max;
+            }
+            row_scale[row] = exp_diff;
+        }
+    }
 }
 
 #endif // VOLTA_MMA_AVAILABLE
@@ -454,110 +558,106 @@ static __global__ void flash_attn_ext_sm70_grouped(
         ggml_sm70_wmma::fill_fragment(output_fragments[fragment_idx], 0.0f);
     }
 
-    // Tile i+1 is fetched into registers while tile i is computed.
+    // Tile i+1 is fetched into registers while tile i is computed. The staging rows of
+    // this warp are private, so a block wide fence is only needed around the panel.
     GroupedVerifyKVRegs<type_K> k_regs;
     GroupedVerifyKVRegs<type_V> v_regs;
-    flash_attn_sm70_grouped_prefetch_kv<type_K>(k_regs, K, nb11, nb12, nb13, seq, kv_head, split_start, n_kv);
+    if (split_start < split_end) {
+        flash_attn_sm70_grouped_prefetch_kv<type_K>(
+            k_regs, K, nb11, nb12, nb13, seq, kv_head, split_start, n_kv);
+        flash_attn_sm70_grouped_prefetch_kv<type_V>(
+            v_regs, V, nb21, nb22, nb23, seq, kv_head, split_start, n_kv);
+    }
 
     for (int tile_start = split_start; tile_start < split_end; tile_start += kGroupedVerifyBlockN) {
-        // K: q8_0 first fills the staging buffer, fp16 goes straight into the panel.
+        const bool has_next = tile_start + kGroupedVerifyBlockN < split_end;
+
         if constexpr (type_K == GGML_TYPE_F16) {
-            __syncthreads(); // the previous PV must be done reading the panel
+            __syncthreads(); // the previous P x V must be done reading the panel
             flash_attn_sm70_grouped_store_kv<type_K>(shared_kv, kv_stage, k_regs);
             __syncthreads();
         } else {
             flash_attn_sm70_grouped_store_kv<type_K>(shared_kv, kv_stage, k_regs);
-            __syncthreads();
+            __syncthreads(); // the previous P x V must be done reading the panel
             flash_attn_sm70_grouped_dequant_kv<type_K>(shared_kv, kv_stage);
             __syncthreads();
         }
 
-        // Hide the next global loads behind QK.
-        flash_attn_sm70_grouped_prefetch_kv<type_V>(v_regs, V, nb21, nb22, nb23, seq, kv_head, tile_start, n_kv);
-        if (tile_start + kGroupedVerifyBlockN < split_end) {
+        if (has_next) {
             flash_attn_sm70_grouped_prefetch_kv<type_K>(
                 k_regs, K, nb11, nb12, nb13, seq, kv_head, tile_start + kGroupedVerifyBlockN, n_kv);
+        }
+        if constexpr (type_V == GGML_TYPE_Q8_0) {
+            // The staging buffer is free again once the K dequantize is done. For q8_0
+            // the raw V tile waits there until the K panel dies after QK. The next V
+            // tile starts loading right away so its latency hides behind QK.
+            flash_attn_sm70_grouped_store_kv<type_V>(shared_kv, kv_stage, v_regs);
+            if (has_next) {
+                flash_attn_sm70_grouped_prefetch_kv<type_V>(
+                    v_regs, V, nb21, nb22, nb23, seq, kv_head, tile_start + kGroupedVerifyBlockN, n_kv);
+            }
+        }
+
+        // The mask does not depend on the panel, so load it before QK to hide the
+        // global latency behind the tensor core work.
+        GroupedVerifyMaskPair row_mask[kGroupedVerifyRowsPerWarp];
+#pragma unroll
+        for (int i = 0; i < kGroupedVerifyRowsPerWarp; ++i) {
+            const int row = warp_id + i * kGroupedVerifyWarps;
+            row_mask[i] = grouped_verify_load_mask_pair(
+                mask, seq_mask_off, nb31, row / kHeadsPerCta, n_q,
+                tile_start + kGroupedVerifyColsPerLane * lane_id, n_kv);
         }
 
         grouped_verify_qk(shared_q, shared_kv, shared_scores, scale);
         __syncthreads(); // scores are ready and QK is done with the panel
 
-        // V: the panel is free once QK is done, the staging buffer once the K dequantize is done.
-        flash_attn_sm70_grouped_store_kv<type_V>(shared_kv, kv_stage, v_regs);
-
-#pragma unroll
-        for (int row = warp_id; row < kGroupedVerifyRows; row += kGroupedVerifyWarps) {
-            const int token_idx = row / kHeadsPerCta;
-            const int kv_idx = tile_start + lane_id;
-            bool  visible  = false;
-            float mask_val = 0.0f;
-            if (token_idx < n_q && kv_idx < n_kv) {
-                if (mask) {
-                    const half * mask_row = (const half *) (mask + seq_mask_off + nb31*token_idx);
-                    mask_val = __half2float(mask_row[kv_idx]);
-                    visible  = mask_val > -INFINITY;
-                } else {
-                    visible = true;
-                }
-            }
-            const float score = visible ? shared_scores[row * kGroupedVerifyScoreStride + lane_id] + mask_val : kXQANegInf;
-            const float tile_max_lane = warp_reduce_max(score);
-            const float tile_max = __shfl_sync(0xffffffffu, tile_max_lane, 0);
-            const float old_max = smem.row_max[row];
-            const float new_max = fmaxf(old_max, tile_max);
-            const float probability = visible ? __expf(fmaxf(score - new_max, -80.0f)) : 0.0f;
-            const float tile_sum_lane = warp_reduce_sum(probability);
-            const float tile_sum = __shfl_sync(0xffffffffu, tile_sum_lane, 0);
-            const float exp_diff = tile_sum > 0.0f ? __expf(fmaxf(old_max - new_max, -80.0f)) : 1.0f;
-            shared_probs[row * kGroupedVerifyProbStride + lane_id] = __float2half_rn(probability);
-            // Finish every lane's shared-state reads before lane 0 overwrites the
-            // online maximum. Shuffle synchronization does not order memory.
-            __syncwarp();
-            if (lane_id == 0) {
-                if (tile_sum > 0.0f) {
-                    smem.row_sum[row] = smem.row_sum[row] * exp_diff + tile_sum;
-                    smem.row_max[row] = new_max;
-                }
-                smem.row_scale[row] = exp_diff;
+        if constexpr (type_V == GGML_TYPE_F16) {
+            // The panel is free now; fp16 V goes straight into it. The next V tile
+            // starts loading right away so its latency hides behind softmax and P x V.
+            flash_attn_sm70_grouped_store_kv<type_V>(shared_kv, kv_stage, v_regs);
+            if (has_next) {
+                flash_attn_sm70_grouped_prefetch_kv<type_V>(
+                    v_regs, V, nb21, nb22, nb23, seq, kv_head, tile_start + kGroupedVerifyBlockN, n_kv);
             }
         }
-        __syncthreads();
+
+        grouped_verify_softmax_tile(
+            shared_scores, shared_probs, smem.row_max, smem.row_sum, smem.row_scale, row_mask, warp_id, lane_id);
         if constexpr (type_V == GGML_TYPE_Q8_0) {
             flash_attn_sm70_grouped_dequant_kv<type_V>(shared_kv, kv_stage);
         }
-#pragma unroll
-        for (int fragment_idx = 0; fragment_idx < kGroupedVerifyOutputTilesPerWarp; ++fragment_idx) {
-            const int output_tile = warp_id + fragment_idx * kGroupedVerifyWarps;
-            const int m_tile = output_tile / (kGroupedVerifyHeadDim / 16);
-            grouped_verify_scale_output_fragment(output_fragments[fragment_idx], smem.row_scale, m_tile * 16);
-        }
-        __syncthreads(); // probs and the V panel are ready for PV
+        // row_scale is written by every warp and read by every warp below, so the
+        // rescale of the accumulators must wait for this barrier.
+        __syncthreads(); // probs, row_scale and the V panel are ready for P x V
 
 #pragma unroll
         for (int fragment_idx = 0; fragment_idx < kGroupedVerifyOutputTilesPerWarp; ++fragment_idx) {
-            const int output_tile = warp_id + fragment_idx * kGroupedVerifyWarps;
-            const int m_tile = output_tile / (kGroupedVerifyHeadDim / 16);
-            const int d_tile = output_tile % (kGroupedVerifyHeadDim / 16);
-            ggml_sm70_wmma::fragment<ggml_sm70_wmma::matrix_a, 16, 16, 16, half, ggml_sm70_wmma::row_major>
-                probability_fragment;
+            grouped_verify_scale_output_fragment(output_fragments[fragment_idx], smem.row_scale, fragment_idx * 16);
+        }
+
+        // One warp per V column tile, all three M tiles share the same B fragment:
+        // 4 B loads + 12 A loads per warp instead of 4 + 4 + 4 loads per M tile.
+#pragma unroll
+        for (int k_offset = 0; k_offset < kGroupedVerifyBlockN; k_offset += 16) {
             ggml_sm70_wmma::fragment<ggml_sm70_wmma::matrix_b, 16, 16, 16, half, ggml_sm70_wmma::row_major>
                 value_fragment;
-            auto& pv_fragment = output_fragments[fragment_idx];
+            ggml_sm70_wmma::load_matrix_sync(
+                value_fragment,
+                shared_kv + k_offset * kGroupedVerifyKVStride + warp_id * 16,
+                kGroupedVerifyKVStride);
 #pragma unroll
-            for (int k_offset = 0; k_offset < kGroupedVerifyBlockN; k_offset += 16) {
+            for (int m_tile = 0; m_tile < kGroupedVerifyOutputTilesPerWarp; ++m_tile) {
+                ggml_sm70_wmma::fragment<ggml_sm70_wmma::matrix_a, 16, 16, 16, half, ggml_sm70_wmma::row_major>
+                    probability_fragment;
                 ggml_sm70_wmma::load_matrix_sync(
                     probability_fragment,
                     shared_probs + m_tile * 16 * kGroupedVerifyProbStride + k_offset,
                     kGroupedVerifyProbStride);
-                ggml_sm70_wmma::load_matrix_sync(
-                    value_fragment,
-                    shared_kv + k_offset * kGroupedVerifyKVStride + d_tile * 16,
-                    kGroupedVerifyKVStride);
-                ggml_sm70_wmma::mma_sync(pv_fragment, probability_fragment, value_fragment, pv_fragment);
+                ggml_sm70_wmma::mma_sync(
+                    output_fragments[m_tile], probability_fragment, value_fragment, output_fragments[m_tile]);
             }
         }
-        // No sync at the loop bottom: the next iteration starts by writing the staging
-        // buffer, which PV does not read, and its own syncthreads() orders the panel.
     }
 
     // The compute buffers are dead. Reuse their storage for the dense FP32 output.
@@ -565,11 +665,8 @@ static __global__ void flash_attn_ext_sm70_grouped(
     float* shared_output = smem.storage.output;
 #pragma unroll
     for (int fragment_idx = 0; fragment_idx < kGroupedVerifyOutputTilesPerWarp; ++fragment_idx) {
-        const int output_tile = warp_id + fragment_idx * kGroupedVerifyWarps;
-        const int m_tile = output_tile / (kGroupedVerifyHeadDim / 16);
-        const int d_tile = output_tile % (kGroupedVerifyHeadDim / 16);
         ggml_sm70_wmma::store_matrix_sync(
-            shared_output + m_tile * 16 * kGroupedVerifyHeadDim + d_tile * 16,
+            shared_output + fragment_idx * 16 * kGroupedVerifyHeadDim + warp_id * 16,
             output_fragments[fragment_idx], kGroupedVerifyHeadDim, ggml_sm70_wmma::mem_row_major);
     }
     __syncthreads();
