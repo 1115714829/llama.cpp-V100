@@ -494,11 +494,10 @@ struct server_slot {
         // determine the max draft that fits the current slot state
         // note: slot.prompt is not yet expanded with the `id` token sampled above
         //       also, need to leave space for 1 extra token to allow context shifts
+        // note: the remaining budget is not used to limit the draft on purpose - drafting the full
+        //       length keeps the verification batch shape stable near the end of the request, which
+        //       avoids graph rebuilds; accepted tokens that exceed the budget are dropped on output (as in vLLM)
         int n_draft_max = n_ctx - prompt.n_tokens() - 2;
-
-        if (n_remaining() > 0) {
-            n_draft_max = std::min(n_draft_max, n_remaining() - 1);
-        }
 
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
 
@@ -3041,14 +3040,18 @@ private:
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
-                        slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        const llama_tokens * prompt_text = slot.prompt.tokens.text_tokens_or_null();
+                        if (prompt_text == nullptr) {
+                            slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                            prompt_text = &slot.spec_prompt;
+                        }
 
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting      = */ true,
                             /* .n_max         = */ n_draft_max,
                             /* .pos0          = */ slot.prompt.tokens.pos_next(),
                             /* .id_last       = */ slot.sampled,
-                            /* .prompt        = */ &slot.spec_prompt,
+                            /* .prompt        = */ prompt_text,
                             /* .result        = */ &slot.spec_draft,
                             /* .use_rejection = */ slot.spec_use_rejection,
                             /* .temp          = */ slot.task->params.sampling.temp,
