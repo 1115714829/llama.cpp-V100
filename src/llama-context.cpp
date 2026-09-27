@@ -1083,6 +1083,17 @@ void llama_context::set_logits_topk(int32_t k) {
 
     k = (int32_t) std::min<int64_t>(std::max<int32_t>(k, 0), n_vocab);
 
+    // the graph selects a fixed number of candidates per shard, so that requests with different
+    // sampling parameters share the verify graph (a new k rebuilds and re-captures it): the sparse
+    // rejection keeps only the best k of the candidates it gets (common_sampler_sparse_p)
+    if (k > 0) {
+        int32_t k_graph = 64;
+        while (k_graph < k) {
+            k_graph *= 2;
+        }
+        k = (int32_t) std::min<int64_t>(k_graph, n_vocab);
+    }
+
     // the logits are split like the rows of the output projection: with an even split every shard
     // selects its own candidates, so the selection needs no data from the other devices
     int32_t n_shards = 1;
