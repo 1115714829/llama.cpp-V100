@@ -193,6 +193,7 @@ __global__ void sm70_d256_mask_bounds_kernel(
 // One CTA per (q block, batch), one thread per row (blockDim.x == SM70_D256_BLOCK_M).
 __global__ void sm70_d256_range_bounds_kernel(
         const int2 * __restrict__ range, int2 * __restrict__ bounds,
+        int * __restrict__ kv_limit,
         const int q_len, const int kv_len,
         const int64_t range_row_stride, const int64_t range_batch_stride) {
     const int q_block = blockIdx.x;
@@ -243,6 +244,11 @@ __global__ void sm70_d256_range_bounds_kernel(
         }
         // Every (batch, q block) is written exactly once, no memset needed.
         bounds[(int64_t) batch * gridDim.x + q_block] = make_int2(kv_len - first_nz, last_fin + 1);
+
+        // Widest KV row bound across all (batch, q block): the dense kernel only reads whole
+        // kBlockN blocks, so round the last used row up. Empty rows contribute 0.
+        const int rows = ((last_fin + 1 + SM70_D256_MASK_BLOCK_N - 1) / SM70_D256_MASK_BLOCK_N) * SM70_D256_MASK_BLOCK_N;
+        atomicMax(kv_limit, rows < kv_len ? rows : kv_len);
     }
 }
 
@@ -252,16 +258,19 @@ __global__ void sm70_d256_range_bounds_kernel(
 //   [Qs f16: q_pad rows per (batch, head)][Os f32: same shape]
 //   PAD(., 128)
 //   [mask bounds int2: one per (batch, q block)]
+//   PAD(., 128)
+//   [kv_limit int: upper bound of the KV rows the bounds allow]
 // alloc_size and the launcher both go through sm70_d256_get_scratch() so the
 // offsets and the need_f16 predicates can not diverge.
 struct sm70_d256_scratch {
-    size_t total;       // full buffer size: nnbytes(dst) + extra
-    size_t qs_offset;   // relative to dst->data + ggml_nbytes(dst)
+    size_t total;            // full buffer size: nnbytes(dst) + extra
+    size_t qs_offset;        // relative to dst->data + ggml_nbytes(dst)
     size_t os_offset;
     size_t bounds_offset;
-    size_t n_q;         // Qs/Os elements per buffer
+    size_t kv_limit_offset;
+    size_t n_q;              // Qs/Os elements per buffer
     int q_pad;
-    int n_q_blocks;     // q_pad / SM70_D256_BLOCK_M
+    int n_q_blocks;          // q_pad / SM70_D256_BLOCK_M
     bool need_f16_k;
     bool need_f16_v;
     bool v_is_k_view;
@@ -292,8 +301,8 @@ static sm70_d256_scratch sm70_d256_get_scratch(const ggml_tensor * dst) {
     s.os_offset = s.qs_offset + s.n_q * sizeof(half);
     s.n_q_blocks = s.q_pad / SM70_D256_BLOCK_M;
     s.bounds_offset = GGML_PAD(s.os_offset + s.n_q * sizeof(float), 128);
-    s.total = ggml_nbytes(dst) + s.bounds_offset
-        + (size_t) Q->ne[3] * s.n_q_blocks * sizeof(int2);
+    s.kv_limit_offset = GGML_PAD(s.bounds_offset + (size_t) Q->ne[3] * s.n_q_blocks * sizeof(int2), 128);
+    s.total = ggml_nbytes(dst) + s.kv_limit_offset + sizeof(int);
     return s;
 }
 
@@ -323,6 +332,46 @@ static void sm70_d256_dequant_kv(
     const to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(V->type);
     to_fp16(V->data, (half *) s.f16_extra.V, V->ne[0], V->ne[1], V->ne[2], V->ne[3],
             V->nb[1] / ts, V->nb[2] / ts, V->nb[3] / ts, stream);
+}
+
+// q8_0 -> f16 mirror of the rows [0, *kv_limit) only. With a range mask the dense kernel never reads
+// a KV row at or past kv_limit, so a K/V view much wider than the attended range (a prompt ubatch that
+// attends the whole cache) costs no conversion. Output layout as sm70_d256_dequant_kv:
+// [ne3][ne2][ne1][ne0] contiguous, i.e. ((i3*ne2 + i2)*ne1 + i1)*ne0 + i0.
+// One warp per row, grid.y = ne2, grid.z = ne3, rows i1 >= *kv_limit are skipped.
+static __global__ void sm70_d256_dequant_q8_0_rows(
+        const char * __restrict__ src, half * __restrict__ dst,
+        const int ne0, const int ne1, const int ne2,
+        const int64_t nb1, const int64_t nb2, const int64_t nb3,
+        const int * __restrict__ kv_limit) {
+    const int i1 = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (i1 >= *kv_limit) {
+        return;
+    }
+
+    const int lane = threadIdx.x & 31;
+    const int i2 = blockIdx.y;
+    const int i3 = blockIdx.z;
+
+    // lane's q8_0 block of the row and its 8-value group inside the block
+    const int ib = lane / 4;
+    const int iq = (lane % 4) * 8;
+
+    const block_q8_0 * src_row = (const block_q8_0 *) (src + (int64_t) i3*nb3 + (int64_t) i2*nb2 + (int64_t) i1*nb1);
+    half * dst_row = dst + (((int64_t) i3*ne2 + i2)*ne1 + i1)*ne0;
+
+    const float d = __half2float(src_row[ib].d);
+    half2 h[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        h[i] = __floats2half2_rn(d * src_row[ib].qs[iq + 2*i], d * src_row[ib].qs[iq + 2*i + 1]);
+    }
+    uint4 out;
+    memcpy(&out.x, &h[0], sizeof(uint32_t));
+    memcpy(&out.y, &h[1], sizeof(uint32_t));
+    memcpy(&out.z, &h[2], sizeof(uint32_t));
+    memcpy(&out.w, &h[3], sizeof(uint32_t));
+    *reinterpret_cast<uint4 *>(dst_row + ib*32 + iq) = out;
 }
 
 // F16 is read in place: contiguous rows plus 16 B aligned strides for the
@@ -482,13 +531,23 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
     half  * Qs = (half  *) (base + scratch.qs_offset);
     float * Os = (float *) (base + scratch.os_offset);
     int2  * mask_bounds = (int2 *) (base + scratch.bounds_offset);
+    int   * kv_limit = (int *) (base + scratch.kv_limit_offset);
 
     cudaStream_t stream = ctx.stream();
+
+    // A range mask bounds the rows the dense kernel reads, so a q8_0 K/V mirror only needs
+    // [0, *kv_limit) rows. Everything else keeps the full mirror.
+    const bool range_q8 = mask_range && K->type == GGML_TYPE_Q8_0;
 
     // Zero the Q pad rows; their outputs are dropped by the scatter.
     CUDA_CHECK(cudaMemsetAsync(Qs, 0, scratch.n_q * sizeof(half), stream));
 
-    sm70_d256_dequant_kv(K, V, scratch, stream);
+    if (range_q8) {
+        // the bounds kernel raises it to the rows its bounds allow
+        CUDA_CHECK(cudaMemsetAsync(kv_limit, 0, sizeof(int), stream));
+    } else {
+        sm70_d256_dequant_kv(K, V, scratch, stream);
+    }
 
     // K/V are read either in place (f16, strides from the tensor) or from the
     // packed f16 mirror [batch][hkv][kv][D].
@@ -537,11 +596,31 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
         // One CTA per (q block, batch) computes the int2 bounds the dense pre-scan produces.
         const dim3 grid(scratch.n_q_blocks, batch);
         sm70_d256_range_bounds_kernel<<<grid, SM70_D256_BLOCK_M, 0, stream>>>(
-            (const int2 *) mask->data, mask_bounds,
+            (const int2 *) mask->data, mask_bounds, kv_limit,
             q_len, kv_len,
             mask->nb[1] / sizeof(int2),
             mask->ne[3] == 1 ? 0 : (int64_t) mask->nb[3] / sizeof(int2));
         CUDA_CHECK(cudaGetLastError());
+
+        if (range_q8) {
+            // the bounds are known now: mirror only the rows they allow
+            GGML_ASSERT(K->ne[0] == SM70_D256_D);
+            const dim3 grid_k((unsigned) ((K->ne[1] + 7) / 8), (unsigned) K->ne[2], (unsigned) K->ne[3]);
+            sm70_d256_dequant_q8_0_rows<<<grid_k, 256, 0, stream>>>(
+                (const char *) K->data, (half *) scratch.f16_extra.K,
+                (int) K->ne[0], (int) K->ne[1], (int) K->ne[2],
+                K->nb[1], K->nb[2], K->nb[3], kv_limit);
+            CUDA_CHECK(cudaGetLastError());
+            if (!scratch.v_is_k_view && V->type != GGML_TYPE_F16) {
+                GGML_ASSERT(V->ne[0] == SM70_D256_D);
+                const dim3 grid_v((unsigned) ((V->ne[1] + 7) / 8), (unsigned) V->ne[2], (unsigned) V->ne[3]);
+                sm70_d256_dequant_q8_0_rows<<<grid_v, 256, 0, stream>>>(
+                    (const char *) V->data, (half *) scratch.f16_extra.V,
+                    (int) V->ne[0], (int) V->ne[1], (int) V->ne[2],
+                    V->nb[1], V->nb[2], V->nb[3], kv_limit);
+                CUDA_CHECK(cudaGetLastError());
+            }
+        }
     } else {
         const int n_splits = (kv_len + SM70_D256_MASK_SPLIT - 1) / SM70_D256_MASK_SPLIT;
         const dim3 grid(scratch.n_q_blocks, batch, n_splits);

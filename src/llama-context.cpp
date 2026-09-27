@@ -2169,6 +2169,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // handle any pending shifts/copies
     memory_update(false);
 
+    // range masks follow the current parameters: llama_opt_init and llama_set_causal_attn change them
+    // after the memory was created
+    if (memory) {
+        memory->set_kq_range_allowed(model.kq_range_mask_supported() && cparams.flash_attn && cparams.causal_attn &&
+                model.hparams.f_max_alibi_bias == 0.0f);
+    }
+
     llama_memory_context_ptr mctx;
 
     while (true) {
@@ -3947,6 +3954,11 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     if (cparams.flash_attn) {
         LLAMA_LOG_INFO("%s: disabling flash attention, FLASH_ATTN_EXT has no backward pass\n", __func__);
         cparams.flash_attn = false;
+
+        // range masks need flash attention; opt_epoch reaches init_batch without going through decode()
+        if (memory) {
+            memory->set_kq_range_allowed(false);
+        }
 
         // the graph changes without flash attention, need to reserve again
         sched_need_reserve = true;

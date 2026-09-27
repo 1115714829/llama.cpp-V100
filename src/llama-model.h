@@ -774,6 +774,10 @@ struct llama_model {
 
     ggml_tensor * get_rope_factors(const llama_cparams & cparams, int il) const;
 
+    // true if the model graph feeds the attention mask to ggml_flash_attn_ext only,
+    // so an I32 [lo, hi) range mask can replace the dense one
+    bool kq_range_mask_supported() const;
+
     llama_memory_i * create_memory(const llama_memory_params & params, const llama_cparams & cparams) const;
 
     ggml_cgraph * build_graph(const llm_graph_params & params) const;

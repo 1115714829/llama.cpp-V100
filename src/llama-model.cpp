@@ -2350,6 +2350,11 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
     return layers[il].rope_short;
 }
 
+bool llama_model::kq_range_mask_supported() const {
+    // these architectures feed the attention mask to ggml_flash_attn_ext only
+    return arch == LLM_ARCH_QWEN35;
+}
+
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
 
