@@ -125,6 +125,9 @@ std::vector<llama_token> common_sampler_reject_core(
 // after only no-op samplers, and dist as the last sampler
 bool common_sampler_can_sparse_reject(const struct common_sampler * gsmpl);
 
+// k of the top_k sampler of the chain of gsmpl, for sparse rejection; 0 if unavailable
+int32_t common_sampler_sparse_k(const struct common_sampler * gsmpl);
+
 // rejection sampling variant of common_sampler_sample_and_accept_n:
 //
 // - reads the top_k logits of every row in idxs, replays the sampler chain on them to get p
