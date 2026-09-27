@@ -349,7 +349,13 @@ public:
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
+                                              // or I32 [2, n_batch/n_stream, 1, n_stream] range mask
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+
+    // whether the graph was built with a range mask allowed, and the n_kv it was built with
+    // note: the range mask shape does not carry n_kv, so it has to be compared separately on reuse
+    bool     allow_range = false;
+    uint32_t n_kv_graph  = 0;
 
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
@@ -1386,7 +1392,9 @@ struct llm_graph_context {
     // hybrid
     //
 
-    llm_graph_input_mem_hybrid * build_inp_mem_hybrid() const;
+    // range_mask: the model feeds the attention mask to ggml_flash_attn_ext only (build_attn), so a
+    // single-sequence causal ubatch may use an I32 [lo, hi) range mask instead of the dense mask
+    llm_graph_input_mem_hybrid * build_inp_mem_hybrid(bool range_mask = false) const;
     llm_graph_input_mem_hybrid_k * build_inp_mem_hybrid_k() const;
 
     llm_graph_input_mem_hybrid_iswa * build_inp_mem_hybrid_iswa() const;
