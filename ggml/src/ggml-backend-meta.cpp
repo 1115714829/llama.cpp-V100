@@ -24,6 +24,7 @@
 #include <thread>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -476,9 +477,33 @@ struct ggml_backend_meta_simple_tensor_container {
     ggml_backend_meta_simple_tensor_container() {}
 };
 
-// Number of rotating "compute" containers. One per plan plus one that is being filled by the
-// next graph allocation, so that a rebuild never evicts the views of both plans at once.
-static constexpr int GGML_META_N_STC = 3;
+// Number of plan slots. Decode plans stay alive while prefill/checkpoint shapes rotate through the
+// remaining slots.
+static constexpr int GGML_META_N_PLANS = 4;
+
+// Number of rotating "compute" containers: one per plan plus two that are being filled by the
+// next graph allocations, so that a rebuild never evicts the views of all plans at once.
+static constexpr int GGML_META_N_STC = GGML_META_N_PLANS + 2;
+
+// UIDs of the plans that hold captured CUDA graphs (any meta backend instance): their containers are
+// recycled last, so that the decode plans survive the prefill graphs of the next request
+static std::mutex                   ggml_backend_meta_hot_mutex;
+static std::unordered_set<uint64_t> ggml_backend_meta_hot_uids;
+
+static void ggml_backend_meta_hot_add(uint64_t uid) {
+    std::lock_guard<std::mutex> lock(ggml_backend_meta_hot_mutex);
+    ggml_backend_meta_hot_uids.insert(uid);
+}
+
+static void ggml_backend_meta_hot_remove(uint64_t uid) {
+    std::lock_guard<std::mutex> lock(ggml_backend_meta_hot_mutex);
+    ggml_backend_meta_hot_uids.erase(uid);
+}
+
+static bool ggml_backend_meta_hot_has(uint64_t uid) {
+    std::lock_guard<std::mutex> lock(ggml_backend_meta_hot_mutex);
+    return uid != 0 && ggml_backend_meta_hot_uids.count(uid) != 0;
+}
 
 struct ggml_backend_meta_split_state_cache_hash {
     size_t operator()(const std::pair<const ggml_tensor *, bool> & key) const {
@@ -499,6 +524,7 @@ struct ggml_backend_meta_buffer_context {
     ggml_backend_meta_simple_tensor_container stc_static;
     ggml_backend_meta_simple_tensor_container stc_compute[GGML_META_N_STC];
     uint64_t stc_owner_uid[GGML_META_N_STC] = {}; // plan UID owning each container, 0 = free
+    uint64_t stc_last_use[GGML_META_N_STC] = {};  // use order, for choosing the container to recycle
     int stc_compute_index      = 0;
     int stc_compute_index_next = 0;
     std::vector<ggml_backend_buffer_ptr> bufs;
@@ -515,12 +541,12 @@ struct ggml_backend_meta_buffer_context {
 
     ggml_backend_meta_buffer_context(
             ggml_backend_meta_simple_tensor_container & stc_static,
-            ggml_backend_meta_simple_tensor_container & stc_compute_0,
-            ggml_backend_meta_simple_tensor_container & stc_compute_1,
-            ggml_backend_meta_simple_tensor_container & stc_compute_2,
+            ggml_backend_meta_simple_tensor_container * stc_compute_in,
             const std::vector<ggml_backend_buffer_t> & bufs)
-            : stc_static(std::move(stc_static)),
-              stc_compute{std::move(stc_compute_0), std::move(stc_compute_1), std::move(stc_compute_2)} {
+            : stc_static(std::move(stc_static)) {
+        for (int i = 0; i < GGML_META_N_STC; i++) {
+            stc_compute[i] = std::move(stc_compute_in[i]);
+        }
         this->bufs.reserve(bufs.size());
         for (ggml_backend_buffer_t buf : bufs) {
             this->bufs.emplace_back(buf);
@@ -2012,9 +2038,10 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
         /*.no_alloc   =*/ true,
     };
     ggml_backend_meta_simple_tensor_container stc_static;
-    ggml_backend_meta_simple_tensor_container stc_compute_0(params, n_simple_bufts);
-    ggml_backend_meta_simple_tensor_container stc_compute_1(params, n_simple_bufts);
-    ggml_backend_meta_simple_tensor_container stc_compute_2(params, n_simple_bufts);
+    ggml_backend_meta_simple_tensor_container stc_compute[GGML_META_N_STC];
+    for (int i = 0; i < GGML_META_N_STC; i++) {
+        stc_compute[i] = ggml_backend_meta_simple_tensor_container(params, n_simple_bufts);
+    }
 
     size_t max_size = 0;
     std::vector<ggml_backend_buffer_t> bufs;
@@ -2024,7 +2051,7 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
         GGML_ASSERT(bufs.back() != nullptr);
         max_size = std::max(max_size, ggml_backend_buffer_get_size(bufs.back()));
     }
-    ggml_backend_meta_buffer_context * buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, stc_compute_2, bufs);
+    ggml_backend_meta_buffer_context * buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute, bufs);
 
     return ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, buf_ctx, max_size);
 }
@@ -2044,12 +2071,13 @@ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struc
         /*.no_alloc   =*/ true,
     };
     ggml_backend_meta_simple_tensor_container stc_static   (params_static,  n_simple_bufts);
-    ggml_backend_meta_simple_tensor_container stc_compute_0(params_compute, n_simple_bufts);
-    ggml_backend_meta_simple_tensor_container stc_compute_1(params_compute, n_simple_bufts);
-    ggml_backend_meta_simple_tensor_container stc_compute_2(params_compute, n_simple_bufts);
+    ggml_backend_meta_simple_tensor_container stc_compute[GGML_META_N_STC];
+    for (int i = 0; i < GGML_META_N_STC; i++) {
+        stc_compute[i] = ggml_backend_meta_simple_tensor_container(params_compute, n_simple_bufts);
+    }
 
     std::vector<ggml_backend_buffer_t> bufs(n_simple_bufts, nullptr);
-    ggml_backend_meta_buffer_context * meta_buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, stc_compute_2, bufs);
+    ggml_backend_meta_buffer_context * meta_buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute, bufs);
 
     ggml_backend_buffer_t meta_buf = ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, meta_buf_ctx, 0);
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
@@ -2103,6 +2131,7 @@ struct ggml_backend_meta_cgraph_config {
 // Everything that is specific to one graph UID and can be reused when the same graph is computed again.
 struct ggml_backend_meta_plan {
     uint64_t uid         = 0; // UID of the graph this plan was built for, 0 = invalid
+    uint64_t last_use    = 0; // plan tick of the last graph_compute that used this plan
     size_t   n_subgraphs = 0;
     int      n_runs      = 0; // completed executions since the plan was built
 
@@ -2126,6 +2155,7 @@ struct ggml_backend_meta_plan {
     void clear() {
         GGML_ASSERT(full_exec.empty());
         uid         = 0;
+        last_use    = 0;
         n_subgraphs = 0;
         n_runs      = 0;
         full_state  = 0;
@@ -2442,6 +2472,9 @@ struct ggml_backend_meta_launchers {
                 p->full_exec.clear();
             }
             p->full_state = all_captured ? 1 : -1;
+            if (all_captured) {
+                ggml_backend_meta_hot_add(p->uid);
+            }
         }
 
         for (size_t j = 0; j < backends.size(); j++) {
@@ -2464,8 +2497,8 @@ struct ggml_backend_meta_context {
     };
     std::string                       name;
     std::vector<backend_config>       backend_configs;
-    ggml_backend_meta_plan            plans[2];
-    int                               i_plan_newest = 0;
+    ggml_backend_meta_plan            plans[GGML_META_N_PLANS];
+    uint64_t                          plan_tick = 0; // see plan.last_use and stc_last_use
     ggml_context_ptr                  ctx;
     std::vector<ggml_cgraph *>  cgraphs_aux;
     std::vector<ggml_tensor *>  nodes_aux;
@@ -2485,6 +2518,9 @@ struct ggml_backend_meta_context {
 
     // Invalidate a plan. Its executables may still run, so the ranks are synchronized before they are freed.
     void plan_clear(ggml_backend_meta_plan & plan) {
+        if (plan.uid != 0) {
+            ggml_backend_meta_hot_remove(plan.uid);
+        }
         if (!plan.full_exec.empty()) {
             for (auto & bc : backend_configs) {
                 ggml_backend_synchronize(bc.backend);
@@ -2797,7 +2833,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // If a plan for this graph UID still owns all of its simple tensor containers it can be reused.
     ggml_backend_meta_plan * p = nullptr;
     if (cgraph->uid != 0) {
-        for (int k = 0; k < 2 && p == nullptr; k++) {
+        for (int k = 0; k < GGML_META_N_PLANS && p == nullptr; k++) {
             ggml_backend_meta_plan & plan = backend_ctx->plans[k];
             if (plan.uid != cgraph->uid) {
                 continue;
@@ -2811,9 +2847,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
             }
             if (valid) {
+                plan.last_use = ++backend_ctx->plan_tick;
                 for (const auto & slot : plan.slots) {
                     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) slot.first->context;
                     buf_ctx->stc_compute_index = slot.second;
+                    buf_ctx->stc_last_use[slot.second] = plan.last_use;
                 }
                 p = &plan;
             }
@@ -2824,7 +2862,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
     bool max_nnodes_raised = false;
     if (cgraph->n_nodes > backend_ctx->max_nnodes) {
-        for (int k = 0; k < 2; k++) {
+        for (int k = 0; k < GGML_META_N_PLANS; k++) {
             backend_ctx->plans[k].nodes.resize(n_backends);
             backend_ctx->plans[k].cgraphs.resize(n_backends);
             for (size_t j = 0; j < n_backends; j++) {
@@ -2838,7 +2876,42 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     }
 
     if (needs_rebuild) {
-        const int k = backend_ctx->i_plan_newest ^ 1;
+        // Pick the slot to rebuild in: the stale plan of this same graph if there is one, an empty
+        // slot, then the least recently used plan that has no captured CUDA graph, then any plan.
+        int k = -1;
+        for (int i = 0; i < GGML_META_N_PLANS; i++) {
+            if (backend_ctx->plans[i].uid == cgraph->uid) {
+                k = i;
+                break;
+            }
+        }
+        if (k < 0) {
+            for (int i = 0; i < GGML_META_N_PLANS; i++) {
+                if (backend_ctx->plans[i].uid == 0) {
+                    k = i;
+                    break;
+                }
+            }
+        }
+        if (k < 0) {
+            for (int i = 0; i < GGML_META_N_PLANS; i++) {
+                if (backend_ctx->plans[i].full_state == 1) {
+                    continue;
+                }
+                if (k < 0 || backend_ctx->plans[i].last_use < backend_ctx->plans[k].last_use) {
+                    k = i;
+                }
+            }
+        }
+        if (k < 0) {
+            for (int i = 0; i < GGML_META_N_PLANS; i++) {
+                if (k < 0 || backend_ctx->plans[i].last_use < backend_ctx->plans[k].last_use) {
+                    k = i;
+                }
+            }
+        }
+        GGML_ASSERT(k >= 0);
+
         ggml_backend_meta_plan & plan = backend_ctx->plans[k];
         backend_ctx->plan_clear(plan);
 
@@ -2862,10 +2935,39 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             buf_ctx->stc_owner_uid[s]       = cgraph->uid;
             plan.slots.emplace_back(buf, s);
 
-            // Prepare the container for the next graph allocation, freeing it if it still belongs to an old plan.
-            const int n = (s + 1) % GGML_META_N_STC;
+            // Prepare the container for the next graph allocation: prefer a free container, then
+            // the least recently used one that holds no captured plan.
+            int n = -1;
+            for (int i = 0; i < GGML_META_N_STC; i++) {
+                if (i != s && buf_ctx->stc_owner_uid[i] == 0) {
+                    n = i;
+                    break;
+                }
+            }
+            if (n < 0) {
+                for (int i = 0; i < GGML_META_N_STC; i++) {
+                    if (i == s || ggml_backend_meta_hot_has(buf_ctx->stc_owner_uid[i])) {
+                        continue;
+                    }
+                    if (n < 0 || buf_ctx->stc_last_use[i] < buf_ctx->stc_last_use[n]) {
+                        n = i;
+                    }
+                }
+            }
+            if (n < 0) {
+                for (int i = 0; i < GGML_META_N_STC; i++) {
+                    if (i == s) {
+                        continue;
+                    }
+                    if (n < 0 || buf_ctx->stc_last_use[i] < buf_ctx->stc_last_use[n]) {
+                        n = i;
+                    }
+                }
+            }
+            GGML_ASSERT(n >= 0);
+
             if (buf_ctx->stc_owner_uid[n] != 0) {
-                for (int kk = 0; kk < 2; kk++) {
+                for (int kk = 0; kk < GGML_META_N_PLANS; kk++) {
                     if (backend_ctx->plans[kk].uid == buf_ctx->stc_owner_uid[n]) {
                         backend_ctx->plan_clear(backend_ctx->plans[kk]);
                     }
@@ -3116,6 +3218,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         plan.n_subgraphs = n_subgraphs;
 
         if (max_tmp_size > backend_ctx->max_tmp_size) {
+            // the per-rank temporary buffers are reallocated: discard every other plan first,
+            // since its captured executables and collected tensors reference the old buffers
+            for (auto & plan_other : backend_ctx->plans) {
+                if (&plan_other != &plan) {
+                    backend_ctx->plan_clear(plan_other);
+                }
+            }
             for (size_t j = 0; j < n_backends; j++) {
                 auto & bcj = backend_ctx->backend_configs[j];
                 for (size_t i = 0; i < backend_ctx->n_reduce_steps; i++) {
@@ -3126,10 +3235,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
 
         if (max_nnodes_raised || n_subgraphs > backend_ctx->max_subgraphs) {
+            // the graph context is rebuilt: discard every other plan, its cgraphs live in the old context
+            for (auto & plan_other : backend_ctx->plans) {
+                if (&plan_other != &plan) {
+                    backend_ctx->plan_clear(plan_other);
+                }
+            }
             backend_ctx->max_subgraphs = std::max(backend_ctx->max_subgraphs, n_subgraphs);
             const size_t n_nodes_per_device = 3 * backend_ctx->n_reduce_steps; // tmp + ADD (+zeroing) graph per step and device
             const size_t n_cgraphs_per_device = 2 * backend_ctx->n_reduce_steps; // ADD ( + zeroing) graph per step and device
-            const size_t mem_per_device_graphs_main = 2*backend_ctx->max_subgraphs*ggml_graph_overhead_custom(backend_ctx->max_nnodes, cgraph->grads); // one cgraph per subgraph and plan
+            const size_t mem_per_device_graphs_main = GGML_META_N_PLANS*backend_ctx->max_subgraphs*ggml_graph_overhead_custom(backend_ctx->max_nnodes, cgraph->grads); // one cgraph per subgraph and plan
             const size_t mem_per_device_graphs_aux = n_cgraphs_per_device*backend_ctx->max_subgraphs*ggml_graph_overhead_custom(1, cgraph->grads);
             const size_t mem_per_device_nodes_aux = n_nodes_per_device*backend_ctx->max_subgraphs*ggml_tensor_overhead();
             const ggml_init_params params = {
@@ -3138,10 +3253,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 /*.no_alloc   =*/ true,
             };
             backend_ctx->ctx.reset(ggml_init(params));
-            // All cgraphs of both plans lived in the old context:
-            backend_ctx->plans[0].uid = 0;
-            backend_ctx->plans[1].uid = 0;
-            for (int k = 0; k < 2; k++) {
+            // All cgraphs of all plans lived in the old context:
+            for (int k = 0; k < GGML_META_N_PLANS; k++) {
                 for (size_t j = 0; j < n_backends; j++) {
                     for (auto & cc : backend_ctx->plans[k].cgraphs[j]) {
                         cc.cgraph_main = nullptr;
@@ -3305,7 +3418,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
-        backend_ctx->i_plan_newest = k;
+        plan.last_use = ++backend_ctx->plan_tick;
+        for (const auto & slot : plan.slots) {
+            ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) slot.first->context;
+            buf_ctx->stc_last_use[slot.second] = plan.last_use;
+        }
         p = &plan;
     }
 

@@ -2986,8 +2986,12 @@ bool llama_kv_cache_context::apply() {
     kq_range = kv->get_kq_range_ok(sinfos[i_cur], ubatches[i_cur]);
     // with a range mask an ubatch of 2+ tokens attends the whole cache: the range bounds the work (the
     // sm70 prompt and verify kernels split by it), and the graph no longer depends on the context length,
-    // so prompt ubatches and verify batches are each built once (single-token ubatches keep the grain)
-    n_kv = kv->get_n_kv(sinfos[i_cur], kq_range && sinfos[i_cur].size() >= 2);
+    // so prompt ubatches and verify batches are each built once (single-token ubatches keep the grain).
+    // bounded caches that view the whole cache saturate, but their n_kv still changes with the used-cell
+    // grain: 2+ token ubatches on them also view the whole cache so that the block graph is built once
+    // (dense mask, the extra cells are masked)
+    const bool full = sinfos[i_cur].size() >= 2 && (kq_range || kv->get_view_full());
+    n_kv = kv->get_n_kv(sinfos[i_cur], full);
 
     return true;
 }
