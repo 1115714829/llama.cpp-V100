@@ -364,6 +364,11 @@ extern "C" {
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
 
+    // copy user input tensors to the split backends asynchronously (default: false)
+    // the caller synchronizes the scheduler before it writes the input tensors again, so user inputs
+    // can be copied asynchronously (see ggml_backend_sched_compute_splits)
+    GGML_API void                 ggml_backend_sched_set_async_inputs(ggml_backend_sched_t sched, bool async_inputs);
+
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
     // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.
     // The correct way to use this API is to discard the deallocated tensors and create new ones.

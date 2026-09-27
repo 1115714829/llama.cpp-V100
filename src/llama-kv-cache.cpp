@@ -922,6 +922,10 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 
         // apply K-shift if needed
         if (hparams.rope_type != LLAMA_ROPE_TYPE_NONE) {
+            // inputs are copied to the backends asynchronously, so wait for any in-flight copies
+            // before overwriting the k_shift input
+            llama_synchronize(lctx);
+
             ggml_backend_sched_reset(sched);
 
             auto * res = lctx->get_gf_res_reserve();

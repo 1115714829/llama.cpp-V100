@@ -660,10 +660,12 @@ void llama_context::sched_reserve() {
     gf_res_prev_active = { nullptr, nullptr };
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    ggml_backend_sched_set_async_inputs(sched.get(), true);
 
     // the injection graph of a DFlash draft gets its own scheduler, see gf_res_slot
     if (dflash_draft) {
         sched_slot0.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+        ggml_backend_sched_set_async_inputs(sched_slot0.get(), true);
     } else {
         sched_slot0.reset();
     }
@@ -706,8 +708,10 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                ggml_backend_sched_set_async_inputs(sched.get(), true);
                 if (sched_slot0) {
                     sched_slot0.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                    ggml_backend_sched_set_async_inputs(sched_slot0.get(), true);
                 }
                 gf = graph_reserve(n_tokens_pp, n_seqs, n_outputs_pp, mctx.get());
             }
@@ -1535,13 +1539,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (!graph_reuse_disable && gf_res_prev_active[slot] == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
-        // with pipeline parallelism, the previous graph_compute_async may still be running
-        // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
-        // that the previous compute is still reading.
-        if (cparams.pipeline_parallel) {
-            ggml_backend_sched_synchronize(sched_cur);
-        }
-
         n_reused++;
     } else {
         if (sched_slot0) {
@@ -1575,6 +1572,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         gf_res_prev_active[slot] = res;
     }
+
+    // user inputs are copied to the backends asynchronously, so the previous compute may still be
+    // reading them. synchronize before overwriting the input tensors (see ggml_backend_sched_set_async_inputs)
+    ggml_backend_sched_synchronize(sched_cur);
 
     // set the input data for the input tensors
     {
