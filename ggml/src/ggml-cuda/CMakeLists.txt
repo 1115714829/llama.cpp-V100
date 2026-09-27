@@ -115,10 +115,42 @@ if (CUDAToolkit_FOUND)
     ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR} SRCS)
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
 
+    # fattn-sm70-d256.cu is compiled by the dedicated sm70 OBJECT target below;
+    # drop it from the glob before the main library is created, or the same TU
+    # would be compiled twice.
+    list(REMOVE_ITEM GGML_SOURCES_CUDA "${CMAKE_CURRENT_SOURCE_DIR}/fattn-sm70-d256.cu")
+
     ggml_add_backend_library(ggml-cuda
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}
                             )
+
+    # SM70 (Volta) D256 Split-D prefill attention (CuTe/CUTLASS based). Separate
+    # OBJECT target so that it is compiled for sm_70 only (not for every entry in
+    # CMAKE_CUDA_ARCHITECTURES) and with --expt-relaxed-constexpr, which CuTe
+    # requires and CUDA_FLAGS does not set. Skipped when the requested
+    # architectures do not include sm_70. HIP/MUSA builds do not process this
+    # file (they glob ../ggml-cuda/*.cu from their own CMakeLists; the source
+    # guards itself with GGML_USE_HIP/GGML_USE_MUSA for that case).
+    set(GGML_CUDA_SM70_D256_ENABLE OFF)
+    foreach(ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
+        if (ARCH MATCHES "^70(-real|-virtual)?$")
+            set(GGML_CUDA_SM70_D256_ENABLE ON)
+        endif()
+    endforeach()
+
+    if (GGML_CUDA_SM70_D256_ENABLE)
+        add_library(ggml-cuda-sm70d256 OBJECT "${CMAKE_CURRENT_SOURCE_DIR}/fattn-sm70-d256.cu")
+        target_link_libraries(ggml-cuda-sm70d256 PRIVATE ggml-base)
+        target_include_directories(ggml-cuda-sm70d256 PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/.."
+            "${CMAKE_CURRENT_SOURCE_DIR}/sm70-vendor")
+        target_compile_options(ggml-cuda-sm70d256 PRIVATE
+            "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--expt-extended-lambda>")
+        set_target_properties(ggml-cuda-sm70d256 PROPERTIES CUDA_ARCHITECTURES "70")
+        target_link_libraries(ggml-cuda PRIVATE $<TARGET_OBJECTS:ggml-cuda-sm70d256>)
+    endif()
 
     if (GGML_CUDA_GRAPHS)
         add_compile_definitions(GGML_CUDA_USE_GRAPHS)
@@ -176,6 +208,10 @@ if (CUDAToolkit_FOUND)
         if (NCCL_FOUND)
             add_compile_definitions(GGML_USE_NCCL)
             target_link_libraries(ggml-cuda PRIVATE NCCL::NCCL)
+            if (TARGET ggml-cuda-sm70d256)
+                # common.cuh includes nccl.h when GGML_USE_NCCL is defined
+                target_link_libraries(ggml-cuda-sm70d256 PRIVATE NCCL::NCCL)
+            endif()
         else()
             message(STATUS "Warning: NCCL not found, performance for multiple CUDA GPUs will be suboptimal")
         endif()

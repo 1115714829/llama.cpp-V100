@@ -1,6 +1,7 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
+#include "fattn-sm70-d256.cuh"
 #include "fattn-sm70-grouped.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
@@ -521,6 +522,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_VEC           = 100,
     BEST_FATTN_KERNEL_MMA_F16       = 400,
     BEST_FATTN_KERNEL_SM70_GROUPED  = 500,
+    BEST_FATTN_KERNEL_SM70_D256     = 501,
 };
 
 // K/V types for which there is a vector kernel template instance, other kernels convert these to f16:
@@ -550,6 +552,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     if (ggml_cuda_flash_attn_ext_sm70_grouped_supported(dst, cc)) {
         return BEST_FATTN_KERNEL_SM70_GROUPED;
+    }
+
+    // D256 Split-D prefill (q >= 17) for Volta. The kernel is compiled by a
+    // dedicated sm_70-only object target that is absent from builds without
+    // sm_70, so skip it here in those builds.
+    if constexpr (GGML_CUDA_SM70_D256_COMPILED) {
+        if (ggml_cuda_sm70_d256_supported(cc, dst)) {
+            return BEST_FATTN_KERNEL_SM70_D256;
+        }
     }
 
     const ggml_tensor * KQV   = dst;
@@ -750,6 +761,11 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
         } break;
         case BEST_FATTN_KERNEL_SM70_GROUPED: // K/V are read directly
             break;
+        case BEST_FATTN_KERNEL_SM70_D256:
+            if constexpr (GGML_CUDA_SM70_D256_COMPILED) {
+                return ggml_cuda_sm70_d256_alloc_size(dst);
+            }
+            break;
         case BEST_FATTN_KERNEL_NONE:
             break;
     }
@@ -776,6 +792,13 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_SM70_GROUPED:
             ggml_cuda_flash_attn_ext_sm70_grouped(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_SM70_D256:
+            if constexpr (GGML_CUDA_SM70_D256_COMPILED) {
+                ggml_cuda_flash_attn_ext_sm70_d256(ctx, dst);
+            } else {
+                GGML_ABORT("sm70 D256 kernel not compiled for this build");
+            }
             break;
     }
 }
