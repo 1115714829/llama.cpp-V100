@@ -4286,6 +4286,60 @@ struct test_add_rms_norm_mul : public test_case {
     }
 };
 
+// GGML_OP_RMS_NORM + GGML_OP_MUL (fused operation, the mul result is the graph output)
+struct test_rms_norm_mul : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+    const bool weight_broadcast;
+    const float eps;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, ne, weight_broadcast, eps);
+    }
+
+    test_rms_norm_mul(ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne = {64, 5, 4, 3},
+            bool weight_broadcast = false,
+            float eps = 1e-6f)
+        : type(type), ne(ne), weight_broadcast(weight_broadcast), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_tensor * w = weight_broadcast ? ggml_new_tensor_1d(ctx, type, ne[0]) : ggml_new_tensor(ctx, type, 4, ne.data());
+
+        ggml_set_param(a);
+        ggml_set_name(a, "a");
+        ggml_set_param(w);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * out = ggml_mul(ctx, ggml_rms_norm(ctx, a, eps), w);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -10.f, 10.f);
+        }
+    }
+
+    float grad_eps() override {
+        return 1.0f;
+    }
+
+    bool grad_precise() override {
+        return true;
+    }
+};
+
 // GGML_OP_UNARY(RELU) + GGML_OP_SQR (fused operation)
 struct test_relu_sqr : public test_case {
     const ggml_type type;
@@ -10414,6 +10468,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, { 5120,  8, 1, 1 }, 1e-6f));
     test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, { 5120, 16, 1, 1 }, 1e-6f));
     test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, { 4096,  3, 1, 1 }, 1e-6f));
+    test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, { 4096,  3, 2, 1 }, 1e-6f));
+    test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, { 5124,  8, 1, 1 }, 1e-6f)); // partial float4 tail of the register path
+    test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, { 5122,  8, 1, 1 }, 1e-6f)); // ncols not a multiple of 4
+
+    // rms norm -> weight mul, the mul result is the graph output
+    test_cases.emplace_back(new test_rms_norm_mul(GGML_TYPE_F32, { 5120,  8, 1, 1 }, true,  1e-6f));
+    test_cases.emplace_back(new test_rms_norm_mul(GGML_TYPE_F32, { 4096,  3, 2, 1 }, true,  1e-6f));
+    test_cases.emplace_back(new test_rms_norm_mul(GGML_TYPE_F32, { 5120,  8, 1, 1 }, false, 1e-6f)); // per-row weight, not the register path
+    test_cases.emplace_back(new test_rms_norm_mul(GGML_TYPE_F32, { 5122,  8, 1, 1 }, true,  1e-6f)); // ncols not a multiple of 4
 
     for (uint32_t n : {64, 1025}) {
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F32, GGML_TYPE_F32, { n, 5, 4, 3 }, false, false));
