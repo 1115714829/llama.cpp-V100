@@ -8718,7 +8718,15 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             memset(VKQ32, 0, DV*sizeof(float));
         }
 
-        const ggml_fp16_t * mp = mask ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
+        const bool mask_range = mask && mask->type == GGML_TYPE_I32;
+        const ggml_fp16_t * mp = mask && !mask_range ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
+        int64_t r_lo = 0;
+        int64_t r_hi = INT64_MAX;
+        if (mask_range) {
+            const int32_t * rp = (const int32_t *)((const char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
+            r_lo = rp[0];
+            r_hi = rp[1];
+        }
 
         // k indices
         const int ik3 = iq3 / rk3;
@@ -8736,6 +8744,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
+            if (ic < r_lo || ic >= r_hi) {
+                continue;
+            }
+
             const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
             if (mv == -INFINITY) {
                 continue;
@@ -8997,12 +9009,27 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
 
             // skip the tile entirely if all the masks are -inf
             if (mask) {
+                const bool mask_range = mask->type == GGML_TYPE_I32;
                 bool can_skip = true;
                 for (int tq = 0; tq < tile_rows; tq++) {
-                    const ggml_fp16_t * mp_row = (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
+                    const ggml_fp16_t * mp_row = mask_range ? NULL : (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
+                    int64_t r_lo = 0;
+                    int64_t r_hi = INT64_MAX;
+                    if (mask_range) {
+                        const int32_t * rp = (const int32_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
+                        r_lo = rp[0];
+                        r_hi = rp[1];
+                    }
                     for (int tk = 0; tk < kv_tile; tk++) {
-                        mask32[tq * KV_TILE_SZ + tk] = slope * GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
-                        if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
+                        float mv;
+                        if (mask_range) {
+                            const int64_t col = ic + tk;
+                            mv = (col >= r_lo && col < r_hi) ? 0.0f : -INFINITY;
+                        } else {
+                            mv = slope * GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
+                        }
+                        mask32[tq * KV_TILE_SZ + tk] = mv;
+                        if (mv != -INFINITY) {
                             can_skip = false;
                         }
                     }

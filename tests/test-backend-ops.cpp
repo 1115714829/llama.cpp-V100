@@ -216,6 +216,50 @@ static void init_tensor_kq_mask_causal(ggml_tensor * tensor) {
     ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
 }
 
+// generate an I32 range mask: the row for query i1 holds [lo, hi), the visible KV columns
+static void init_tensor_kq_range(ggml_tensor * tensor, int64_t n_kv, bool causal) {
+    GGML_ASSERT(tensor->type == GGML_TYPE_I32);
+    GGML_ASSERT(tensor->ne[0] == 2);
+
+    const int64_t ne1 = tensor->ne[1];
+    const int64_t ne2 = tensor->ne[2];
+    const int64_t ne3 = tensor->ne[3];
+
+    std::vector<int32_t> data(2*ne1*ne2*ne3);
+
+    std::random_device rd;
+    std::mt19937 gen(rd());
+
+    for (int64_t i3 = 0; i3 < ne3; i3++) {
+        for (int64_t i2 = 0; i2 < ne2; i2++) {
+            for (int64_t i1 = 0; i1 < ne1; i1++) {
+                int64_t lo;
+                int64_t hi;
+                if (causal) {
+                    lo = 0;
+                    hi = n_kv - ne1 + i1 + 1;
+                    hi = std::max<int64_t>(1, std::min<int64_t>(hi, n_kv));
+                } else {
+                    lo = std::uniform_int_distribution<int64_t>(0, n_kv - 1)(gen);
+                    hi = std::uniform_int_distribution<int64_t>(lo + 1, n_kv)(gen);
+                    if ((rd() & 3) == 0) {
+                        lo = 0;
+                    }
+                    if ((rd() & 3) == 0) {
+                        hi = n_kv;
+                    }
+                }
+
+                const int64_t off = ((i3*ne2 + i2)*ne1 + i1)*2;
+                data[off + 0] = (int32_t) lo;
+                data[off + 1] = (int32_t) hi;
+            }
+        }
+    }
+
+    ggml_backend_tensor_set(tensor, data.data(), 0, data.size()*sizeof(int32_t));
+}
+
 static void init_tensor_kq_mask_sparse(ggml_tensor * tensor, int64_t n_kv_max) {
     GGML_ASSERT(tensor->type == GGML_TYPE_F16);
     GGML_ASSERT(n_kv_max > 0 && n_kv_max <= tensor->ne[0]);
@@ -502,6 +546,7 @@ static std::string var_to_str(ggml_scale_mode mode) {
 #define VARS_TO_STR16(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p) VAR_TO_STR(a) + "," + VARS_TO_STR15(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p)
 #define VARS_TO_STR17(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q) VAR_TO_STR(a) + "," + VARS_TO_STR16(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q)
 #define VARS_TO_STR18(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r) VAR_TO_STR(a) + "," + VARS_TO_STR17(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r)
+#define VARS_TO_STR19(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s) VAR_TO_STR(a) + "," + VARS_TO_STR18(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s)
 
 // accept FLT_MAX as infinity
 static bool isinf_or_max(float f) {
@@ -8498,9 +8543,10 @@ struct test_flash_attn_ext : public test_case {
     const bool v_is_view_of_k;
     const int64_t n_kv_max;
     const bool causal; // use a causal mask instead of a random mask
+    const int range; // 0: dense f16 mask, 1: causal range mask (I32), 2: random range mask (I32)
 
     std::string vars() override {
-        return VARS_TO_STR18(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max, causal);
+        return VARS_TO_STR19(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max, causal, range);
     }
 
     double max_nmse_err() override {
@@ -8517,9 +8563,9 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0, bool causal = false)
+                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0, bool causal = false, int range = 0)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max), causal(causal) {}
+          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max), causal(causal), range(range) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -8567,7 +8613,8 @@ struct test_flash_attn_ext : public test_case {
 
         ggml_tensor * m = nullptr;
         if (mask) {
-            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr23[1]);
+            m = range != 0 ? ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 2, nb, 1, nr23[1])
+                           : ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr23[1]);
             ggml_set_name(m, "m");
         }
 
@@ -8592,7 +8639,9 @@ struct test_flash_attn_ext : public test_case {
                 // make the sink values more noticeable in order to trigger a test failure when the implementation is wrong
                 init_tensor_uniform(t, -10.0f, 10.0f);
             } else if (strcmp(t->name, "m") == 0) {
-                if (causal) {
+                if (range != 0) {
+                    init_tensor_kq_range(t, kv, range == 1);
+                } else if (causal) {
                     init_tensor_kq_mask_causal(t);
                 } else if (n_kv_max > 0) {
                     init_tensor_kq_mask_sparse(t, n_kv_max);
@@ -11709,6 +11758,47 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                         continue;
                     }
                     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, perm, true, false, 0, true));
+                }
+            }
+        }
+    }
+
+    // the same production shapes with range masks (I32): causal and random
+    for (int kv : { 4096, 32768 }) {
+        for (int nb : { 2048, 17, 100 }) {
+            for (const std::array<int32_t, 4> & perm : { std::array<int32_t, 4>{0, 1, 2, 3}, std::array<int32_t, 4>{0, 2, 1, 3} }) {
+                for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+                    if (kv > 4096 && type_KV == GGML_TYPE_F16) {
+                        continue;
+                    }
+                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, perm, true, false, 0, false, 1));
+                }
+            }
+        }
+    }
+    for (int nb : { 2048, 100 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0, false, 2));
+    }
+
+    // grouped decode / verify shapes with range masks
+    for (int nh : { 1, 4 }) {
+        for (int kv : { 113, 1025, 4096 }) {
+            for (int nb : { 2, 8, 16 }) {
+                for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+                    for (int range : { 1, 2 }) {
+                        test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, false, 0, false, range));
+                    }
+                }
+            }
+        }
+    }
+
+    // generic fallback shapes with range masks
+    for (const std::array<int64_t, 2> & nr23 : { std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{4, 1} }) {
+        for (int kv : { 512, 1024 }) {
+            for (int nb : { 1, 7, 32, 512 }) {
+                for (int range : { 1, 2 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, nr23, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, false, range));
                 }
             }
         }

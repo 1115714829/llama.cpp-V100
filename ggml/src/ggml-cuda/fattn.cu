@@ -127,6 +127,44 @@ void ggml_cuda_flash_attn_ext_compact_mask(
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
+// Expands a range mask (I32 [2, ne1, ne2, ne3], row i holds [lo, hi)) into the dense f16 mask it
+// describes: 0 for lo <= j < hi, -INF elsewhere. dst is contiguous [n_kv, ne1, ne2, ne3].
+static __global__ void flash_attn_range_to_dense_mask(
+        const char * __restrict__ range, half * __restrict__ dst, const int64_t n_kv,
+        const int64_t ne1, const int64_t ne2, const int64_t ne3,
+        const size_t nb1, const size_t nb2, const size_t nb3) {
+    const int64_t col = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (col >= n_kv) {
+        return;
+    }
+
+    for (int64_t i23 = blockIdx.z; i23 < ne2*ne3; i23 += gridDim.z) {
+        const int64_t i2 = i23 % ne2;
+        const int64_t i3 = i23 / ne2;
+        const char * range_plane = range + i2*nb2 + i3*nb3;
+        half * dst_plane = dst + i23*ne1*n_kv + col;
+
+        for (int64_t i1 = (int64_t) blockIdx.y*blockDim.y + threadIdx.y; i1 < ne1; i1 += (int64_t) gridDim.y*blockDim.y) {
+            const int32_t * rp = (const int32_t *)(range_plane + i1*nb1);
+            const int32_t lo = rp[0];
+            const int32_t hi = rp[1];
+            dst_plane[i1*n_kv] = (col >= lo && col < hi) ? __float2half(0.0f) : __float2half(-INFINITY);
+        }
+    }
+}
+
+// The dense f16 mask a range mask describes, as a tensor description: contiguous [n_kv, ne1, ne2, ne3].
+static ggml_tensor ggml_cuda_fattn_dense_mask_desc(const ggml_tensor * mask, int64_t n_kv) {
+    ggml_tensor m = *mask;
+    m.type  = GGML_TYPE_F16;
+    m.ne[0] = n_kv;
+    m.nb[0] = sizeof(half);
+    m.nb[1] = m.nb[0]*m.ne[0];
+    m.nb[2] = m.nb[1]*m.ne[1];
+    m.nb[3] = m.nb[2]*m.ne[2];
+    return m;
+}
+
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1, const int ncols2) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
     GGML_UNUSED_VARS(cc, dst, ncols1, ncols2);
@@ -548,6 +586,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_NONE;
 #endif// FLASH_ATTN_AVAILABLE
 
+    if (dst->src[3] && dst->src[3]->type == GGML_TYPE_I32) {
+        // a range mask is expanded to an equivalent dense f16 mask at compute time; the kernel
+        // selection only inspects the mask layout, so select for the dense mask description
+        ggml_tensor d = *dst;
+        ggml_tensor m = ggml_cuda_fattn_dense_mask_desc(dst->src[3], dst->src[1]->ne[1]);
+        d.src[3] = &m;
+        return ggml_cuda_get_best_fattn_kernel(device, &d);
+    }
+
     const int cc = ggml_cuda_info().devices[device].cc;
 
     if (ggml_cuda_flash_attn_ext_sm70_grouped_supported(dst, cc)) {
@@ -776,7 +823,43 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+static void ggml_cuda_flash_attn_ext_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_set_device(ctx.device);
+
+    const ggml_tensor * mask = dst->src[3];
+    if (mask && mask->type == GGML_TYPE_I32) {
+        // expand the range mask into the dense f16 mask the kernels expect, then run the regular path
+        const int64_t n_kv = dst->src[1]->ne[1];
+
+        ggml_cuda_pool_alloc<half> mask_f16(ctx.pool(), n_kv*mask->ne[1]*mask->ne[2]*mask->ne[3]);
+
+        const dim3 block(256, 1, 1);
+        const dim3 grid(
+            (unsigned) ((n_kv + block.x - 1)/block.x),
+            (unsigned) std::min<int64_t>(mask->ne[1], 65535),
+            (unsigned) std::min<int64_t>(mask->ne[2]*mask->ne[3], 65535));
+        flash_attn_range_to_dense_mask<<<grid, block, 0, ctx.stream()>>>(
+            (const char *) mask->data, mask_f16.get(), n_kv,
+            mask->ne[1], mask->ne[2], mask->ne[3],
+            mask->nb[1], mask->nb[2], mask->nb[3]);
+        CUDA_CHECK(cudaGetLastError());
+
+        ggml_tensor m = ggml_cuda_fattn_dense_mask_desc(mask, n_kv);
+        m.data = mask_f16.get();
+
+        ggml_tensor d = *dst;
+        d.src[3] = &m;
+
+        ggml_cuda_flash_attn_ext_impl(ctx, &d);
+        return;
+    }
+
+    ggml_cuda_flash_attn_ext_impl(ctx, dst);
+}
+
+static void ggml_cuda_flash_attn_ext_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:

@@ -2476,7 +2476,9 @@ extern "C" {
     // q:    [n_embd_k, n_batch, n_head,    ne3 ]
     // k:    [n_embd_k, n_kv,    n_head_kv, ne3 ]
     // v:    [n_embd_v, n_kv,    n_head_kv, ne3 ] !! not transposed !!
-    // mask: [n_kv,     n_batch, ne32,      ne33]
+    // mask: [n_kv,     n_batch, ne32,      ne33] (F16, added to KQ)
+    //   or  [2,        n_batch, ne32,      ne33] (I32 range mask: row i holds [lo, hi), KV column j is visible iff lo <= j < hi, all other columns are -INF;
+    //                                             requires max_bias == 0 and no n_kv_max)
     // res:  [n_embd_v, n_head,  n_batch,   ne3 ] !! permuted !!
     //
     // broadcast:

@@ -1152,6 +1152,7 @@ class tensor_traits_common : public tensor_traits_base {
         const ggml_tensor * q = dst->src[0];
         const ggml_tensor * k = dst->src[1];
         const ggml_tensor * v = dst->src[2];
+        const ggml_tensor * mask = dst->src[3];
 
         GGML_TENSOR_LOCALS(int64_t, neq, q, ne)
         GGML_TENSOR_LOCALS(size_t, nbq, q, nb)
@@ -1169,8 +1170,9 @@ class tensor_traits_common : public tensor_traits_base {
         const bool supported_types = (q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16);
         const bool supported_shape = (DK > 0 && DK <= 128 && DV > 0 && DV <= 128);
         const bool supported_vlen  = (__riscv_vlenb() == 128);
+        const bool supported_mask  = (mask == nullptr || mask->type == GGML_TYPE_F16);
 
-        if (!(supported_prec && supported_types && supported_shape && supported_vlen)) {
+        if (!(supported_prec && supported_types && supported_shape && supported_vlen && supported_mask)) {
             ggml_compute_forward_flash_attn_ext(params, dst);
             return;
         }
