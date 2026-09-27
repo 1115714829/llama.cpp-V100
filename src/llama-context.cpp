@@ -4812,7 +4812,11 @@ int llama_context::encode(const llama_batch & batch_inp) {
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
-    llama_batch_compat compat(this, batch_inp);
+    // DFlash2 device path: the injection graph reads the target features from the staging sink
+    // (see process_ubatch), so the placeholder embd rows of the batch are not copied
+    const bool embd_on_device = embd_link && embd_src_enable && t_embd_src_sink != nullptr && batch_inp.embd != nullptr;
+
+    llama_batch_compat compat(this, batch_inp, 0, embd_on_device);
     return decode(*compat.batch_ext);
 }
 

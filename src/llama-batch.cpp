@@ -85,7 +85,11 @@ bool llama_batch_allocr::init(
     }
 
     if (has_embd) {
-        embd_vec = batch_inp.embd;
+        embd_on_device = batch_inp.embd_on_device;
+
+        if (!embd_on_device) {
+            embd_vec = batch_inp.embd;
+        }
     }
 
     //
@@ -174,7 +178,7 @@ bool llama_batch_allocr::init(
 
     batch.n_tokens = n_tok;
     batch.token    = has_token ? token_vec.data() : nullptr;
-    batch.embd     = has_embd  ? embd_vec.data()  : nullptr;
+    batch.embd     = has_embd  ? (embd_on_device ? &embd_on_device_tag : embd_vec.data()) : nullptr;
     batch.pos      = pos.data();
     batch.n_seq_id = n_seq_id.data();
     batch.seq_id   = seq_id.data();
@@ -760,6 +764,7 @@ void llama_batch_allocr::clear() {
 
     token_vec   .clear();
     embd_vec    .clear();
+    embd_on_device = false;
     seq_id_data .clear();
     pos         .clear();
     n_seq_id    .clear();
@@ -789,7 +794,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
 
     auto udata = std::make_shared<llama_ubatch::data_t>();
 
-    const int64_t n_embd_all = batch.embd ? (int64_t) n_tokens*n_embd : 0;
+    const int64_t n_embd_all = batch.embd && !embd_on_device ? (int64_t) n_tokens*n_embd : 0;
     const int64_t n_pos_all  =              (int64_t) n_tokens*n_pos_per_embd;
 
     udata->token     .resize(n_tokens);
@@ -810,7 +815,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
             udata->token[i] = batch.token[idxs[i]];
         }
 
-        if (batch.embd) {
+        if (batch.embd && !embd_on_device) {
             memcpy(udata->embd.data() + i*n_embd, batch.embd + (int64_t) idxs[i]*n_embd, n_embd*sizeof(float));
         }
 
@@ -860,7 +865,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.n_pos        =*/ n_pos_per_embd,
 
         /*.token        =*/ batch.token ? udata->token.data() : nullptr,
-        /*.embd         =*/ batch.embd ? udata->embd.data() : nullptr,
+        /*.embd         =*/ batch.embd ? (embd_on_device ? &embd_on_device_tag : udata->embd.data()) : nullptr,
         /*.pos          =*/ udata->pos.data(),
         /*.n_seq_id     =*/ udata->n_seq_id.data(),
         /*.seq_id       =*/ udata->seq_id.data(),
@@ -1068,6 +1073,7 @@ void llama_batch_ext::clear() {
     tokens.clear();
     embd  .clear();
     n_embd = 0;
+    embd_on_device = false;
 }
 
 int32_t llama_batch_ext::add_token(llama_seq_id seq_id) {
@@ -1245,7 +1251,7 @@ bool llama_batch_ext_set_output_logits(llama_batch_ext * batch, int32_t idx, boo
 
 // llama_batch_compat
 
-void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_inp, size_t n_embd_row) {
+void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_inp, size_t n_embd_row, bool embd_on_device) {
     llama_batch_ext * batch_ext = &dst;
 
     if (n_embd_row == 0) {
@@ -1255,6 +1261,10 @@ void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_i
     // a batch can carry both, for example the MTP hook batches
     const bool has_token = batch_inp.token != nullptr;
     const bool has_embd  = batch_inp.embd  != nullptr;
+
+    if (has_embd && !embd_on_device) {
+        batch_ext->embd.reserve((size_t) batch_inp.n_tokens * n_embd_row);
+    }
 
     static const llama_seq_id default_seq_id    = 0;
     static const int32_t      default_n_seq_id  = 1;
@@ -1299,10 +1309,14 @@ void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_i
 
         if (has_embd) {
             t.has_embd = true;
-            t.embd_off = batch_ext->embd.size();
-            const float * src = batch_inp.embd + (size_t) i * n_embd_row;
-            batch_ext->embd.insert(batch_ext->embd.end(), src, src + n_embd_row);
-            batch_ext->n_embd = n_embd_row;
+
+            if (embd_on_device) {
+                t.embd_off = 0;
+            } else {
+                t.embd_off = batch_ext->embd.size();
+                const float * src = batch_inp.embd + (size_t) i * n_embd_row;
+                batch_ext->embd.insert(batch_ext->embd.end(), src, src + n_embd_row);
+            }
         }
 
         // output flag
@@ -1313,11 +1327,16 @@ void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_i
 
         batch_ext->tokens.push_back(t);
     }
+
+    if (has_embd) {
+        batch_ext->n_embd = n_embd_row;
+        batch_ext->embd_on_device = embd_on_device;
+    }
 }
 
-llama_batch_compat::llama_batch_compat(llama_context * ctx, const llama_batch & batch_inp, size_t n_embd_row) {
+llama_batch_compat::llama_batch_compat(llama_context * ctx, const llama_batch & batch_inp, size_t n_embd_row, bool embd_on_device) {
     batch_ext = new llama_batch_ext(ctx);
-    init(*batch_ext, batch_inp, n_embd_row);
+    init(*batch_ext, batch_inp, n_embd_row, embd_on_device);
 }
 
 llama_batch_compat::~llama_batch_compat() {
