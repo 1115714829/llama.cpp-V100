@@ -1250,6 +1250,14 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
 
     const size_t n = ret->dev_ids.size();
     ret->comms.resize(n);
+#if defined(__powerpc64__)
+    // IBM AC922 (POWER9): the GPUs of the two sockets reach each other through the
+    // CPUs' NVLink ports. NCCL's default topology rules route those hops through
+    // host shared memory (SHM/direct), which is much slower for the large prefill
+    // all-reduces than direct P2P (4 x V100: 32K prefill TTFT 15.1 -> 13.6 s).
+    // Allow P2P across the SMP interconnect unless the user chose a level.
+    setenv("NCCL_P2P_LEVEL", "SYS", /*overwrite =*/ 0);
+#endif
     ncclResult_t rc = ncclCommInitAll(ret->comms.data(), (int) n, ret->dev_ids.data());
     if (rc == ncclSuccess) {
         ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_nccl;
