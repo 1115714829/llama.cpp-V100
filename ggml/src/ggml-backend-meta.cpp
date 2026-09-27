@@ -2689,6 +2689,38 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
     }
 }
 
+static bool ggml_backend_meta_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+    GGML_UNUSED(backend_src);
+
+    if (!ggml_backend_is_meta(backend_dst)) {
+        return false;
+    }
+    if (dst->buffer == nullptr || !ggml_backend_buffer_is_meta(dst->buffer)) {
+        return false;
+    }
+    if (src->buffer == nullptr || !ggml_backend_buffer_is_host(src->buffer)) {
+        return false;
+    }
+    if (!ggml_are_same_layout(src, dst) || !ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    if (ggml_nelements(dst) == 0) {
+        return true;
+    }
+    // only the layouts that set_tensor_async can upload, anything else takes the scheduler's synchronous copy
+    const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(dst, /*assume_sync =*/ false);
+    if (split_state.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED && split_state.axis != GGML_BACKEND_SPLIT_AXIS_PARTIAL &&
+            (split_state.axis < 0 || split_state.axis > GGML_BACKEND_SPLIT_AXIS_2)) {
+        return false;
+    }
+
+    // The host buffer of src is not overwritten until this graph is done (the caller synchronizes
+    // the scheduler before writing inputs again), so the per-rank copies issued here may still be in
+    // flight when this function returns. A pinned src makes them truly asynchronous.
+    ggml_backend_meta_set_tensor_async(backend_dst, dst, src->data, 0, ggml_nbytes(dst));
+    return true;
+}
+
 static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     for (size_t i = 0; i < n_backends; i++) {
@@ -3533,7 +3565,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
     /* .get_tensor_async        = */ ggml_backend_meta_get_tensor_async,
     /* .set_tensor_2d_async     = */ nullptr,
     /* .get_tensor_2d_async     = */ nullptr,
-    /* .cpy_tensor_async        = */ nullptr,
+    /* .cpy_tensor_async        = */ ggml_backend_meta_cpy_tensor_async,
     /* .synchronize             = */ ggml_backend_meta_synchronize,
     /* .graph_plan_create       = */ nullptr,
     /* .graph_plan_free         = */ nullptr,
