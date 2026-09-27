@@ -12,6 +12,10 @@
 // NCCL, which reduces large tensors in BF16 for the default proc, hence the
 // looser relative tolerance there. The exact proc is optional: with an older
 // library the exact part of the test is skipped.
+//
+// The chain timing records many per-rank push AllReduce calls into one CUDA
+// graph per rank and replays the graph, which removes the host launch overhead
+// and the rank-to-rank skew from the per-call time.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -24,6 +28,7 @@
 #include <cstdio>
 #include <cstring>
 #include <random>
+#include <thread>
 #include <vector>
 
 struct ar_test {
@@ -33,6 +38,14 @@ struct ar_test {
     ggml_backend_comm_free_t      comm_free      = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce_exact = nullptr; // optional
+
+    // CUDA graph capture of the per-rank push AllReduce; all optional.
+    ggml_backend_comm_allreduce_rank_t            comm_allreduce_rank = nullptr;
+    ggml_backend_comm_allreduce_rank_capturable_t comm_allreduce_rank_capturable = nullptr;
+    ggml_backend_capture_begin_t  capture_begin  = nullptr;
+    ggml_backend_capture_end_t    capture_end    = nullptr;
+    ggml_backend_capture_launch_t capture_launch = nullptr;
+    ggml_backend_capture_free_t   capture_free   = nullptr;
 };
 
 // Per-case ggml contexts and their backend buffers, freed together.
@@ -279,6 +292,230 @@ static void run_timing(const ar_test & t, ggml_backend_comm_allreduce_tensor_t a
     }
 }
 
+// Records n_per_graph per-rank push AllReduce calls of one size into one CUDA
+// graph per rank, replays the graphs together and reports the per-call time.
+// The push kernel keeps its state in device memory, so the replay needs no
+// host-side bookkeeping. A skip is not a failure, a failed check is.
+static bool run_chain_timing(const ar_test & t, bool exact) {
+    if (t.comm_allreduce_rank == nullptr || t.comm_allreduce_rank_capturable == nullptr ||
+        t.capture_begin == nullptr || t.capture_end == nullptr ||
+        t.capture_launch == nullptr || t.capture_free == nullptr) {
+        printf("chain: SKIP (no capture proc interface)\n");
+        return true;
+    }
+
+    const size_t n = t.n;
+    const int64_t sizes[] = { 5120, 20480, 40960, 81920 };
+    const int n_per_graph = 128;
+    const int n_warmup    = 5;
+    const int n_replay    = 50;
+    const int n_single    = 200;
+    const int n_fill      = 20; // warmup allreduce calls before the capture
+
+    printf("chain timing exact=%d (%d calls each)\n", (int) exact, n_replay * n_per_graph);
+
+    bool ok = true;
+
+    for (int64_t ne : sizes) {
+        const size_t nbytes = (size_t) ne * sizeof(float);
+
+        ar_case c;
+        std::vector<std::vector<float>> host(n);
+        for (size_t i = 0; i < n; ++i) {
+            struct ggml_init_params params = {
+                /* .mem_size   = */ 16 * 1024,
+                /* .mem_buffer = */ nullptr,
+                /* .no_alloc   = */ true,
+            };
+            ggml_context * ctx = ggml_init(params);
+            ggml_tensor * tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne);
+            tensor->flags |= GGML_TENSOR_FLAG_COMPUTE;
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, t.backends[i]);
+            if (buf == nullptr) {
+                c.ctxs.push_back(ctx);
+                fprintf(stderr, "chain: alloc failed (ne=%lld rank=%zu)\n", (long long) ne, i);
+                return false;
+            }
+            c.ctxs.push_back(ctx);
+            c.tensors.push_back(tensor);
+            c.bufs.push_back(buf);
+
+            std::mt19937 rng(0xCAFEu + (uint32_t) ne + (uint32_t) i * 7919u);
+            std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+            host[i].resize(ne);
+            for (int64_t j = 0; j < ne; ++j) {
+                host[i][j] = dist(rng);
+            }
+            ggml_backend_tensor_set(tensor, host[i].data(), 0, nbytes);
+        }
+
+        if (!t.comm_allreduce_rank_capturable(t.comm, c.tensors.data(), exact)) {
+            printf("chain ne=%lld SKIP (not capturable)\n", (long long) ne);
+            continue;
+        }
+
+        for (int it = 0; it < n_fill; ++it) {
+            for (size_t i = 0; i < n; ++i) {
+                t.comm_allreduce_rank(t.comm, i, c.tensors[i], exact);
+            }
+        }
+        for (size_t i = 0; i < n; ++i) {
+            ggml_backend_synchronize(t.backends[i]);
+        }
+
+        std::vector<void *> execs(n, nullptr);
+        bool captured = true;
+        for (size_t i = 0; i < n; ++i) {
+            if (!t.capture_begin(t.backends[i])) {
+                captured = false;
+                break;
+            }
+            for (int k = 0; k < n_per_graph; ++k) {
+                t.comm_allreduce_rank(t.comm, i, c.tensors[i], exact);
+            }
+            execs[i] = t.capture_end(t.backends[i]);
+            if (execs[i] == nullptr) {
+                captured = false;
+                break;
+            }
+        }
+        if (!captured) {
+            for (void * exec : execs) {
+                t.capture_free(exec);
+            }
+            printf("chain ne=%lld SKIP (capture failed)\n", (long long) ne);
+            continue;
+        }
+
+        for (int rep = 0; rep < n_warmup; ++rep) {
+            for (size_t i = 0; i < n; ++i) {
+                t.capture_launch(t.backends[i], execs[i]);
+            }
+            for (size_t i = 0; i < n; ++i) {
+                ggml_backend_synchronize(t.backends[i]);
+            }
+        }
+
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int rep = 0; rep < n_replay; ++rep) {
+            for (size_t i = 0; i < n; ++i) {
+                t.capture_launch(t.backends[i], execs[i]);
+            }
+        }
+        for (size_t i = 0; i < n; ++i) {
+            ggml_backend_synchronize(t.backends[i]);
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+
+        const double us = std::chrono::duration<double, std::micro>(t1 - t0).count() / (n_replay * n_per_graph);
+        printf("chain ne=%lld bytes=%lld exact=%d us/call=%.2f\n", (long long) ne, (long long) nbytes, (int) exact, us);
+
+        for (void * exec : execs) {
+            t.capture_free(exec);
+        }
+
+        // One-call graphs replayed with an idle gap each time: this number
+        // includes the launch overhead, so it is only a reference point.
+        std::vector<void *> singles(n, nullptr);
+        bool single_captured = true;
+        for (size_t i = 0; i < n; ++i) {
+            if (!t.capture_begin(t.backends[i])) {
+                single_captured = false;
+                break;
+            }
+            t.comm_allreduce_rank(t.comm, i, c.tensors[i], exact);
+            singles[i] = t.capture_end(t.backends[i]);
+            if (singles[i] == nullptr) {
+                single_captured = false;
+                break;
+            }
+        }
+        if (!single_captured) {
+            for (void * exec : singles) {
+                t.capture_free(exec);
+            }
+            printf("chain ne=%lld SKIP (single capture failed)\n", (long long) ne);
+            continue;
+        }
+
+        double single_us = 0.0;
+        for (int rep = 0; rep < n_single; ++rep) {
+            const auto s0 = std::chrono::steady_clock::now();
+            for (size_t i = 0; i < n; ++i) {
+                t.capture_launch(t.backends[i], singles[i]);
+            }
+            for (size_t i = 0; i < n; ++i) {
+                ggml_backend_synchronize(t.backends[i]);
+            }
+            const auto s1 = std::chrono::steady_clock::now();
+            single_us += std::chrono::duration<double, std::micro>(s1 - s0).count();
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+        }
+        printf("single ne=%lld exact=%d us/call=%.2f\n", (long long) ne, (int) exact, single_us / n_single);
+
+        // The replayed tensors hold repeated sums, so reload the inputs and
+        // replay one fresh one-call graph before comparing rank 0.
+        for (size_t i = 0; i < n; ++i) {
+            ggml_backend_tensor_set(c.tensors[i], host[i].data(), 0, nbytes);
+        }
+        for (size_t i = 0; i < n; ++i) {
+            t.capture_launch(t.backends[i], singles[i]);
+        }
+        for (size_t i = 0; i < n; ++i) {
+            ggml_backend_synchronize(t.backends[i]);
+        }
+
+        std::vector<float> result(ne);
+        ggml_backend_tensor_get(c.tensors[0], result.data(), 0, nbytes);
+
+        bool check = true;
+        if (exact) {
+            // The f32 kernel sums the ranks in rank order, so the reference does too.
+            std::vector<float> ref(ne);
+            for (int64_t j = 0; j < ne; ++j) {
+                float sum = host[0][j];
+                for (size_t i = 1; i < n; ++i) {
+                    sum += host[i][j];
+                }
+                ref[j] = sum;
+            }
+            check = memcmp(result.data(), ref.data(), nbytes) == 0;
+            if (!check) {
+                for (int64_t j = 0; j < ne; ++j) {
+                    if (memcmp(&result[j], &ref[j], sizeof(float)) != 0) {
+                        fprintf(stderr, "chain: ne=%lld exact=1 elem=%lld got=%g want=%g\n",
+                                (long long) ne, (long long) j, (double) result[j], (double) ref[j]);
+                        break;
+                    }
+                }
+            }
+        } else {
+            for (int64_t j = 0; j < ne; ++j) {
+                double expected = 0.0;
+                for (size_t i = 0; i < n; ++i) {
+                    expected += (double) host[i][j];
+                }
+                const double diff = std::fabs((double) result[j] - expected);
+                if (diff / std::max(std::fabs(expected), 1.0) >= 1e-2) {
+                    fprintf(stderr, "chain: ne=%lld exact=0 elem=%lld got=%g want=%g\n",
+                            (long long) ne, (long long) j, (double) result[j], expected);
+                    check = false;
+                    break;
+                }
+            }
+        }
+
+        printf("chain ne=%lld check %s\n", (long long) ne, check ? "OK" : "FAILED");
+        ok = ok && check;
+
+        for (void * exec : singles) {
+            t.capture_free(exec);
+        }
+    }
+
+    return ok;
+}
+
 int main() {
     ggml_backend_load_all();
 
@@ -303,6 +540,20 @@ int main() {
     ggml_backend_comm_allreduce_tensor_t comm_allreduce_exact =
         (ggml_backend_comm_allreduce_tensor_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allreduce_tensor_exact");
 
+    // Optional: CUDA graph capture of the per-rank push AllReduce, for the chain timing.
+    ggml_backend_comm_allreduce_rank_t comm_allreduce_rank =
+        (ggml_backend_comm_allreduce_rank_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allreduce_rank");
+    ggml_backend_comm_allreduce_rank_capturable_t comm_allreduce_rank_capturable =
+        (ggml_backend_comm_allreduce_rank_capturable_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allreduce_rank_capturable");
+    ggml_backend_capture_begin_t capture_begin =
+        (ggml_backend_capture_begin_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_capture_begin");
+    ggml_backend_capture_end_t capture_end =
+        (ggml_backend_capture_end_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_capture_end");
+    ggml_backend_capture_launch_t capture_launch =
+        (ggml_backend_capture_launch_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_capture_launch");
+    ggml_backend_capture_free_t capture_free =
+        (ggml_backend_capture_free_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_capture_free");
+
     size_t n = ggml_backend_reg_dev_count(reg);
     if (n > 8) {
         n = 8;
@@ -317,6 +568,12 @@ int main() {
     t.comm_free = comm_free;
     t.comm_allreduce = comm_allreduce;
     t.comm_allreduce_exact = comm_allreduce_exact;
+    t.comm_allreduce_rank = comm_allreduce_rank;
+    t.comm_allreduce_rank_capturable = comm_allreduce_rank_capturable;
+    t.capture_begin = capture_begin;
+    t.capture_end = capture_end;
+    t.capture_launch = capture_launch;
+    t.capture_free = capture_free;
 
     bool backends_ok = true;
     for (size_t i = 0; i < n; ++i) {
@@ -403,6 +660,12 @@ int main() {
         run_timing(t, t.comm_allreduce, t.comm_allreduce_exact != nullptr ? "default proc" : "default proc (no exact proc)");
         if (t.comm_allreduce_exact != nullptr) {
             run_timing(t, t.comm_allreduce_exact, "exact proc");
+        }
+        if (!run_chain_timing(t, false)) {
+            n_failed++;
+        }
+        if (t.comm_allreduce_exact != nullptr && !run_chain_timing(t, true)) {
+            n_failed++;
         }
     }
 
