@@ -40,6 +40,21 @@ struct llama_memory_buffer {
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
+// DFlash2: device-side link between a target context (writes the layer-input sink) and a draft
+// context (copies from it). The same object is held by both contexts.
+struct llama_embd_link {
+    ggml_backend_event_t ev_tgt_done  = nullptr; // target finished writing the sink
+    ggml_backend_event_t ev_copy_done = nullptr; // draft finished copying from the sink
+
+    ggml_tensor * t_layer_inp_sink = nullptr;    // target sink, [n_embd * n_layers, n_batch]
+    ggml_tensor * t_embd_src_sink  = nullptr;    // draft staging sink, [n_embd_inp, n_ubatch]
+
+    ~llama_embd_link() {
+        ggml_backend_event_free(ev_tgt_done);
+        ggml_backend_event_free(ev_copy_done);
+    }
+};
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
@@ -123,6 +138,15 @@ struct llama_context {
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
+    // DFlash2: keep the target layer inputs in a device sink instead of host buffers
+    bool enable_layer_inp_sink(const std::vector<uint32_t> & lids);
+    // DFlash2: link a draft context to this target context (allocates the draft staging sink)
+    bool link_embd(llama_context * ctx_dft);
+    // DFlash2: switch the next embd batch of a linked draft between the device sink and the host input
+    void set_embd_source(bool enable, int32_t token_offset);
+    // DFlash2: read back [token_offset, token_offset + n_tokens) rows of the sink into dst
+    bool layer_inp_sink_get(size_t token_offset, size_t n_tokens, float * dst);
+
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
@@ -142,7 +166,8 @@ struct llama_context {
                 const llama_ubatch & ubatch,
                     llm_graph_type   gtype,
             llama_memory_context_i * mctx,
-                       ggml_status & ret);
+                       ggml_status & ret,
+                         size_t     token_offset = 0);
 
     int encode(const llama_batch_ext & batch_inp);
     int decode(const llama_batch_ext & batch_inp);
@@ -276,7 +301,8 @@ private:
                          llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const;
+                          llm_graph_type   gtype,
+                             size_t        token_offset = 0) const;
 
     llm_graph_cb graph_get_cb(ggml_backend_sched_t sched) const;
 
@@ -323,6 +349,22 @@ private:
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
+
+    // DFlash2: device-side sink for the target layer inputs, [n_embd * n_layers, n_batch]
+    ggml_context_ptr        ctx_sink; // declared before buf_sink so that the buffer is freed first
+    ggml_backend_buffer_ptr buf_sink;
+    ggml_tensor *           t_layer_inp_sink = nullptr;
+    std::vector<uint32_t>   layer_inp_sink_layers;
+
+    // DFlash2: draft-side staging sink for the injected features, [n_embd_inp, n_ubatch]
+    ggml_context_ptr        ctx_embd_src;
+    ggml_backend_buffer_ptr buf_embd_src;
+    ggml_tensor *           t_embd_src_sink = nullptr;
+
+    // producer/consumer link, shared with the linked context
+    std::shared_ptr<llama_embd_link> embd_link;
+    bool    embd_src_enable = false; // draft: the next embd batch reads the staging sink
+    int32_t embd_src_offset = 0;     // draft: first target-sink column to copy
 
     // top-k logits output (3-dimensional arrays: [n_outputs][n_shards][k]), see llama_set_logits_topk;
     // the ids are local to their vocab shard, topk_ids_row holds the global ids of the last row read

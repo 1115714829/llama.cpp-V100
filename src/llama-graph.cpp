@@ -1464,6 +1464,10 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
+    t_layer_inp_sink (params.t_layer_inp_sink),
+    t_embd_src       (params.t_embd_src),
+    layer_inp_sink_layers(params.layer_inp_sink_layers),
+    token_offset     (params.token_offset),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
@@ -3639,6 +3643,34 @@ void llm_graph_context::build_dense_out(
     cb(cur, "result_embd_pooled", -1);
     res->t_embd_pooled = cur;
     ggml_build_forward_expand(gf, cur);
+}
+
+void llm_graph_context::build_layer_inp_sink() const {
+    if (t_layer_inp_sink == nullptr) {
+        return;
+    }
+
+    GGML_ASSERT(!layer_inp_sink_layers.empty());
+
+    for (size_t k = 0; k < layer_inp_sink_layers.size(); ++k) {
+        const uint32_t il = layer_inp_sink_layers[k];
+        ggml_tensor * cur = res->get_layer_inp((int) il);
+        GGML_ASSERT(cur != nullptr && "layer input tensor is null");
+        GGML_ASSERT(cur->type == GGML_TYPE_F32);
+        GGML_ASSERT(cur->ne[1] == n_tokens);
+
+        const int64_t n_embd_cur = cur->ne[0];
+        GGML_ASSERT(n_embd_cur * (int64_t) layer_inp_sink_layers.size() == t_layer_inp_sink->ne[0]);
+        GGML_ASSERT(token_offset + (size_t) n_tokens <= (size_t) t_layer_inp_sink->ne[1]);
+
+        // the column offset is part of the graph parameters, so a reused graph writes the same columns
+        ggml_tensor * dst = ggml_view_2d(ctx0, t_layer_inp_sink, n_embd_cur, n_tokens,
+                t_layer_inp_sink->nb[1],
+                (size_t) k * n_embd_cur * sizeof(float) + token_offset * t_layer_inp_sink->nb[1]);
+        ggml_tensor * cpy = ggml_cpy(ctx0, cur, dst);
+        ggml_format_name(cpy, "layer_inp_sink_cpy_l%d", il);
+        ggml_build_forward_expand(gf, cpy);
+    }
 }
 
 
