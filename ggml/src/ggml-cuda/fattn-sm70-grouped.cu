@@ -50,7 +50,7 @@ bool ggml_cuda_flash_attn_ext_sm70_grouped_supported(const ggml_tensor * dst, in
     if (sinks != nullptr) {
         return false;
     }
-    if (mask && mask->type != GGML_TYPE_F16) {
+    if (mask && mask->type != GGML_TYPE_F16 && !(mask->type == GGML_TYPE_I32 && mask->ne[0] == 2 && mask->nb[0] == sizeof(int32_t))) {
         return false;
     }
     if (ggml_get_op_params_i32(dst, 4) != 0) { // n_kv_max hint
@@ -107,7 +107,8 @@ static void ggml_cuda_flash_attn_ext_sm70_grouped_launch(ggml_backend_cuda_conte
         (int64_t) K->nb[1], (int64_t) K->nb[2], (int64_t) K->nb[3],
         (int64_t) V->nb[1], (int64_t) V->nb[2], (int64_t) V->nb[3],
         mask ? (int64_t) mask->nb[1] : (int64_t) 0,
-        mask ? (int64_t) mask->nb[3] : (int64_t) 0);
+        mask ? (int64_t) mask->nb[3] : (int64_t) 0,
+        mask && mask->type == GGML_TYPE_I32 ? 1 : 0);
 
     const dim3 blocks_num_combine(n_q, n_heads, n_seq);
     const dim3 block_dim_combine(kGroupedVerifyHeadDim, 1, 1);
