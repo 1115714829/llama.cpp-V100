@@ -66,6 +66,22 @@ public:
         return pos.size();
     }
 
+    // raw access to the cell arrays, for performance-critical loops
+    const llama_pos * pos_data() const {
+        return pos.data();
+    }
+
+    const seq_set_t * seq_data() const {
+        return seq.data();
+    }
+
+    // number of cells that carry sequence seq_id
+    uint32_t seq_n_cells(llama_seq_id seq_id) const {
+        assert(seq_id >= 0 && seq_id < LLAMA_MAX_SEQ);
+
+        return seq_pos[seq_id].size();
+    }
+
     void resize(uint32_t n) {
         pos.resize(n);
         ext.resize(n);
