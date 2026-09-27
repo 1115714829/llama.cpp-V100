@@ -56,6 +56,9 @@ struct llama_cparams {
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
+    int32_t logits_topk        = 0; // output only the top k logits of every row, see llama_set_logits_topk
+    int32_t logits_topk_shards = 1; // vocab shards that select their candidates independently
+
     enum llama_context_type ctx_type;
     enum llama_rope_scaling_type rope_scaling_type;
     enum llama_pooling_type pooling_type;

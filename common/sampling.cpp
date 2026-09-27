@@ -925,30 +925,48 @@ static common_sampler_sparse_probs common_sampler_sparse_p(
         struct llama_context * ctx,
         int idx,
         int32_t k) {
-    const float * logits = llama_get_logits_ith(ctx, idx);
-    GGML_ASSERT(logits != nullptr);
-
-    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
-
-    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
-    GGML_ASSERT(k > 0 && k <= n_vocab);
-
-    // top-k with a deterministic tie break (logit desc, id asc) in one pass over the row: the ids are
-    // visited in ascending order, so once k candidates are kept a later id only enters with a logit
-    // strictly greater than the current k-th one
     std::vector<llama_token_data> cur;
-    cur.reserve(k + 1);
-    for (llama_token id = 0; id < n_vocab; ++id) {
-        const float logit = logits[id];
-        if ((int32_t) cur.size() == k && !(logit > cur.back().logit)) {
-            continue;
+
+    // with the top-k logits output the row holds a superset of its top k candidates
+    const llama_token * topk_ids    = nullptr;
+    const float       * topk_logits = nullptr;
+    const int32_t n_topk = llama_get_logits_topk_ith(ctx, idx, &topk_ids, &topk_logits);
+
+    if (n_topk >= k) {
+        cur.resize(n_topk);
+        for (int32_t i = 0; i < n_topk; ++i) {
+            cur[i] = llama_token_data{topk_ids[i], topk_logits[i], 0.0f};
         }
-        // after the kept candidates with a logit >= this one
-        const auto it = std::upper_bound(cur.begin(), cur.end(), logit,
-                [](float l, const llama_token_data & t) { return l > t.logit; });
-        cur.insert(it, llama_token_data{id, logit, 0.0f});
-        if ((int32_t) cur.size() > k) {
-            cur.pop_back();
+
+        // top-k with a deterministic tie break (logit desc, id asc)
+        std::sort(cur.begin(), cur.end(), [](const llama_token_data & a, const llama_token_data & b) {
+            return a.logit != b.logit ? a.logit > b.logit : a.id < b.id;
+        });
+        cur.resize(k);
+    } else {
+        const float * logits = llama_get_logits_ith(ctx, idx);
+        GGML_ASSERT(logits != nullptr);
+
+        const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+
+        const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+        GGML_ASSERT(k > 0 && k <= n_vocab);
+
+        // the same top-k in one pass over the row: the ids are visited in ascending order, so once k
+        // candidates are kept a later id only enters with a logit strictly greater than the k-th one
+        cur.reserve(k + 1);
+        for (llama_token id = 0; id < n_vocab; ++id) {
+            const float logit = logits[id];
+            if ((int32_t) cur.size() == k && !(logit > cur.back().logit)) {
+                continue;
+            }
+            // after the kept candidates with a logit >= this one
+            const auto it = std::upper_bound(cur.begin(), cur.end(), logit,
+                    [](float l, const llama_token_data & t) { return l > t.logit; });
+            cur.insert(it, llama_token_data{id, logit, 0.0f});
+            if ((int32_t) cur.size() > k) {
+                cur.pop_back();
+            }
         }
     }
 

@@ -940,6 +940,11 @@ public:
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
 
+    // top-k logits output (llama_set_logits_topk): [1, k, n_shards, n_outputs] logits and
+    // [k, n_shards, n_outputs] ids local to their vocab shard
+    ggml_tensor * t_logits_topk     = nullptr;
+    ggml_tensor * t_logits_topk_ids = nullptr;
+
     std::vector<ggml_tensor *> t_layer_inp;
 
     std::vector<ggml_tensor *> t_sampled;
@@ -1380,6 +1385,8 @@ struct llm_graph_context {
     //
 
     void build_sampling() const;
+
+    void build_logits_topk() const;
 
     //
     // dense (out)
