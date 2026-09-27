@@ -3702,10 +3702,12 @@ private:
 
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
+        // with speculative decoding the target is synchronized after the draft injection below,
+        // so that the injection is enqueued behind the target on the device instead of after it on the host
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
             ret = llama_decode(ctx_tgt, batch_view);
-            if (ret == 0 && has_output) {
+            if (ret == 0 && has_output && !spec) {
                 llama_synchronize(ctx_tgt);
             }
         });
@@ -3770,6 +3772,9 @@ private:
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch_view);
+                if (ok && has_output) {
+                    llama_synchronize(ctx_tgt);
+                }
             });
 
             if (!ok) {
