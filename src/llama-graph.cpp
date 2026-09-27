@@ -1327,6 +1327,9 @@ void llm_graph_result::reset() {
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
 
+    t_logits_topk     = nullptr;
+    t_logits_topk_ids = nullptr;
+
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
 
@@ -1379,6 +1382,11 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
                 GGML_ASSERT(t_layer_inp[il] != nullptr && "layer input tensor is null");
                 ggml_set_output(t_layer_inp[il]);
             }
+        }
+    }
+    for (auto * tensor : { t_logits_topk, t_logits_topk_ids }) {
+        if (tensor != nullptr) {
+            ggml_set_output(tensor);
         }
     }
     for (auto * tensor : t_sampled) {
@@ -3788,6 +3796,38 @@ void llm_graph_context::build_pooling(
     res->t_embd_pooled = cur;
 
     ggml_build_forward_expand(gf, cur);
+}
+
+void llm_graph_context::build_logits_topk() const {
+    const int32_t k        = cparams.logits_topk;
+    const int32_t n_shards = cparams.logits_topk_shards;
+
+    if (k <= 0 || !res->t_logits || res->t_logits->ne[1] == 0) {
+        return;
+    }
+
+    ggml_tensor * logits = res->t_logits; // [n_vocab, n_outputs]
+
+    const int64_t n_vocab = logits->ne[0];
+    const int64_t n_rows  = logits->ne[1];
+
+    GGML_ASSERT(n_vocab % n_shards == 0 && n_vocab / n_shards >= k);
+
+    // one row per vocab shard: with the vocab split over the devices every device selects the
+    // candidates of its own shard, so no data has to cross the devices
+    ggml_tensor * shards = ggml_reshape_3d(ctx0, logits, n_vocab / n_shards, n_shards, n_rows);
+
+    ggml_tensor * ids = ggml_top_k(ctx0, shards, k); // [k, n_shards, n_rows]
+    cb(ids, "logits_topk_ids", -1);
+
+    ggml_tensor * vals = ggml_get_rows(ctx0, ggml_reshape_4d(ctx0, shards, 1, n_vocab / n_shards, n_shards, n_rows), ids);
+    cb(vals, "logits_topk", -1);
+
+    res->t_logits_topk     = vals;
+    res->t_logits_topk_ids = ids;
+
+    ggml_build_forward_expand(gf, ids);
+    ggml_build_forward_expand(gf, vals);
 }
 
 void llm_graph_context::build_sampling() const {

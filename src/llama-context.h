@@ -82,6 +82,9 @@ struct llama_context {
     float * get_logits();
     float * get_logits_ith(int32_t i);
 
+    void    set_logits_topk(int32_t k);
+    int32_t get_logits_topk_ith(int32_t i, const llama_token ** ids, const float ** logits);
+
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
@@ -320,6 +323,15 @@ private:
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
+
+    // top-k logits output (3-dimensional arrays: [n_outputs][n_shards][k]), see llama_set_logits_topk;
+    // the ids are local to their vocab shard, topk_ids_row holds the global ids of the last row read
+    buffer_view<float>       topk_logits = {nullptr, 0};
+    buffer_view<int32_t>     topk_ids    = {nullptr, 0};
+    std::vector<llama_token> topk_ids_row;
+
+    // false when the last batch only copied its top-k logits
+    bool logits_full = true;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

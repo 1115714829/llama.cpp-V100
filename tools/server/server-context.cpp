@@ -1821,6 +1821,13 @@ private:
                     params_base.speculative.types.end(),
                     COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params_base.speculative.types.end();
             slot.spec_use_rejection = spec && spec_dflash2 && common_sampler_can_sparse_reject(slot.smpl.get());
+
+            // the rejection reads only the top-k logits of the verified rows, so they do not have to leave
+            // the device; the context setting is shared by the slots, hence a single slot only
+            if (params_base.n_parallel == 1) {
+                llama_set_logits_topk(ctx_tgt, slot.spec_use_rejection && !use_backend_sampling && !need_pre_sample_logits
+                        ? common_sampler_sparse_k(slot.smpl.get()) : 0);
+            }
         } else {
             slot.smpl.reset();
         }

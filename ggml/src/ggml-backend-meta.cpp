@@ -788,6 +788,18 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             // rows spread across backends, collected during graph compute
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
         }
+        // batched gather with the batch dimension split over the backends and the ids split alike
+        // (ids dim d-1 indexes src0 dim d): every backend gathers from its own batches
+        if (src_ss[0].axis >= GGML_BACKEND_SPLIT_AXIS_2 && src_ss[0].axis < GGML_MAX_DIMS &&
+                src_ss[1].axis == src_ss[0].axis - 1 && src_ss[0].n_segments == 1 && src_ss[1].n_segments == 1) {
+            bool same_split = true;
+            for (size_t j = 0; j < n_bufs; j++) {
+                same_split = same_split && src_ss[0].ne[j]*src_ss[0].nr[0] == src_ss[1].ne[j]*src_ss[1].nr[0];
+            }
+            if (same_split) {
+                return src_ss[0];
+            }
+        }
         return handle_generic(src_ss, /*scalar_only =*/ true);
     };
 
