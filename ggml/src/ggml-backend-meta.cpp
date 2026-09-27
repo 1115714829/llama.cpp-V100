@@ -2497,6 +2497,8 @@ struct ggml_backend_meta_context {
     };
     std::string                       name;
     std::vector<backend_config>       backend_configs;
+    // retired temporary buffers: captured plans may still reference them, so they are kept until the context is destroyed
+    std::vector<ggml_backend_buffer_ptr> tmp_bufs_retired;
     ggml_backend_meta_plan            plans[GGML_META_N_PLANS];
     uint64_t                          plan_tick = 0; // see plan.last_use and stc_last_use
     ggml_context_ptr                  ctx;
@@ -3217,22 +3219,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
         plan.n_subgraphs = n_subgraphs;
 
-        if (max_tmp_size > backend_ctx->max_tmp_size) {
-            // the per-rank temporary buffers are reallocated: discard every other plan first,
-            // since its captured executables and collected tensors reference the old buffers
-            for (auto & plan_other : backend_ctx->plans) {
-                if (&plan_other != &plan) {
-                    backend_ctx->plan_clear(plan_other);
-                }
-            }
-            for (size_t j = 0; j < n_backends; j++) {
-                auto & bcj = backend_ctx->backend_configs[j];
-                for (size_t i = 0; i < backend_ctx->n_reduce_steps; i++) {
-                    bcj.bufs[i].reset(ggml_backend_alloc_buffer(bcj.backend, max_tmp_size));
-                }
-            }
-            backend_ctx->max_tmp_size = max_tmp_size;
-        }
+        // the per-rank temporary buffers are only allocated by set_tmp_data when the fallback AllReduce actually runs
+        backend_ctx->max_tmp_size = std::max(backend_ctx->max_tmp_size, max_tmp_size);
 
         if (max_nnodes_raised || n_subgraphs > backend_ctx->max_subgraphs) {
             // the graph context is rebuilt: discard every other plan, its cgraphs live in the old context
@@ -3444,7 +3432,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         auto & bcj = backend_ctx->backend_configs[j];
         ggml_backend_buffer_ptr & buf_ptr = bcj.bufs[i_buf];
         if (!buf_ptr || ggml_backend_buffer_get_size(buf_ptr.get()) < backend_ctx->max_tmp_size) {
-            buf_ptr.reset(ggml_backend_alloc_buffer(bcj.backend, backend_ctx->max_tmp_size));
+            // retire the old buffer: captured executables may still reference it
+            if (buf_ptr) {
+                backend_ctx->tmp_bufs_retired.push_back(std::move(buf_ptr));
+            }
+            // allocate a power of two so that repeated growth retires less than the current size in total
+            size_t size = 1;
+            while (size < backend_ctx->max_tmp_size) {
+                size *= 2;
+            }
+            buf_ptr.reset(ggml_backend_alloc_buffer(bcj.backend, size));
         }
         tensor->buffer = buf_ptr.get();
         tensor->data   = ggml_backend_buffer_get_base(buf_ptr.get());
