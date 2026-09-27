@@ -465,6 +465,10 @@ static llama_mmap::ranges ranges_complement(llama_mmap::ranges ranges, size_t li
 struct llama_mmap::impl {
 #ifdef _POSIX_MAPPED_FILES
     std::vector<std::pair<size_t, size_t>> mapped_fragments;
+#ifdef __linux__
+    // own file descriptor, used to drop the page cache of unmapped fragments
+    int fd_own = -1;
+#endif
 
     impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
         size = file->size();
@@ -513,6 +517,13 @@ struct llama_mmap::impl {
         }
 
         mapped_fragments.emplace_back(0, file->size());
+
+#ifdef __linux__
+        fd_own = dup(fd);
+        if (fd_own == -1) {
+            LLAMA_LOG_DEBUG("warning: dup failed: %s, page cache of unmapped fragments will not be released\n", strerror(errno));
+        }
+#endif
     }
 
     static void align_range(size_t * first, size_t * last, size_t page_size) {
@@ -542,9 +553,16 @@ struct llama_mmap::impl {
 
         void * next_page_start = (uint8_t *) addr + first;
 
-        if (munmap(next_page_start, len)) {
+        const int munmap_ret = munmap(next_page_start, len);
+        if (munmap_ret) {
             LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
         }
+#ifdef __linux__
+        // the data is not needed anymore, drop its page cache
+        if (munmap_ret == 0 && fd_own != -1 && posix_fadvise(fd_own, first, len, POSIX_FADV_DONTNEED)) {
+            LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_DONTNEED) failed: %s\n", strerror(errno));
+        }
+#endif
 
         std::vector<std::pair<size_t, size_t>> new_mapped_fragments;
         for (const auto & frag : mapped_fragments) {
@@ -569,6 +587,11 @@ struct llama_mmap::impl {
                 LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
             }
         }
+#ifdef __linux__
+        if (fd_own != -1) {
+            close(fd_own);
+        }
+#endif
     }
 #elif defined(_WIN32)
     HANDLE hMapping = nullptr;
