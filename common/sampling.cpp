@@ -166,6 +166,9 @@ struct common_sampler {
     }
 
     mutable int64_t t_total_us = 0;
+
+    // number of tokens the logit bias bans (-INFINITY, e.g. ignore_eos), -1 if a bias is finite
+    int32_t n_logit_bans = 0;
 };
 
 std::string common_params_sampling::print() const {
@@ -323,6 +326,7 @@ struct common_sampler * common_sampler_init(
     }
 
     // logit bias: user biases + model suppress tokens (-INFINITY)
+    int32_t n_logit_bans = 0;
     {
         std::vector<llama_logit_bias> merged = params.logit_bias;
 
@@ -330,6 +334,14 @@ struct common_sampler * common_sampler_init(
         const llama_token * suppress = llama_vocab_get_suppress_tokens(vocab, &n_suppress);
         for (int32_t i = 0; i < n_suppress; ++i) {
             merged.push_back({ suppress[i], -INFINITY });
+        }
+
+        for (const auto & lb : merged) {
+            if (lb.bias != -INFINITY) {
+                n_logit_bans = -1;
+                break;
+            }
+            n_logit_bans++;
         }
 
         if (!merged.empty()) {
@@ -434,6 +446,8 @@ struct common_sampler * common_sampler_init(
         /* .cur_p   = */ {},
     };
 
+    result->n_logit_bans = n_logit_bans;
+
     return result;
 }
 
@@ -507,7 +521,7 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 }
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
-    return new common_sampler {
+    auto * result = new common_sampler {
         /* .params  = */ gsmpl->params,
         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
@@ -516,6 +530,10 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
     };
+
+    result->n_logit_bans = gsmpl->n_logit_bans;
+
+    return result;
 }
 
 void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
@@ -536,6 +554,7 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur_p      = src->cur_p;
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
     dst->t_total_us = src->t_total_us;
+    dst->n_logit_bans = src->n_logit_bans;
 }
 
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
@@ -767,11 +786,18 @@ bool common_sampler_can_sparse_reject(const struct common_sampler * gsmpl) {
         return false;
     }
 
-    // before top-k only no-op samplers are allowed
+    // before top-k only no-op samplers and a logit bias that only bans tokens (e.g. ignore_eos) are
+    // allowed; the sparse rows then hold top_k + n_logit_bans candidates, so that the banned ones
+    // can drop out when the chain is replayed over them
     for (int32_t i = 0; i < i_top_k; ++i) {
-        if (llama_sampler_name(llama_sampler_chain_get(chain, i))[0] != '?') {
-            return false;
+        const char * name = llama_sampler_name(llama_sampler_chain_get(chain, i));
+        if (name[0] == '?') {
+            continue;
         }
+        if (common_sampler_name_is(name, "logit-bias") && gsmpl->n_logit_bans >= 0) {
+            continue;
+        }
+        return false;
     }
 
     // after top-k only truncation and temperature samplers are allowed; this rejects
@@ -791,6 +817,14 @@ bool common_sampler_can_sparse_reject(const struct common_sampler * gsmpl) {
     }
 
     return true;
+}
+
+int32_t common_sampler_sparse_k(const struct common_sampler * gsmpl) {
+    if (!common_sampler_can_sparse_reject(gsmpl)) {
+        return 0;
+    }
+
+    return gsmpl->params.top_k + gsmpl->n_logit_bans;
 }
 
 static float common_sampler_sparse_get(const std::vector<llama_token> & ids, const std::vector<float> & probs, llama_token id) {
@@ -968,7 +1002,7 @@ std::vector<llama_token> common_sampler_reject_and_accept_n(
 
     llama_synchronize(ctx);
 
-    const int32_t k = gsmpl->params.top_k;
+    const int32_t k = common_sampler_sparse_k(gsmpl);
 
     std::vector<common_sampler_sparse_probs> p_rows;
     p_rows.reserve(idxs.size());
