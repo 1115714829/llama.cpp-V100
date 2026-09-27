@@ -933,23 +933,23 @@ static common_sampler_sparse_probs common_sampler_sparse_p(
     const int32_t n_vocab = llama_vocab_n_tokens(vocab);
     GGML_ASSERT(k > 0 && k <= n_vocab);
 
-    std::vector<llama_token> ids(n_vocab);
-    for (llama_token i = 0; i < n_vocab; ++i) {
-        ids[i] = i;
-    }
-
-    // top-k with a deterministic tie break (logit desc, id asc)
-    std::partial_sort(ids.begin(), ids.begin() + k, ids.end(), [logits](llama_token a, llama_token b) {
-        if (logits[a] != logits[b]) {
-            return logits[a] > logits[b];
+    // top-k with a deterministic tie break (logit desc, id asc) in one pass over the row: the ids are
+    // visited in ascending order, so once k candidates are kept a later id only enters with a logit
+    // strictly greater than the current k-th one
+    std::vector<llama_token_data> cur;
+    cur.reserve(k + 1);
+    for (llama_token id = 0; id < n_vocab; ++id) {
+        const float logit = logits[id];
+        if ((int32_t) cur.size() == k && !(logit > cur.back().logit)) {
+            continue;
         }
-        return a < b;
-    });
-    ids.resize(k);
-
-    std::vector<llama_token_data> cur(k);
-    for (int32_t i = 0; i < k; ++i) {
-        cur[i] = llama_token_data{ids[i], logits[ids[i]], 0.0f};
+        // after the kept candidates with a logit >= this one
+        const auto it = std::upper_bound(cur.begin(), cur.end(), logit,
+                [](float l, const llama_token_data & t) { return l > t.logit; });
+        cur.insert(it, llama_token_data{id, logit, 0.0f});
+        if ((int32_t) cur.size() > k) {
+            cur.pop_back();
+        }
     }
 
     llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
