@@ -90,6 +90,10 @@ struct llama_batch_ext {
     // must be either n_embd_inp or n_embd_inp_enc; encode/decode verify it against the graph input
     size_t n_embd = 0;
 
+    // the embd rows carry no host data: the graph reads the embeddings from a device buffer
+    // (DFlash2 injection from the staging sink), so they are neither copied nor read
+    bool embd_on_device = false;
+
     struct token {
         llama_token  id = LLAMA_TOKEN_NULL;
         bool         has_embd = false; // whether embd_off is set
@@ -193,6 +197,10 @@ private:
 
     std::vector<llama_token>    token_vec;    // owned token IDs built from llama_batch_ext
     std::vector<float>          embd_vec;     // owned embeddings built from llama_batch_ext
+
+    // placeholder embd rows that live on the device: embd_on_device_tag only marks the batch/ubatch as non-empty
+    bool                        embd_on_device     = false;
+    float                       embd_on_device_tag = 0.0f;
     std::vector<llama_seq_id>   seq_id_data;  // flat storage for seq_id pointers below
 
     std::vector<llama_pos>      pos;
@@ -234,10 +242,11 @@ struct llama_batch_compat {
     llama_batch_ext * batch_ext;
 
     // n_embd_row is the embd row width of batch_inp, 0 = use the decoder width
-    llama_batch_compat(llama_context * ctx, const llama_batch & batch_inp, size_t n_embd_row = 0);
+    // if embd_on_device is true, the embd rows are only placeholders and are not copied to the host
+    llama_batch_compat(llama_context * ctx, const llama_batch & batch_inp, size_t n_embd_row = 0, bool embd_on_device = false);
     ~llama_batch_compat();
 
     // fill an existing llama_batch_ext from a llama_batch (old API)
     // note: this is called directly by the tests, skipping llama_context creation
-    static void init(llama_batch_ext & batch_ext, const llama_batch & batch_inp, size_t n_embd_row = 0);
+    static void init(llama_batch_ext & batch_ext, const llama_batch & batch_inp, size_t n_embd_row = 0, bool embd_on_device = false);
 };
