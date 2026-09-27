@@ -193,6 +193,11 @@ public:
     // allow I32 [lo, hi) range masks for eligible ubatches (see get_kq_range_ok)
     void set_kq_range_allowed(bool allowed) override;
 
+    // 2+ token ubatches view the whole cache (bounded caches only, e.g. the SWA cache of an iSWA
+    // memory without swa_full): the graph then does not depend on the used cells
+    void set_view_full(bool enable) { view_full = enable; }
+    bool get_view_full() const { return view_full; }
+
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -308,6 +313,9 @@ private:
 
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
+
+    // see get_view_full()
+    bool view_full = false;
 
     // range masks are enabled before each decode from the current context parameters
     bool kq_range_enabled = false;

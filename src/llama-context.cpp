@@ -549,6 +549,9 @@ llama_context::~llama_context() {
             if (sched_slot0) {
                 size_act += ggml_backend_sched_get_buffer_size(sched_slot0.get(), backend);
             }
+            if (sched_dec) {
+                size_act += ggml_backend_sched_get_buffer_size(sched_dec.get(), backend);
+            }
             if (size_exp == size_act) {
                 LLAMA_LOG_DEBUG("%s: %10s compute buffer size is %8.4f MiB, matches expectation of %8.4f MiB\n",
                     __func__, ggml_backend_buft_name(buft), size_act / (1024.0*1024.0), size_exp / (1024.0*1024.0));
@@ -682,6 +685,10 @@ static bool is_dflash_draft(const llama_model & model, const llama_cparams & cpa
         && model.hparams.dsv4_hc_mult == 0;
 }
 
+// verification and single-token decode batches are small and get the dedicated decode scheduler;
+// larger token batches still use the regular prefill scheduler
+static constexpr uint32_t LLAMA_DEC_SLOT_MAX_TOKENS = 16;
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -712,7 +719,7 @@ void llama_context::sched_reserve() {
         res.reset();
     }
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
-    gf_res_prev_active = { nullptr, nullptr };
+    gf_res_prev_active = { nullptr, nullptr, nullptr };
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     ggml_backend_sched_set_async_inputs(sched.get(), true);
@@ -723,6 +730,14 @@ void llama_context::sched_reserve() {
         ggml_backend_sched_set_async_inputs(sched_slot0.get(), true);
     } else {
         sched_slot0.reset();
+    }
+
+    // decode batches (verification/single-token) get their own scheduler on regular contexts
+    if (!dflash_draft) {
+        sched_dec.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+        ggml_backend_sched_set_async_inputs(sched_dec.get(), true);
+    } else {
+        sched_dec.reset();
     }
 
     llama_memory_context_ptr mctx;
@@ -767,6 +782,10 @@ void llama_context::sched_reserve() {
                 if (sched_slot0) {
                     sched_slot0.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
                     ggml_backend_sched_set_async_inputs(sched_slot0.get(), true);
+                }
+                if (sched_dec) {
+                    sched_dec.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                    ggml_backend_sched_set_async_inputs(sched_dec.get(), true);
                 }
                 gf = graph_reserve(n_tokens_pp, n_seqs, n_outputs_pp, mctx.get());
             }
@@ -824,6 +843,26 @@ void llama_context::sched_reserve() {
         }
     }
 
+    // reserve the decode graph (verification/single-token batch) on its own scheduler
+    if (sched_dec) {
+        const uint32_t n_dec_tokens = std::min<uint32_t>(LLAMA_DEC_SLOT_MAX_TOKENS, cparams.n_ubatch);
+
+        std::vector<size_t> sizes_dec;
+        if (model.hparams.no_alloc) {
+            sizes_dec.assign(backend_ptrs.size(), 0);
+        }
+
+        auto * gf = graph_reserve(n_dec_tokens, 1, n_dec_tokens, mctx.get(), model.hparams.no_alloc,
+                model.hparams.no_alloc ? sizes_dec.data() : nullptr, 0, sched_dec.get());
+        if (!gf) {
+            throw std::runtime_error("failed to allocate compute decode buffers");
+        }
+
+        for (size_t i = 0; i < sizes_dec.size(); ++i) {
+            backend_buf_exp_size[i] += sizes_dec[i];
+        }
+    }
+
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
         ggml_backend_t             backend = backend_ptrs[i];
         ggml_backend_buffer_type_t buft    = backend_buft[i];
@@ -831,6 +870,9 @@ void llama_context::sched_reserve() {
             backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend);
             if (sched_slot0) {
                 backend_buf_exp_size[i] += ggml_backend_sched_get_buffer_size(sched_slot0.get(), backend);
+            }
+            if (sched_dec) {
+                backend_buf_exp_size[i] += ggml_backend_sched_get_buffer_size(sched_dec.get(), backend);
             }
         }
         if (backend_buf_exp_size[i] > 1) {
@@ -859,6 +901,18 @@ void llama_context::sched_reserve() {
 
     const int64_t t_end_us = ggml_time_us();
 
+    {
+        std::string dec_info = "disabled";
+        if (sched_dec) {
+            dec_info = "enabled";
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                dec_info += format(" %s=%.2f MiB", ggml_backend_buft_name(backend_buft[i]),
+                        ggml_backend_sched_get_buffer_size(sched_dec.get(), backend_ptrs[i]) / 1024.0 / 1024.0);
+            }
+        }
+        LLAMA_LOG_INFO("%s: decode scheduler %s\n", __func__, dec_info.c_str());
+    }
+
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
 }
@@ -871,6 +925,9 @@ void llama_context::synchronize() {
     ggml_backend_sched_synchronize(sched.get());
     if (sched_slot0) {
         ggml_backend_sched_synchronize(sched_slot0.get());
+    }
+    if (sched_dec) {
+        ggml_backend_sched_synchronize(sched_dec.get());
     }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
@@ -976,7 +1033,7 @@ bool llama_context::memory_update(bool optimize) {
                 res->reset();
             }
         }
-        gf_res_prev_active = { nullptr, nullptr };
+        gf_res_prev_active = { nullptr, nullptr, nullptr };
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -1758,11 +1815,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
-        if (sched_slot0) {
-            gf_res_prev_active[slot] = nullptr;
-        } else {
-            // both slots share `sched`, so allocating this graph invalidates the other slot's graph
-            gf_res_prev_active = { nullptr, nullptr };
+        // allocating on a scheduler invalidates the previous graphs held by that scheduler
+        for (int i = 0; i < (sched_dec ? 3 : 2); ++i) {
+            if (sched_for_slot(i) == sched_cur) {
+                gf_res_prev_active[i] = nullptr;
+            }
         }
         res->reset();
 
@@ -2857,6 +2914,11 @@ llm_graph_result * llama_context::get_gf_res_prev(int slot) {
 }
 
 int llama_context::gf_res_slot(const llama_ubatch & ubatch) const {
+    // verification/single-token decode batches of regular contexts get the dedicated decode scheduler
+    if (sched_dec && ubatch.embd == nullptr && n_outputs == ubatch.n_tokens && ubatch.n_tokens <= LLAMA_DEC_SLOT_MAX_TOKENS) {
+        return 2;
+    }
+
     if (!sched_slot0) {
         return n_outputs > 0 ? 1 : 0;
     }
@@ -2867,7 +2929,12 @@ int llama_context::gf_res_slot(const llama_ubatch & ubatch) const {
 }
 
 ggml_backend_sched_t llama_context::sched_for_slot(int slot) const {
-    GGML_ASSERT(slot == 0 || slot == 1);
+    GGML_ASSERT(slot >= 0 && slot <= 2);
+
+    if (slot == 2) {
+        GGML_ASSERT(sched_dec);
+        return sched_dec.get();
+    }
 
     return slot == 0 && sched_slot0 ? sched_slot0.get() : sched.get();
 }
@@ -2930,7 +2997,8 @@ static void ubatch_prepare_reserve(
 }
 
 ggml_cgraph * llama_context::graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes, uint32_t n_embd) {
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes, uint32_t n_embd,
+        ggml_backend_sched_t sched_override) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
 
@@ -2939,7 +3007,7 @@ ggml_cgraph * llama_context::graph_reserve(
         LLAMA_LOG_DEBUG("%s: making n_tokens a multiple of n_seqs - n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs);
     }
 
-    ggml_backend_sched_t sched_cur = n_embd > 0 && sched_slot0 ? sched_slot0.get() : sched.get();
+    ggml_backend_sched_t sched_cur = sched_override ? sched_override : (n_embd > 0 && sched_slot0 ? sched_slot0.get() : sched.get());
 
     ggml_backend_sched_reset(sched_cur);
 
@@ -2949,7 +3017,7 @@ ggml_cgraph * llama_context::graph_reserve(
             res->reset();
         }
     }
-    gf_res_prev_active = { nullptr, nullptr };
+    gf_res_prev_active = { nullptr, nullptr, nullptr };
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
@@ -3929,6 +3997,9 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             if (sched_slot0) {
                 ret[buft].compute += ggml_backend_sched_get_buffer_size(sched_slot0.get(), backend);
             }
+            if (sched_dec) {
+                ret[buft].compute += ggml_backend_sched_get_buffer_size(sched_dec.get(), backend);
+            }
         }
     }
     return ret;
@@ -4084,7 +4155,7 @@ void llama_context::opt_epoch_iter(
             const auto gparams = graph_params(sched_for_slot(slot), res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
 
             // the optimizer graph is allocated outside sched, so the next decode must rebuild
-            gf_res_prev_active = { nullptr, nullptr };
+            gf_res_prev_active = { nullptr, nullptr, nullptr };
             res->reset();
 
             auto * gf = model.build_graph(gparams);

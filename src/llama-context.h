@@ -283,7 +283,8 @@ public:
     // reserve a graph with a dummy ubatch of the specified size
     // n_embd > 0 reserves the graph of an embd ubatch with that row width (e.g. DFlash feature injection)
     ggml_cgraph * graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr, uint32_t n_embd = 0);
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr, uint32_t n_embd = 0,
+        ggml_backend_sched_t sched_override = nullptr);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
@@ -419,6 +420,10 @@ private:
     // the alternating inject/block passes do not invalidate each other's graph state
     ggml_backend_sched_ptr sched_slot0;
 
+    // decode graphs (verification/single-token batches) get their own scheduler so that
+    // prefill allocations do not invalidate them across requests, see gf_res_slot
+    ggml_backend_sched_ptr sched_dec;
+
     bool sched_need_reserve = true;
 
     ggml_backend_t backend_cpu = nullptr;
@@ -441,11 +446,12 @@ private:
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
     // Separate arenas give batches with different graph layouts distinct CUDA graph cache keys:
-    // by outputs for regular contexts, by input kind (embd/token) for DFlash drafts
-    std::array<llm_graph_result_ptr, 2> gf_res_prev;
+    // by outputs for regular contexts, by input kind (embd/token) for DFlash drafts,
+    // slot 2 for decode batches when sched_dec is enabled
+    std::array<llm_graph_result_ptr, 3> gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
 
-    std::array<llm_graph_result *, 2> gf_res_prev_active = { nullptr, nullptr };
+    std::array<llm_graph_result *, 3> gf_res_prev_active = { nullptr, nullptr, nullptr };
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

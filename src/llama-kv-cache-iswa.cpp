@@ -103,6 +103,10 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
             model, hparams, type_k, type_v,
             v_trans, offload, unified, size_swa, n_seq_max, n_pad,
             hparams.n_swa, hparams.swa_type, mem_other_swa, filter_swa, reuse, share);
+
+    // without swa_full the SWA cache is bounded (about n_swa + n_ubatch cells), so 2+ token ubatches
+    // can view it whole
+    kv_swa->set_view_full(!swa_full);
 }
 
 void llama_kv_cache_iswa::clear(bool data) {
