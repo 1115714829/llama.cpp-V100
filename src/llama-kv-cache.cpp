@@ -1247,12 +1247,20 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
-    const uint32_t n_pad_cur = std::max(n_pad, 256u);
-
+    // a new n_kv rebuilds the graph and, with tensor parallelism, re-records its CUDA graphs (about 0.1 s), so the grain
+    // is large: 2048 cells, doubling with the used context beyond 64K so that the boundaries stay rare in long generations
+    // note: the extra cells are empty and masked, but FA still reads them - the waste is below the grain (1/32 of the used length at 128K)
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
 
-        result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur))), result);
+        const uint32_t n_used = cells.used_max_p1();
+
+        uint32_t grain = std::max(n_pad, 2048u);
+        while (grain * 32 < n_used) {
+            grain *= 2;
+        }
+
+        result = std::max(std::min(cells.size(), std::max(grain, GGML_PAD(n_used, grain))), result);
     }
 
     return result;
