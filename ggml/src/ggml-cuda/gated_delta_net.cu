@@ -1,5 +1,6 @@
 #include "gated_delta_net.cuh"
 #include "ggml-cuda/common.cuh"
+#include "gdn-chunk-sm70.cuh"
 
 template <int S_v, bool KDA, bool keep_rs_t, bool Prologue>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
@@ -325,34 +326,104 @@ static void ggml_cuda_op_gated_delta_net_impl(
         state_slot_stride = cache->slot_stride;
     }
 
+    // sm_70 chunked prefill: the leading n_c tokens run through the chunked kernels,
+    // the recurrent kernel keeps the tail (>= K tokens, so the snapshots stay correct).
+    const float * q_rec   = q_d;
+    const float * k_rec   = k_d;
+    const float * v_rec   = v_d;
+    const float * g_rec   = g_d;
+    const float * b_rec   = b_d;
+    const float * s_rec   = s_d;
+    float *       dst_rec = dst_d;
+    int64_t       n_rec   = n_tokens;
+    ggml_cuda_gdn_prologue pro_rec = {};
+    const ggml_cuda_gdn_prologue * pro_rec_p = prologue;
+    ggml_cuda_pool_alloc<float> h_mid;
+
+    if constexpr (GGML_CUDA_GDN_CHUNK_SM70_COMPILED) {
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        const int64_t n_c = ggml_cuda_gdn_chunk_sm70_n_tokens(cc, S_v, H, neqk1, n_tokens, n_seqs, rq3, kda, K);
+        if (n_c > 0) {
+            h_mid.alloc(ctx.pool(), H * S_v * S_v);
+
+            ggml_cuda_gdn_chunk_args args = {};
+            if (prologue != nullptr) {
+                args.q   = prologue->q_raw;
+                args.k   = prologue->k_raw;
+                args.sq1 = prologue->sq1;
+                args.sq2 = prologue->sq2;
+                args.sk1 = prologue->sk1;
+                args.sk2 = prologue->sk2;
+                args.l2norm  = true;
+                args.eps_q   = prologue->eps_q;
+                args.scale_q = prologue->scale_q;
+                args.eps_k   = prologue->eps_k;
+                args.scale_k = prologue->scale_k;
+            } else {
+                args.q   = q_d;
+                args.k   = k_d;
+                args.sq1 = sq1;
+                args.sq2 = sq2;
+                args.sk1 = sq1;
+                args.sk2 = sq2;
+                args.l2norm = false;
+            }
+            args.v        = v_d;
+            args.sv1      = sv1;
+            args.sv2      = sv2;
+            args.g        = g_d;
+            args.beta     = b_d;
+            args.s0       = s_d;
+            args.n_tokens = n_c;
+            args.dst      = dst_d;
+            args.h_out    = h_mid.get();
+            ggml_cuda_gdn_chunk_sm70(ctx, args);
+
+            q_rec  = q_d + n_c * sq2;
+            k_rec  = k_d + n_c * sq2;
+            v_rec  = v_d + n_c * sv2;
+            g_rec  = g_d + n_c * sb2;
+            b_rec  = b_d + n_c * sb2;
+            s_rec  = h_mid.get();
+            dst_rec += n_c * H * S_v;
+            n_rec   = n_tokens - n_c;
+            if (prologue != nullptr) {
+                pro_rec      = *prologue;
+                pro_rec.q_raw += n_c * prologue->sq2;
+                pro_rec.k_raw += n_c * prologue->sk2;
+                pro_rec_p = &pro_rec;
+            }
+        }
+    }
+
     if (kda) {
         if (keep_rs) {
-            launch_gated_delta_net<true, true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+            launch_gated_delta_net<true, true, false>(q_rec, k_rec, v_rec, g_rec, b_rec, s_rec, dst_rec, state_d,
+                S_v, H, n_rec, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, {}, stream);
         } else {
-            launch_gated_delta_net<true, false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+            launch_gated_delta_net<true, false, false>(q_rec, k_rec, v_rec, g_rec, b_rec, s_rec, dst_rec, state_d,
+                S_v, H, n_rec, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, {}, stream);
         }
     } else if (prologue != nullptr) {
         if (keep_rs) {
-            launch_gated_delta_net<false, true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, *prologue, stream);
+            launch_gated_delta_net<false, true, true>(q_rec, k_rec, v_rec, g_rec, b_rec, s_rec, dst_rec, state_d,
+                S_v, H, n_rec, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, *pro_rec_p, stream);
         } else {
-            launch_gated_delta_net<false, false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, *prologue, stream);
+            launch_gated_delta_net<false, false, true>(q_rec, k_rec, v_rec, g_rec, b_rec, s_rec, dst_rec, state_d,
+                S_v, H, n_rec, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, *pro_rec_p, stream);
         }
     } else {
         if (keep_rs) {
-            launch_gated_delta_net<false, true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+            launch_gated_delta_net<false, true, false>(q_rec, k_rec, v_rec, g_rec, b_rec, s_rec, dst_rec, state_d,
+                S_v, H, n_rec, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, {}, stream);
         } else {
-            launch_gated_delta_net<false, false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+            launch_gated_delta_net<false, false, false>(q_rec, k_rec, v_rec, g_rec, b_rec, s_rec, dst_rec, state_d,
+                S_v, H, n_rec, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, {}, stream);
         }
     }
