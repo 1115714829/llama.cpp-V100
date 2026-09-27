@@ -1393,6 +1393,26 @@ static bool ggml_backend_cuda_comm_allreduce_rank_can(
 #endif // GGML_USE_NCCL
 }
 
+// the push route is a plain kernel on the rank's stream that keeps its state on the device, so it
+// can be recorded into a CUDA graph and replayed; the NCCL route is not recorded
+static bool ggml_backend_cuda_comm_allreduce_rank_capturable(
+        void * comm_ctx_v, struct ggml_tensor ** tensors, bool exact) {
+    if (comm_ctx_v == nullptr) {
+        return false;
+    }
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    for (size_t i = 0; i < comm_ctx->backends.size(); ++i) {
+        if (tensors[i] == nullptr) {
+            return false;
+        }
+        if (ggml_nelements(tensors[i]) != 0 &&
+            (comm_ctx->ar_push == nullptr || !ggml_cuda_ar_push_can(comm_ctx->ar_push, tensors[i], exact))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool ggml_backend_cuda_comm_allreduce_rank(
         void * comm_ctx_v, size_t rank, struct ggml_tensor * tensor, bool exact) {
     GGML_ASSERT(comm_ctx_v != nullptr);
@@ -5427,8 +5447,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
 
 #ifdef USE_CUDA_GRAPH
-        ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (use_cuda_graph && cuda_graph_update_required) { // End CUDA graph capture
+            ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
             if (graph->graph != nullptr) {
                 CUDA_CHECK(cudaGraphDestroy(graph->graph));
                 graph->graph = nullptr;
@@ -5487,6 +5507,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_q8_skinny_prepass(*cuda_ctx, cgraph);
 
+    if (cuda_ctx->capture_external) {
+        // the outer capture records the kernels, see ggml_backend_cuda_capture_begin()
+        ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, false, false, nullptr);
+        return GGML_STATUS_SUCCESS;
+    }
+
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
@@ -5539,6 +5565,76 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
 
     return GGML_STATUS_SUCCESS;
+}
+
+// Whole-graph capture for the meta backend: every subgraph and all-reduce one rank enqueues for a
+// graph is recorded into one CUDA graph, which later runs with a single launch instead of one launch
+// and one property check per subgraph. While the capture is active graph_compute evaluates the
+// graphs directly, so their kernels land in the outer capture.
+static bool ggml_backend_cuda_capture_begin(ggml_backend_t backend) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    GGML_ASSERT(!cuda_ctx->capture_external);
+
+    ggml_cuda_set_device(cuda_ctx->device);
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+        ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed) != cudaSuccess) {
+        (void) cudaGetLastError();
+        std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+        if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
+            ggml_cuda_lock_cv.notify_all();
+        }
+        return false;
+    }
+    cuda_ctx->capture_external = true;
+    return true;
+}
+
+static void * ggml_backend_cuda_capture_end(ggml_backend_t backend) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    GGML_ASSERT(cuda_ctx->capture_external);
+
+    ggml_cuda_set_device(cuda_ctx->device);
+    cuda_ctx->capture_external = false;
+
+    cudaGraph_t graph = nullptr;
+    cudaError_t err = cudaStreamEndCapture(cuda_ctx->stream(), &graph);
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+        if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
+            ggml_cuda_lock_cv.notify_all();
+        }
+    }
+
+    cudaGraphExec_t exec = nullptr;
+    if (err == cudaSuccess && graph != nullptr) {
+        err = cudaGraphInstantiate(&exec, graph, NULL, NULL, 0);
+    }
+    if (graph != nullptr) {
+        CUDA_CHECK(cudaGraphDestroy(graph));
+    }
+    if (err != cudaSuccess) {
+        GGML_LOG_WARN("%s: capture failed on device %d: %s\n", __func__, cuda_ctx->device, cudaGetErrorString(err));
+        (void) cudaGetLastError();
+        return nullptr;
+    }
+    return exec;
+}
+
+static bool ggml_backend_cuda_capture_launch(ggml_backend_t backend, void * exec) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    ggml_cuda_set_device(cuda_ctx->device);
+    CUDA_CHECK(cudaGraphLaunch((cudaGraphExec_t) exec, cuda_ctx->stream()));
+    return true;
+}
+
+static void ggml_backend_cuda_capture_free(void * exec) {
+    if (exec != nullptr) {
+        CUDA_CHECK(cudaGraphExecDestroy((cudaGraphExec_t) exec));
+    }
 }
 
 static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
@@ -6828,6 +6924,21 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_rank") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_rank;
+    }
+    if (strcmp(name, "ggml_backend_comm_allreduce_rank_capturable") == 0) {
+        return (void *)ggml_backend_cuda_comm_allreduce_rank_capturable;
+    }
+    if (strcmp(name, "ggml_backend_capture_begin") == 0) {
+        return (void *)ggml_backend_cuda_capture_begin;
+    }
+    if (strcmp(name, "ggml_backend_capture_end") == 0) {
+        return (void *)ggml_backend_cuda_capture_end;
+    }
+    if (strcmp(name, "ggml_backend_capture_launch") == 0) {
+        return (void *)ggml_backend_cuda_capture_launch;
+    }
+    if (strcmp(name, "ggml_backend_capture_free") == 0) {
+        return (void *)ggml_backend_cuda_capture_free;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;
