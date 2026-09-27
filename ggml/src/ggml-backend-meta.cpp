@@ -479,11 +479,18 @@ struct ggml_backend_meta_simple_tensor_container {
 
 // Number of plan slots. Decode plans stay alive while prefill/checkpoint shapes rotate through the
 // remaining slots.
-static constexpr int GGML_META_N_PLANS = 4;
+static constexpr int GGML_META_N_PLANS = 6;
 
 // Number of rotating "compute" containers: one per plan plus two that are being filled by the
 // next graph allocations, so that a rebuild never evicts the views of all plans at once.
 static constexpr int GGML_META_N_STC = GGML_META_N_PLANS + 2;
+
+// One speculative round uses a plan for the target verification, the injection and the draft block, so
+// plans and containers used by the last 3 computations are in flight and must not be evicted.
+static constexpr uint64_t GGML_META_RECENT_TICKS = 3;
+
+// use order for plan.last_use and stc_last_use, shared by all meta backend instances
+static std::atomic<uint64_t> ggml_backend_meta_tick{0};
 
 // UIDs of the plans that hold captured CUDA graphs (any meta backend instance): their containers are
 // recycled last, so that the decode plans survive the prefill graphs of the next request
@@ -2500,7 +2507,6 @@ struct ggml_backend_meta_context {
     // retired temporary buffers: captured plans may still reference them, so they are kept until the context is destroyed
     std::vector<ggml_backend_buffer_ptr> tmp_bufs_retired;
     ggml_backend_meta_plan            plans[GGML_META_N_PLANS];
-    uint64_t                          plan_tick = 0; // see plan.last_use and stc_last_use
     ggml_context_ptr                  ctx;
     std::vector<ggml_cgraph *>  cgraphs_aux;
     std::vector<ggml_tensor *>  nodes_aux;
@@ -2849,11 +2855,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
             }
             if (valid) {
-                plan.last_use = ++backend_ctx->plan_tick;
+                const uint64_t tick = ++ggml_backend_meta_tick;
+                plan.last_use = tick;
                 for (const auto & slot : plan.slots) {
                     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) slot.first->context;
                     buf_ctx->stc_compute_index = slot.second;
-                    buf_ctx->stc_last_use[slot.second] = plan.last_use;
+                    buf_ctx->stc_last_use[slot.second] = tick;
                 }
                 p = &plan;
             }
@@ -2878,8 +2885,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     }
 
     if (needs_rebuild) {
-        // Pick the slot to rebuild in: the stale plan of this same graph if there is one, an empty
-        // slot, then the least recently used plan that has no captured CUDA graph, then any plan.
+        // Pick the slot to rebuild in: the stale plan of this same graph if there is one, an empty slot,
+        // then the least recently used plan that is not in flight and has no captured CUDA graph, then
+        // the least recently used plan that is not in flight, then any plan.
+        const uint64_t now = ggml_backend_meta_tick.load();
         int k = -1;
         for (int i = 0; i < GGML_META_N_PLANS; i++) {
             if (backend_ctx->plans[i].uid == cgraph->uid) {
@@ -2897,7 +2906,20 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
         if (k < 0) {
             for (int i = 0; i < GGML_META_N_PLANS; i++) {
+                if (now - backend_ctx->plans[i].last_use <= GGML_META_RECENT_TICKS) {
+                    continue;
+                }
                 if (backend_ctx->plans[i].full_state == 1) {
+                    continue;
+                }
+                if (k < 0 || backend_ctx->plans[i].last_use < backend_ctx->plans[k].last_use) {
+                    k = i;
+                }
+            }
+        }
+        if (k < 0) {
+            for (int i = 0; i < GGML_META_N_PLANS; i++) {
+                if (now - backend_ctx->plans[i].last_use <= GGML_META_RECENT_TICKS) {
                     continue;
                 }
                 if (k < 0 || backend_ctx->plans[i].last_use < backend_ctx->plans[k].last_use) {
@@ -2937,8 +2959,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             buf_ctx->stc_owner_uid[s]       = cgraph->uid;
             plan.slots.emplace_back(buf, s);
 
-            // Prepare the container for the next graph allocation: prefer a free container, then
-            // the least recently used one that holds no captured plan.
+            // Prepare the container for the next graph allocation: prefer a free container, then the
+            // least recently used one that is not in flight and holds no captured plan, then the least
+            // recently used one that is not in flight, then any.
             int n = -1;
             for (int i = 0; i < GGML_META_N_STC; i++) {
                 if (i != s && buf_ctx->stc_owner_uid[i] == 0) {
@@ -2949,6 +2972,22 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             if (n < 0) {
                 for (int i = 0; i < GGML_META_N_STC; i++) {
                     if (i == s || ggml_backend_meta_hot_has(buf_ctx->stc_owner_uid[i])) {
+                        continue;
+                    }
+                    if (now - buf_ctx->stc_last_use[i] <= GGML_META_RECENT_TICKS) {
+                        continue;
+                    }
+                    if (n < 0 || buf_ctx->stc_last_use[i] < buf_ctx->stc_last_use[n]) {
+                        n = i;
+                    }
+                }
+            }
+            if (n < 0) {
+                for (int i = 0; i < GGML_META_N_STC; i++) {
+                    if (i == s) {
+                        continue;
+                    }
+                    if (now - buf_ctx->stc_last_use[i] <= GGML_META_RECENT_TICKS) {
                         continue;
                     }
                     if (n < 0 || buf_ctx->stc_last_use[i] < buf_ctx->stc_last_use[n]) {
@@ -3406,10 +3445,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
-        plan.last_use = ++backend_ctx->plan_tick;
+        const uint64_t tick = ++ggml_backend_meta_tick;
+        plan.last_use = tick;
         for (const auto & slot : plan.slots) {
             ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) slot.first->context;
-            buf_ctx->stc_last_use[slot.second] = plan.last_use;
+            buf_ctx->stc_last_use[slot.second] = tick;
         }
         p = &plan;
     }
