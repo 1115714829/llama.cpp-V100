@@ -11808,6 +11808,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // the same grouped shapes with a range mask that stops at half of the KV view: the split must
+    // follow the range, not the view width
+    for (int nh : { 1, 4 }) {
+        for (int kv : { 1025, 4096 }) {
+            for (int nb : { 2, 8, 16 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0, false, 3));
+            }
+        }
+    }
+
     // generic fallback shapes with range masks
     for (const std::array<int64_t, 2> & nr23 : { std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{4, 1} }) {
         for (int kv : { 512, 1024 }) {
@@ -12462,6 +12472,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, kv, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, true,  0));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, kv, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, false, 1));
     }
+    // a verify batch (grouped kernel) that views a 256K cache but attends only its first half
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 262144, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, false, 3));
 
     // a prompt ubatch that views a 256K cache but only attends its first half with a
     // range mask: the q8_0 mirror must scale with the range, not with the view width
