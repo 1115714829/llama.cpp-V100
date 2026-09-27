@@ -2843,6 +2843,10 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     // and only models that feed the mask to ggml_flash_attn_ext alone opt in (range_mask)
     const bool allow_range = range_mask && cparams.flash_attn && cparams.causal_attn && hparams.f_max_alibi_bias == 0.0f;
 
+    // a KV cache with range masks enabled attends the whole cache for prompt ubatches: a dense mask of
+    // that width would be huge, so the graph must take the range mask
+    GGML_ASSERT(!mctx_cur->get_kq_range() || allow_range);
+
     auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur);
 
     {
@@ -2861,10 +2865,10 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     return inp;
 }
 
-llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
+llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv(bool range_mask) const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
-    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur, false);
+    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur, range_mask);
 
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }

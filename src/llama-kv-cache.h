@@ -186,7 +186,12 @@ public:
     // graph_build API
     //
 
-    uint32_t get_n_kv(const slot_info & sinfo) const;
+    // full: ignore the used cells and return the cache size, so that all prompt
+    // ubatches with range masks share the same n_kv
+    uint32_t get_n_kv(const slot_info & sinfo, bool full = false) const;
+
+    // allow I32 [lo, hi) range masks for eligible ubatches (see get_kq_range_ok)
+    void set_kq_range_allowed(bool allowed) override;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -303,6 +308,9 @@ private:
 
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
+
+    // range masks are enabled before each decode from the current context parameters
+    bool kq_range_enabled = false;
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;

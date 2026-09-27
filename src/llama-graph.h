@@ -1243,7 +1243,8 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
-    llm_graph_input_attn_kv * build_attn_inp_kv() const;
+    // range_mask: see build_inp_mem_hybrid
+    llm_graph_input_attn_kv * build_attn_inp_kv(bool range_mask = false) const;
 
     ggml_tensor * build_attn(
             llm_graph_input_attn_kv * inp,

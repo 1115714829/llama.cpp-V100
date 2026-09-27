@@ -217,7 +217,9 @@ static void init_tensor_kq_mask_causal(ggml_tensor * tensor) {
 }
 
 // generate an I32 range mask: the row for query i1 holds [lo, hi), the visible KV columns
-static void init_tensor_kq_range(ggml_tensor * tensor, int64_t n_kv, bool causal) {
+// mode: 1 = causal, 2 = random, 3 = causal over the first half of the KV positions (a range
+// that ends well before the KV view the kernel is given)
+static void init_tensor_kq_range(ggml_tensor * tensor, int64_t n_kv, int mode) {
     GGML_ASSERT(tensor->type == GGML_TYPE_I32);
     GGML_ASSERT(tensor->ne[0] == 2);
 
@@ -235,10 +237,14 @@ static void init_tensor_kq_range(ggml_tensor * tensor, int64_t n_kv, bool causal
             for (int64_t i1 = 0; i1 < ne1; i1++) {
                 int64_t lo;
                 int64_t hi;
-                if (causal) {
+                if (mode == 1) {
                     lo = 0;
                     hi = n_kv - ne1 + i1 + 1;
                     hi = std::max<int64_t>(1, std::min<int64_t>(hi, n_kv));
+                } else if (mode == 3) {
+                    lo = 0;
+                    hi = n_kv/2 - ne1 + i1 + 1;
+                    hi = std::max<int64_t>(1, std::min<int64_t>(hi, n_kv/2));
                 } else {
                     lo = std::uniform_int_distribution<int64_t>(0, n_kv - 1)(gen);
                     hi = std::uniform_int_distribution<int64_t>(lo + 1, n_kv)(gen);
@@ -8640,7 +8646,7 @@ struct test_flash_attn_ext : public test_case {
                 init_tensor_uniform(t, -10.0f, 10.0f);
             } else if (strcmp(t->name, "m") == 0) {
                 if (range != 0) {
-                    init_tensor_kq_range(t, kv, range == 1);
+                    init_tensor_kq_range(t, kv, range);
                 } else if (causal) {
                     init_tensor_kq_mask_causal(t);
                 } else if (n_kv_max > 0) {
@@ -11780,6 +11786,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0, false, 2));
     }
 
+    // range masks that stop at half of the KV view (the split-d conversion must
+    // follow the bounds, not the view width)
+    for (int kv : { 4096, 32768 }) {
+        for (int nb : { 2048, 100 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, false, 3));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 4096, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, true, false, 0, false, 3));
+
     // grouped decode / verify shapes with range masks
     for (int nh : { 1, 4 }) {
         for (int kv : { 113, 1025, 4096 }) {
@@ -12447,6 +12462,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, kv, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, true,  0));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, kv, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, false, 1));
     }
+
+    // a prompt ubatch that views a 256K cache but only attends its first half with a
+    // range mask: the q8_0 mirror must scale with the range, not with the view width
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 262144, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, false, 3));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 131072, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, false, 1));
 
     for (int kv : { 4096, 8192, 16384,32768, 65536, }) {
         for (int hs : { 64, 128, 256, 576, }) {

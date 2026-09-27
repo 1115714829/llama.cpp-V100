@@ -1310,7 +1310,7 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     return v_cells[seq_to_stream[seq_id]];
 }
 
-uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
+uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, bool full) const {
     uint32_t result = 0;
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
@@ -1318,8 +1318,15 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     // a new n_kv rebuilds the graph and, with tensor parallelism, re-records its CUDA graphs (about 0.1 s), so the grain
     // is large: 2048 cells, doubling with the used context beyond 64K so that the boundaries stay rare in long generations
     // note: the extra cells are empty and masked, but FA still reads them - the waste is below the grain (1/32 of the used length at 128K)
+    // full: range-mask prompt ubatches always view the whole cache so that they share one n_kv and one graph
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
+
+        if (full) {
+            result = std::max(cells.size(), result);
+
+            continue;
+        }
 
         const uint32_t n_used = cells.used_max_p1();
 
@@ -1332,6 +1339,10 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     }
 
     return result;
+}
+
+void llama_kv_cache::set_kq_range_allowed(bool allowed) {
+    kq_range_enabled = allowed;
 }
 
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
@@ -1876,6 +1887,10 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
 }
 
 bool llama_kv_cache::get_kq_range_ok(const slot_info & sinfo, const llama_ubatch & ubatch) const {
+    if (!kq_range_enabled) {
+        return false;
+    }
+
     if (swa_type != LLAMA_SWA_TYPE_NONE) {
         return false;
     }
@@ -2968,8 +2983,10 @@ bool llama_kv_cache_context::apply() {
     }
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
-    n_kv = kv->get_n_kv(sinfos[i_cur]);
     kq_range = kv->get_kq_range_ok(sinfos[i_cur], ubatches[i_cur]);
+    // a prompt ubatch with a range mask attends the whole cache: the range bounds the work, and every
+    // prompt ubatch then shares one graph (no rebuild per ubatch or per request)
+    n_kv = kv->get_n_kv(sinfos[i_cur], kq_range && sinfos[i_cur].size() > 256);
 
     return true;
 }

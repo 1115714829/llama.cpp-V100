@@ -100,6 +100,10 @@ struct llama_memory_i {
     // getters
     virtual bool get_can_shift() const = 0;
 
+    // whether the attention KV caches may use I32 [lo, hi) range masks for the next ubatches
+    // (follows the current context parameters, see llama_context::decode)
+    virtual void set_kq_range_allowed(bool allowed) { GGML_UNUSED(allowed); }
+
     //
     // ops
     //

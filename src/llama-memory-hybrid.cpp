@@ -135,6 +135,10 @@ bool llama_memory_hybrid::get_can_shift() const {
     return mem_attn->get_can_shift();
 }
 
+void llama_memory_hybrid::set_kq_range_allowed(bool allowed) {
+    mem_attn->set_kq_range_allowed(allowed);
+}
+
 void llama_memory_hybrid::clear(bool data) {
     mem_attn->clear(data);
     mem_recr->clear(data);
