@@ -2051,10 +2051,20 @@ struct ggml_backend_meta_plan {
     // Meta buffers used by the graph, with the simple tensor container slot holding its views.
     std::vector<std::pair<ggml_backend_buffer_t, int>> slots;
 
+    // Whole-graph capture of every rank's launch sequence (see ggml_backend_meta_launchers), in segments
+    // of consecutive subgraphs: 0 = not captured yet, 1 = captured, -1 = the capture failed.
+    int                              full_state = 0;
+    std::vector<size_t>              full_seg;  // first subgraph of every segment, then n_subgraphs
+    std::vector<std::vector<void *>> full_exec; // per backend, one executable per segment
+
+    // the executables must have been freed (ggml_backend_meta_context::plan_clear)
     void clear() {
+        GGML_ASSERT(full_exec.empty());
         uid         = 0;
         n_subgraphs = 0;
         n_runs      = 0;
+        full_state  = 0;
+        full_seg.clear();
         collects.clear();
         ctx_collect.clear();
         buf_collect.clear();
@@ -2068,11 +2078,26 @@ struct ggml_backend_meta_plan {
 // push AllReduce synchronizes on the GPU, so ranks may be driven independently as
 // long as each submits the same collective sequence. The main thread waits for the
 // enqueues before returning because the caller may use the same streams right after.
+//
+// Once a plan is warm, one run records every rank's launch sequence (subgraphs and all-reduces) into
+// executables (ggml_backend_capture_*_t) that later runs replay, one launch per segment of about
+// GGML_META_CAPTURE_SEGMENT_NODES nodes: launching a CUDA graph takes time proportional to its nodes,
+// so the first segments already run while the later ones are being launched. Nothing runs during the
+// capture, and every rank instantiates its executables before any rank launches, for the same reason
+// as the barrier after each collective.
+static constexpr int GGML_META_CAPTURE_SEGMENT_NODES = 256;
+
 struct ggml_backend_meta_launchers {
     std::vector<ggml_backend_t> backends;
     void *                                  comm_ctx           = nullptr;
     ggml_backend_comm_allreduce_rank_can_t  allreduce_rank_can = nullptr;
     ggml_backend_comm_allreduce_rank_t      allreduce_rank     = nullptr;
+
+    // optional whole-graph capture, all set or all nullptr
+    ggml_backend_capture_begin_t  capture_begin  = nullptr;
+    ggml_backend_capture_end_t    capture_end    = nullptr;
+    ggml_backend_capture_launch_t capture_launch = nullptr;
+    ggml_backend_capture_free_t   capture_free   = nullptr;
 
     std::vector<std::thread> threads;
 
@@ -2086,6 +2111,10 @@ struct ggml_backend_meta_launchers {
 
     // Written by the main thread before `job` is bumped, read by the workers.
     ggml_backend_meta_plan * plan = nullptr;
+    bool capture_run = false; // record the plan into plan->full_exec during this run
+
+    // per rank result of the capture, exchanged through barrier()
+    std::vector<char> capture_ok;
 
     // After enqueueing its part of a collective a worker waits until every rank has enqueued its
     // part. Otherwise a worker blocked in the driver (a lock holder that waits for its GPU, e.g.
@@ -2103,6 +2132,7 @@ struct ggml_backend_meta_launchers {
             ggml_backend_comm_allreduce_rank_t allreduce_rank) :
         backends(std::move(backends)), comm_ctx(comm_ctx),
         allreduce_rank_can(allreduce_rank_can), allreduce_rank(allreduce_rank),
+        capture_ok(this->backends.size(), 0),
         statuses(this->backends.size(), GGML_STATUS_SUCCESS) {
         threads.reserve(this->backends.size());
         for (size_t j = 0; j < this->backends.size(); j++) {
@@ -2176,13 +2206,78 @@ struct ggml_backend_meta_launchers {
         return true;
     }
 
-    // Rank j's launch sequence, the same work the single-threaded path does for rank j.
+    // Rank j's part of a run: replay the captured executables, record them, or launch the sequence.
     ggml_status launch_rank(size_t j) {
+        ggml_backend_meta_plan * p = plan;
+        ggml_backend_t backend = backends[j];
+
+        if (p->full_state == 1) {
+            for (void * exec : p->full_exec[j]) {
+                if (!capture_launch(backend, exec)) {
+                    return GGML_STATUS_FAILED;
+                }
+            }
+            return GGML_STATUS_SUCCESS;
+        }
+        if (!capture_run) {
+            return launch_sequence(j, 0, p->n_subgraphs);
+        }
+
+        // Record the segments. A stream capture only fails to begin on a broken stream; a rank that runs
+        // its sequence while the others record would spin in the all-reduces, so this is fatal.
+        std::vector<void *> execs;
+        bool        ok     = true;
+        ggml_status status = GGML_STATUS_SUCCESS;
+        for (size_t s = 0; s + 1 < p->full_seg.size() && status == GGML_STATUS_SUCCESS; s++) {
+            if (!capture_begin(backend)) {
+                GGML_ABORT("%s: failed to begin the capture on backend %zu", __func__, j);
+            }
+            status = launch_sequence(j, p->full_seg[s], p->full_seg[s + 1]);
+            execs.push_back(capture_end(backend));
+            ok = ok && execs.back() != nullptr;
+        }
+        auto free_execs = [&]() {
+            for (void * exec : execs) {
+                capture_free(exec);
+            }
+        };
+        if (status != GGML_STATUS_SUCCESS) {
+            free_execs();
+            return status;
+        }
+
+        // nothing was executed so far: launch the executables once all ranks have instantiated theirs,
+        // or run the sequence without capture if any rank failed
+        capture_ok[j] = ok;
+        if (!barrier()) {
+            free_execs();
+            return GGML_STATUS_FAILED;
+        }
+        bool all_ok = true;
+        for (char rank_ok : capture_ok) {
+            all_ok = all_ok && rank_ok;
+        }
+        if (!all_ok) {
+            free_execs();
+            return launch_sequence(j, 0, p->n_subgraphs);
+        }
+        p->full_exec[j] = execs;
+        for (void * exec : execs) {
+            if (!capture_launch(backend, exec)) {
+                return GGML_STATUS_FAILED;
+            }
+        }
+        return GGML_STATUS_SUCCESS;
+    }
+
+    // Rank j's launch sequence for the subgraphs [i0, i1) and their collectives, the same work the
+    // single-threaded path does for rank j.
+    ggml_status launch_sequence(size_t j, size_t i0, size_t i1) {
         const ggml_backend_meta_plan * p = plan;
         const size_t n_backends = backends.size();
         ggml_backend_t backend = backends[j];
 
-        for (size_t i = 0; i < p->n_subgraphs; i++) {
+        for (size_t i = i0; i < i1; i++) {
             if (p->cgraphs[j][i].cgraph_main->n_nodes > 0) {
                 const ggml_status status = ggml_backend_graph_compute_async(backend, p->cgraphs[j][i].cgraph_main);
                 if (status != GGML_STATUS_SUCCESS) {
@@ -2222,8 +2317,30 @@ struct ggml_backend_meta_launchers {
         return allreduce_rank_can(comm_ctx, tensors, exact);
     }
 
-    ggml_status compute(ggml_backend_meta_plan * p) {
-        plan = p;
+    bool can_capture() const {
+        return capture_begin != nullptr && capture_end != nullptr && capture_launch != nullptr && capture_free != nullptr;
+    }
+
+    // capture: record this run into p->full_exec, see ggml_backend_meta_launchers
+    ggml_status compute(ggml_backend_meta_plan * p, bool capture) {
+        plan        = p;
+        capture_run = capture;
+        if (capture) {
+            GGML_ASSERT(p->full_state == 0 && p->full_exec.empty());
+            p->full_exec.assign(backends.size(), {});
+
+            // segment boundaries after a subgraph, i.e. after its collective, the same for all ranks
+            p->full_seg.assign(1, 0);
+            int n_nodes = 0;
+            for (size_t i = 0; i + 1 < p->n_subgraphs; i++) {
+                n_nodes += p->cgraphs[0][i].cgraph_main->n_nodes;
+                if (n_nodes >= GGML_META_CAPTURE_SEGMENT_NODES) {
+                    p->full_seg.push_back(i + 1);
+                    n_nodes = 0;
+                }
+            }
+            p->full_seg.push_back(p->n_subgraphs);
+        }
         for (ggml_status & s : statuses) {
             s = GGML_STATUS_SUCCESS;
         }
@@ -2243,6 +2360,23 @@ struct ggml_backend_meta_launchers {
             if ((++i_spin & 63) == 0) {
                 std::this_thread::yield();
             }
+        }
+
+        if (capture) {
+            bool all_captured = true;
+            for (const auto & execs : p->full_exec) {
+                all_captured = all_captured && !execs.empty();
+            }
+            if (!all_captured) {
+                // a rank that failed later than the others may leave executables behind
+                for (const auto & execs : p->full_exec) {
+                    for (void * exec : execs) {
+                        capture_free(exec);
+                    }
+                }
+                p->full_exec.clear();
+            }
+            p->full_state = all_captured ? 1 : -1;
         }
 
         for (size_t j = 0; j < backends.size(); j++) {
@@ -2280,6 +2414,25 @@ struct ggml_backend_meta_context {
     ggml_backend_comm_allreduce_tensor_t comm_allreduce_exact = nullptr;
 
     std::unique_ptr<ggml_backend_meta_launchers> launchers;
+
+    // optional, see ggml_backend_meta_launchers
+    ggml_backend_comm_allreduce_rank_capturable_t comm_allreduce_rank_capturable = nullptr;
+
+    // Invalidate a plan. Its executables may still run, so the ranks are synchronized before they are freed.
+    void plan_clear(ggml_backend_meta_plan & plan) {
+        if (!plan.full_exec.empty()) {
+            for (auto & bc : backend_configs) {
+                ggml_backend_synchronize(bc.backend);
+            }
+            for (const auto & execs : plan.full_exec) {
+                for (void * exec : execs) {
+                    launchers->capture_free(exec);
+                }
+            }
+            plan.full_exec.clear();
+        }
+        plan.clear();
+    }
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
@@ -2329,11 +2482,25 @@ struct ggml_backend_meta_context {
             if (n_devs > 1 && comm_allreduce_rank_can != nullptr && comm_allreduce_rank != nullptr) {
                 launchers = std::make_unique<ggml_backend_meta_launchers>(
                     simple_backends, comm_ctx, comm_allreduce_rank_can, comm_allreduce_rank);
+
+                // Optional: whole-graph capture of the launch sequences.
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0]));
+                comm_allreduce_rank_capturable = (ggml_backend_comm_allreduce_rank_capturable_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allreduce_rank_capturable");
+                launchers->capture_begin  = (ggml_backend_capture_begin_t)  ggml_backend_reg_get_proc_address(reg, "ggml_backend_capture_begin");
+                launchers->capture_end    = (ggml_backend_capture_end_t)    ggml_backend_reg_get_proc_address(reg, "ggml_backend_capture_end");
+                launchers->capture_launch = (ggml_backend_capture_launch_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_capture_launch");
+                launchers->capture_free   = (ggml_backend_capture_free_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_capture_free");
             }
         }
     }
 
     ~ggml_backend_meta_context() {
+        for (auto & plan : plans) {
+            if (!plan.full_exec.empty()) {
+                plan_clear(plan);
+            }
+        }
         // Stop the launcher threads before the comm context they use is freed.
         launchers.reset();
         if (comm_ctx != nullptr) {
@@ -2509,7 +2676,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     if (needs_rebuild) {
         const int k = backend_ctx->i_plan_newest ^ 1;
         ggml_backend_meta_plan & plan = backend_ctx->plans[k];
-        plan.clear();
+        backend_ctx->plan_clear(plan);
 
         std::set<ggml_backend_buffer_t> used_buffers;
         for (int i = 0; i < cgraph->n_leafs; i++) {
@@ -2536,7 +2703,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             if (buf_ctx->stc_owner_uid[n] != 0) {
                 for (int kk = 0; kk < 2; kk++) {
                     if (backend_ctx->plans[kk].uid == buf_ctx->stc_owner_uid[n]) {
-                        backend_ctx->plans[kk].clear();
+                        backend_ctx->plan_clear(backend_ctx->plans[kk]);
                     }
                 }
             }
@@ -3141,9 +3308,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // change between calls. The first runs of a plan stay on this thread: they capture and
     // instantiate the CUDA graphs, load kernels and grow the memory pools, i.e. driver calls
     // that can wait for the GPU while holding driver locks (see ggml_backend_meta_launchers).
-    if (backend_ctx->launchers != nullptr && p->n_runs >= 2) {
-        bool can_launch = true;
-        for (size_t i = 0; i < p->n_subgraphs && can_launch; i++) {
+    //
+    // After its first run (kernels loaded, pool memory grown) a plan is recorded into one executable per
+    // rank if every collective can be recorded, i.e. none takes NCCL. The recording skips the CUDA graphs
+    // of the individual subgraphs, and nothing runs until every rank has instantiated its executable.
+    const bool try_capture = backend_ctx->launchers != nullptr && p->full_state == 0 && p->n_runs >= 1 &&
+                             backend_ctx->launchers->can_capture() && backend_ctx->comm_allreduce_rank_capturable != nullptr;
+    if (backend_ctx->launchers != nullptr && (p->n_runs >= 2 || try_capture)) {
+        bool can_launch  = true;
+        bool can_capture = try_capture;
+        for (size_t i = 0; i < p->n_subgraphs && can_launch && p->full_state != 1; i++) {
             const ggml_backend_meta_collect & collect = p->collects[i];
             const bool do_reduce = collect.kind != GGML_BACKEND_META_COLLECT_ALLREDUCE
                 ? n_backends > 1
@@ -3152,10 +3326,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 continue;
             }
             const bool exact = collect.kind != GGML_BACKEND_META_COLLECT_ALLREDUCE;
-            can_launch = backend_ctx->launchers->can(p->collects[i].reduce.data(), exact);
+            can_launch  = backend_ctx->launchers->can(p->collects[i].reduce.data(), exact);
+            can_capture = can_capture && can_launch &&
+                backend_ctx->comm_allreduce_rank_capturable(backend_ctx->comm_ctx, p->collects[i].reduce.data(), exact);
         }
-        if (can_launch) {
-            const ggml_status status = backend_ctx->launchers->compute(p);
+        if (can_launch && (p->n_runs >= 2 || can_capture)) {
+            const ggml_status status = backend_ctx->launchers->compute(p, can_capture);
             if (status == GGML_STATUS_SUCCESS) {
                 p->n_runs++;
             }

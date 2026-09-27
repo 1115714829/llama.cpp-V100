@@ -1459,6 +1459,10 @@ struct ggml_backend_cuda_context {
     // see ggml_cuda_q8_skinny_prepass()
     int q8_skinny_idle_scans = 0;
 
+    // an outer capture records everything enqueued on the main stream, graphs are evaluated directly
+    // see ggml_backend_cuda_capture_begin()
+    bool capture_external = false;
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)

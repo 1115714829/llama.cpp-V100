@@ -217,6 +217,17 @@ extern "C" {
     typedef bool   (*ggml_backend_comm_allreduce_rank_can_t)(void * comm_ctx, struct ggml_tensor ** tensors, bool exact);
     typedef bool   (*ggml_backend_comm_allreduce_rank_t)    (void * comm_ctx, size_t rank, struct ggml_tensor * tensor, bool exact);
 
+    // Whole-graph capture of everything a backend enqueues between begin and end, e.g. all subgraphs and
+    // per-rank all-reduces of one rank of the meta backend, so that they can be replayed with a single
+    // launch. `end` returns an opaque executable, NULL if the capture failed, in which case nothing of the
+    // captured work was executed. `allreduce_rank_capturable` reports whether the per-rank calls of this
+    // collective can be recorded into such a capture (same arguments as `can`).
+    typedef bool   (*ggml_backend_capture_begin_t) (ggml_backend_t backend);
+    typedef void * (*ggml_backend_capture_end_t)   (ggml_backend_t backend);
+    typedef bool   (*ggml_backend_capture_launch_t)(ggml_backend_t backend, void * exec);
+    typedef void   (*ggml_backend_capture_free_t)  (void * exec);
+    typedef bool   (*ggml_backend_comm_allreduce_rank_capturable_t)(void * comm_ctx, struct ggml_tensor ** tensors, bool exact);
+
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
     // Set the number of threads for the backend
