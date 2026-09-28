@@ -11,8 +11,8 @@
 #include <algorithm>
 #include <vector>
 
-// sentinel object whose address tags a repacked tensor
-static const char q8_skinny_marker = 0;
+// sentinel object whose address tags a repacked tensor (not const: it is stored in tensor->extra)
+static char q8_skinny_marker = 0;
 
 static int q8_skinny_split_k(const int64_t k) {
     if (k <= 0) {
@@ -957,7 +957,7 @@ void ggml_cuda_q8_skinny_repack_inplace(ggml_backend_cuda_context & ctx, ggml_te
     CUDA_CHECK(cudaFree(staging));
     CUDA_CHECK(cudaFree(scales_tmp));
 
-    t->extra = (void *) &q8_skinny_marker;
+    t->extra = &q8_skinny_marker;
 }
 
 void ggml_cuda_q8_skinny_prepass(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph) {
