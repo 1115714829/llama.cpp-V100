@@ -2,7 +2,7 @@
 
 [简体中文](README.md) | **English**
 
-A modified version of llama.cpp for the NVIDIA V100 (SM70). Current version **1.0.2**; see [CHANGELOG.md](CHANGELOG.md) for the changes in each release.
+A modified version of llama.cpp for the NVIDIA V100 (SM70). Current version **1.0.3**; see [CHANGELOG.md](CHANGELOG.md) for the changes in each release.
 
 ---
 
@@ -29,7 +29,7 @@ The test data below all uses Qwen3.8-27B (Q8_0) with DFlash2 speculative decodin
 
 Systematic optimization around the hardware characteristics of the V100 (SM70), from compute kernels to the runtime:
 
-- **Multi-GPU parallelism**: optimized scheduling and kernel launching for tensor parallelism to reduce the time GPUs wait for the host; supports splits where the number of attention heads is not divisible by the number of GPUs (e.g. 6 GPUs).
+- **Multi-GPU parallelism**: optimized scheduling and kernel launching for tensor parallelism to reduce the time GPUs wait for the host; all-reduce between GPUs is done hierarchically following the NVLink topology; supports splits where the number of attention heads is not divisible by the number of GPUs (e.g. 6 GPUs).
 - **Long context**: keeps prefill and decode speed stable at very long contexts, and reduces the VRAM used by compute buffers.
 - **Speculative decoding**: a complete DFlash2 speculative decoding pipeline, with optimized sampling and per-round overhead for higher decode speed.
 - **Compute kernels**: some SM70 compute kernels are ported from 1Cat-vLLM and adapted to the Q8_0 format, combined with operator fusion.
@@ -45,7 +45,7 @@ Test environment:
 - Model: Qwen3.8-27B, Q8_0 GGUF; speculative decoding uses the DFlash2 draft model (F16), drafts 7 tokens per round.
 - Launch parameters: see the corresponding configuration in the "Launch parameters" section.
 - Except for "two concurrent requests" and "Multimodal", every case is measured on a freshly started server; the cases in those two sections are measured sequentially in the same server.
-- Speeds were measured on 1.0.0-1.0.2; peak VRAM was measured on 1.0.2.
+- 4-GPU speeds were measured on 1.0.0-1.0.2 and peak VRAM on 1.0.2 (on 4 GPUs, 1.0.3 produces output identical to 1.0.2 at the same speed); 6-GPU data was measured on 1.0.3.
 - The decode speed for real content varies with the acceptance rate; some tables also give the time per speculative round.
 
 ### 4 GPUs, 262144 context
@@ -81,20 +81,20 @@ Real code, 1024 output tokens:
 
 | `-ub` | Input | Prefill | Decode | Time per speculative round | Peak VRAM per GPU |
 |---|---|---:|---:|---:|---:|
-| 2048 | synthetic 209715 tokens (512 output tokens) | 1720 tok/s | 272.9 tok/s | 29.3 ms | 10.2 GB |
-| 2048 | real code 209233 tokens (1024 output tokens) | 1719 tok/s | 84.3 tok/s | 29.1 ms | 10.2 GB |
-| 2048 | real code 16496 tokens (1024 output tokens) | 2592 tok/s | 135.3 tok/s | 22.6 ms | 10.2 GB |
-| 4096 | synthetic 209715 tokens (512 output tokens) | 1912 tok/s | 273.6 tok/s | 29.2 ms | 11.4 GB |
-| 4096 | real code 209229 tokens (1024 output tokens) | 1905 tok/s | 87.4 tok/s | 29.1 ms | 11.4 GB |
-| 4096 | real code 16497 tokens (1024 output tokens) | 2731 tok/s | 115.7 tok/s | 22.6 ms | 11.4 GB |
-| 8192 | synthetic 209715 tokens (512 output tokens) | 1912 tok/s | 273.3 tok/s | 29.2 ms | 13.8 GB |
+| 2048 | synthetic 209715 tokens (512 output tokens) | 1710 tok/s | 293.6 tok/s | 27.2 ms | 10.2 GB |
+| 2048 | real code 209233 tokens (1024 output tokens) | 1701 tok/s | 97.5 tok/s | 27.1 ms | 10.2 GB |
+| 2048 | real code 16502 tokens (1024 output tokens) | 2556 tok/s | 128.9 tok/s | 20.5 ms | 10.2 GB |
+| 4096 | synthetic 209715 tokens (512 output tokens) | 1895 tok/s | 290.9 tok/s | 27.4 ms | 11.4 GB |
+| 4096 | real code 209236 tokens (1024 output tokens) | 1889 tok/s | 99.7 tok/s | 27.2 ms | 11.4 GB |
+| 4096 | real code 16501 tokens (1024 output tokens) | 2716 tok/s | 118.9 tok/s | 20.6 ms | 11.4 GB |
+| 8192 | synthetic 209715 tokens (512 output tokens) | 1906 tok/s | 293.0 tok/s | 27.2 ms | 13.8 GB |
 
 ### 6 GPUs, 524288 context (YaRN)
 
 | `-ub` | Input | TTFT | Prefill | Decode | Peak VRAM per GPU |
 |---|---|---:|---:|---:|---:|
-| 2048 | synthetic 419430 tokens (512 output tokens) | 360 s | 1165 tok/s | 220.2 tok/s | 12.7 GB |
-| 4096 | synthetic 419430 tokens (512 output tokens) | 320 s | 1309 tok/s | 218.1 tok/s | 13.9 GB |
+| 2048 | synthetic 419430 tokens (512 output tokens) | 363 s | 1155 tok/s | 232.9 tok/s | 12.7 GB |
+| 4096 | synthetic 419430 tokens (512 output tokens) | 320 s | 1312 tok/s | 232.2 tok/s | 13.9 GB |
 
 `-ub 8192` does not fit in VRAM and fails to start. Only speed and VRAM were measured; output quality above 262144 was not tested. The YaRN setting applies to all lengths.
 
@@ -117,17 +117,17 @@ Real code, 1024 output tokens:
 
 | Input | Tokens | TTFT | Decode |
 |---|---:|---:|---:|
-| image (paper figure) | 3078 | 5.0 s | 136 tok/s |
-| image (diagram) | 4069 | 5.6 s | 126 tok/s |
-| PDF first 6 pages (one image per page) | 3590 | 3.5 s | 151 tok/s |
-| 12-second video (slides) | 23104 | 19.5 s | 164 tok/s |
-| 10-second video | 6387 | 7.3 s | 160 tok/s |
-| 200K tokens of text + 1 image | 206958 | 122 s | 91 tok/s |
+| image (paper figure) | 3078 | 5.1 s | 148 tok/s |
+| image (diagram) | 4069 | 5.7 s | 186 tok/s |
+| PDF first 6 pages (one image per page) | 3590 | 3.6 s | 182 tok/s |
+| 12-second video (slides) | 23104 | 19.7 s | 181 tok/s |
+| 10-second video | 6387 | 7.4 s | 179 tok/s |
+| 200K tokens of text + 1 image | 206958 | 123 s | 100 tok/s |
 
-- Appending 8030 tokens to the same session after 208K tokens: TTFT 7.7 s (only the new part is processed).
-- With the vision module loaded, text-only synthetic 419430 tokens (512 output tokens): prefill 1154 tok/s, decode 217.9 tok/s; peak VRAM 13.6 GB on GPU 0 and 12.7 GB on the others.
+- Appending 8034 tokens to the same session after 209K tokens: TTFT 7.7 s (only the new part is processed).
+- With the vision module loaded, text-only synthetic 419430 tokens (512 output tokens): prefill 1154 tok/s, decode 232.6 tok/s; peak VRAM 13.6 GB on GPU 0 and 12.7 GB on the others.
 - 4 GPUs, 262144 context, vision module on GPU: a one-image request takes 7.6 s and the PDF first 6 pages 5.5 s (both include answer generation); peak VRAM about 14.7 GB on GPU 0.
-- With the vision module on CPU (`--no-mmproj-offload`): the same two images take 150 s and 232 s to first token, and a 12-second video 649 s.
+- With the vision module on CPU (`--no-mmproj-offload`, measured on 1.0.1): the same two images take 150 s and 232 s to first token, and a 12-second video 649 s.
 
 ---
 
@@ -279,7 +279,7 @@ Sampling: when `top_k ≤ 64` and only top-k, top-p, min-p, and temperature are 
 
 ## Next steps
 
-- **Multi-GPU splitting**: Qwen3.8 has 4 attention KV heads, so with 6-GPU tensor parallelism 2 GPUs have no attention heads in each attention layer, and the time per speculative round on 6 GPUs is about 3% higher than on 4 GPUs. Future work will improve splitting and inter-GPU communication for such uneven cases to raise prefill and decode speed on 6 GPUs.
+- **Multi-GPU splitting**: Qwen3.8 has 4 attention KV heads, so with 6-GPU tensor parallelism 2 GPUs have no attention heads in each attention layer, and prefill on 6 GPUs is about as fast as on 4 GPUs (the same at 16K input, about 3% faster at 200K input). Future work will improve splitting for such uneven cases and inter-GPU communication during prefill to raise prefill speed on 6 GPUs.
 - **Concurrent requests**: optimization currently targets single requests; with multiple concurrent requests, prefill and decode affect each other. Future work will improve scheduling and throughput for concurrent requests.
 
 ---
