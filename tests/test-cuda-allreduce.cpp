@@ -16,6 +16,10 @@
 // The chain timing records many per-rank push AllReduce calls into one CUDA
 // graph per rank and replays the graph, which removes the host launch overhead
 // and the rank-to-rank skew from the per-call time.
+//
+// With 6 devices whose topology splits into two cliques the default comm
+// picks the hierarchical 3+3 kernel; to time the flat one against it, run
+// this test built against the older library.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -290,6 +294,90 @@ static void run_timing(const ar_test & t, ggml_backend_comm_allreduce_tensor_t a
         const double us = std::chrono::duration<double, std::micro>(t1 - t0).count() / n_iter;
         printf("ne=%lld bytes=%lld us/call=%.2f\n", (long long) ne, (long long) nbytes, us);
     }
+}
+
+// Median per-call time of the default-proc allreduce over n_iter calls. All
+// ranks are synchronized after every call, so a sample is one full round trip.
+static double ar_median_us(const ar_test & t, void * comm,
+                           ggml_backend_comm_allreduce_tensor_t allreduce, int64_t ne) {
+    const size_t n = t.n;
+    const size_t nbytes = (size_t) ne * sizeof(float);
+    const int n_warmup = 20;
+    const int n_iter   = 101;
+
+    ar_case c;
+    std::vector<float> zeros(ne, 0.0f);
+    for (size_t i = 0; i < n; ++i) {
+        struct ggml_init_params params = {
+            /* .mem_size   = */ 16 * 1024,
+            /* .mem_buffer = */ nullptr,
+            /* .no_alloc   = */ true,
+        };
+        ggml_context * ctx = ggml_init(params);
+        ggml_tensor * tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne);
+        tensor->flags |= GGML_TENSOR_FLAG_COMPUTE;
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, t.backends[i]);
+        if (buf == nullptr) {
+            c.ctxs.push_back(ctx);
+            fprintf(stderr, "six: alloc failed (ne=%lld rank=%zu)\n", (long long) ne, i);
+            return -1.0;
+        }
+        c.ctxs.push_back(ctx);
+        c.tensors.push_back(tensor);
+        c.bufs.push_back(buf);
+        ggml_backend_tensor_set(tensor, zeros.data(), 0, nbytes);
+    }
+
+    for (int it = 0; it < n_warmup; ++it) {
+        allreduce(comm, c.tensors.data());
+    }
+    for (size_t i = 0; i < n; ++i) {
+        ggml_backend_synchronize(t.backends[i]);
+    }
+
+    std::vector<double> samples;
+    samples.reserve(n_iter);
+    for (int it = 0; it < n_iter; ++it) {
+        const auto t0 = std::chrono::steady_clock::now();
+        allreduce(comm, c.tensors.data());
+        for (size_t i = 0; i < n; ++i) {
+            ggml_backend_synchronize(t.backends[i]);
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        samples.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+    }
+    std::sort(samples.begin(), samples.end());
+    return samples[samples.size() / 2];
+}
+
+// On 6 devices whose topology splits into two cliques the default comm picks
+// the hierarchical 3+3 kernel; the flat one is timed by running this test
+// built against the older library. Shapes are the decode sizes of the
+// tensor-parallel graph: [5120,8] and [5120,1] f32.
+static bool run_six_rank_default(ar_test & t) {
+    const int64_t sizes[] = { 5120 * 8, 5120 };
+    const char * labels[] = { "5120x8", "5120x1" };
+
+    bool ok = true;
+    for (int s = 0; s < 2; ++s) {
+        std::vector<bool> compute(t.n, true);
+        const uint32_t seed = 0x6100u + (uint32_t) s;
+        if (!run_case(t, t.comm_allreduce, false, sizes[s], compute, seed, "six-default")) {
+            ok = false;
+        }
+    }
+
+    for (int s = 0; s < 2; ++s) {
+        const double us = ar_median_us(t, t.comm, t.comm_allreduce, sizes[s]);
+        if (us < 0.0) {
+            ok = false;
+            continue;
+        }
+        printf("six-default %s ne=%lld median_us=%.2f\n", labels[s], (long long) sizes[s], us);
+    }
+
+    printf("six-default: %s\n", ok ? "OK" : "FAILED");
+    return ok;
 }
 
 // Records n_per_graph per-rank push AllReduce calls of one size into one CUDA
@@ -660,6 +748,9 @@ int main() {
         run_timing(t, t.comm_allreduce, t.comm_allreduce_exact != nullptr ? "default proc" : "default proc (no exact proc)");
         if (t.comm_allreduce_exact != nullptr) {
             run_timing(t, t.comm_allreduce_exact, "exact proc");
+        }
+        if (n == 6 && !run_six_rank_default(t)) {
+            n_failed++;
         }
         if (!run_chain_timing(t, false)) {
             n_failed++;
