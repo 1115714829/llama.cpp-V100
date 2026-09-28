@@ -1931,15 +1931,26 @@ bool llama_kv_cache::get_kq_range_ok(const slot_info & sinfo, const llama_ubatch
     // the range [0, cell + 1) of a token equals its causal mask (see set_input_kq_mask) when the cells are in
     // strict causal order: increasing positions, where the tokens of an image that share a position (M-RoPE)
     // follow the order of the 2D causal mask
-    for (uint32_t j = 1; j < n_used; ++j) {
-        const llama_pos p_prev = cells.pos_get(j - 1);
-        const llama_pos p_cur  = cells.pos_get(j);
+    //
+    // this runs for every ubatch over all used cells: text has strictly increasing positions, which a
+    // branch-free scan checks (it vectorizes); only shared positions take the per-cell check
+    const llama_pos * pos = cells.pos_data();
 
-        if (p_cur > p_prev) {
+    int32_t not_increasing = 0;
+    for (uint32_t j = 1; j < n_used; ++j) {
+        not_increasing |= pos[j] <= pos[j - 1];
+    }
+
+    if (!not_increasing) {
+        return true;
+    }
+
+    for (uint32_t j = 1; j < n_used; ++j) {
+        if (pos[j] > pos[j - 1]) {
             continue;
         }
 
-        if (p_cur < p_prev) {
+        if (pos[j] < pos[j - 1]) {
             return false;
         }
 
