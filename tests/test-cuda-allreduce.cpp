@@ -143,10 +143,12 @@ static bool run_case(const ar_test & t, ggml_backend_comm_allreduce_tensor_t all
             // The exact proc must match the f64 reference up to f32 rounding.
             // The f16 push path converts its input (here in [-1, 1]) to f16,
             // which loses at most 4.9e-4 per element. The NCCL fallback uses
-            // BF16 for large tensors, so it gets a relative tolerance.
+            // BF16 for large tensors, so it gets a relative tolerance that grows
+            // with the number of ranks (one BF16 rounding per ring step).
+            const double tol_bf16 = 2e-2 * std::max(1.0, (double) n / 4.0);
             const bool good = exact ? diff < 1e-5 :
                 (f16_push ? diff < 4e-3 :
-                (diff < 1e-5 || diff / std::max(std::fabs(expected[j]), 1.0) < 2e-2));
+                (diff < 1e-5 || diff / std::max(std::fabs(expected[j]), 1.0) < tol_bf16));
             if (!good) {
                 fprintf(stderr, "%s: ne=%lld rank=%zu elem=%lld got=%g want=%g\n",
                         phase, (long long) ne, i, (long long) j, (double) result[j], expected[j]);
