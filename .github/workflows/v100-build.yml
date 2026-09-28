@@ -1,0 +1,102 @@
+# 本项目（V100 / sm_70 专项优化版）的自动编译：
+# - 推送 master：在 GitHub 的 x86_64 Linux 机器上按 sm_70 编译一遍（警告按错误处理），编不过即失败；
+# - 推送 v100-* 标签：另外打包 x86_64 Linux 程序，发布到该标签的 Release。
+# GitHub 的机器没有显卡，这里只编译、不运行测试。上游 llama.cpp 自带的 workflow 已在仓库设置里停用。
+name: V100 build
+
+on:
+  push:
+    branches: [master]
+    tags: ['v100-*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:12.6.2-devel-ubuntu24.04
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential cmake git ca-certificates libssl-dev
+          if [ ! -f /usr/include/nccl.h ]; then
+            apt-get install -y --no-install-recommends libnccl-dev
+          fi
+
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_CUDA=ON \
+            -DCMAKE_CUDA_ARCHITECTURES=70-real \
+            -DGGML_NATIVE=OFF \
+            -DLLAMA_FATAL_WARNINGS=ON \
+            -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON 2>&1 | tee cmake.log
+          if grep -q "NCCL not found" cmake.log; then
+            echo "::error::NCCL not found, multi-GPU tensor parallelism needs it"
+            exit 1
+          fi
+
+      - name: Build
+        run: cmake --build build -j $(nproc)
+
+      - name: Package
+        if: startsWith(github.ref, 'refs/tags/v100-')
+        run: |
+          name="llama-${GITHUB_REF_NAME}-linux-x64-cuda12-sm70"
+          mkdir -p "$name/licenses"
+          cp -a build/bin/llama-* build/bin/lib*.so* build/bin/test-backend-ops "$name/"
+          cp LICENSE README.md "$name/"
+          cp licenses/* ggml/src/ggml-cuda/LICENSE.v100-skinny ggml/src/ggml-cuda/gdn-chunk-sm70/LICENSE-tilelang \
+             ggml/src/ggml-cuda/sm70-vendor/LICENSE-* "$name/licenses/"
+          tar -czf "$name.tar.gz" "$name"
+
+      - name: Upload package
+        if: startsWith(github.ref, 'refs/tags/v100-')
+        uses: actions/upload-artifact@v6
+        with:
+          name: package
+          path: llama-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v100-')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download package
+        uses: actions/download-artifact@v7
+        with:
+          name: package
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<'EOF'
+          V100（sm_70）专项优化版 llama.cpp。
+
+          附件是 x86_64 Linux 版本：用 CUDA 12.6 编译，只含 sm_70（V100）的代码。运行需要 NVIDIA 驱动 525 或更新，以及 CUDA 12 的运行库（cudart、cuBLAS）和 NCCL 2。
+          POWER9（ppc64le）等其他平台请按 README 自行编译。
+          EOF
+          gh release create "$GITHUB_REF_NAME" llama-*.tar.gz --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --notes-file notes.md
