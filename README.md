@@ -1,126 +1,184 @@
-# llama.cpp
+# llama.cpp-v100
 
-![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
+面向 NVIDIA V100（SM70）的 llama.cpp 专项优化版本。当前版本 **1.0.0**。
 
-<div align="center">
+---
 
-<b>LLM inference in C/C++</b>
+## 致谢
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp?filter=v*&color=brightgreen)](https://github.com/ggml-org/llama.cpp/releases?q=tag:v0)
-[![Nightly](https://img.shields.io/github/v/release/ggml-org/llama.cpp?label=nightly&filter=b*&color=orange)](https://github.com/ggml-org/llama.cpp/releases?q=b)
-[![Server](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/server.yml?label=Server)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
-[![Docker](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/docker.yml?label=Docker)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
-[![Winget](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/winget.yml?label=Winget)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
+**特别感谢 [1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM)。** 它在 V100 上的工程实践给了本项目很多参考，部分 SM70 计算内核移植自它。
 
-[ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/issues?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Ajhen0409%20OR%20author%3Abartowski1182%20OR%20author%3Anikwen%20OR%20author%3Ahipudding%20OR%20author%3Aravi9%20OR%20author%3AServeurpersoCom%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3Amarty1885%20OR%20author%3A0cc4m%20OR%20author%3ATitaniumtown%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3Aallozaur%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Awine99%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Alhez%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming)%20sort%3Aupdated-desc) / [dev stats](https://github.com/ggml-org/llama.cpp-dev) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
+同样感谢：
 
-</div>
+- **[llama.cpp](https://github.com/ggml-org/llama.cpp) / [ggml](https://github.com/ggml-org/ggml)**：本项目的基础框架。
+- **[vLLM](https://github.com/vllm-project/vllm)**：投机解码等方面的设计给了本项目很多借鉴。
 
-## Quick start
+---
 
-A few options to get `llama.cpp` installed on your machine:
+## 简介
 
-- Visit https://llama.app and follow the instructions
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
+本项目基于 llama.cpp（2026-09-26 的 master `08618ff8e`，已包含上游 v0.5.0）改造，针对 V100 做专项优化。重点是 Qwen3.8-27B（Q8_0）配合 DFlash2 投机解码，在 4 卡张量并行下的长上下文预填充和吐字速度。
 
-Once installed:
+除部分 SM70 计算内核移植自 1Cat-vLLM 外，多卡运行时与调度、长上下文注意力、投机解码链路、大部分算子融合和平台适配都是本项目自研。
 
-```sh
-# Download and run a model directly from Hugging Face
-llama cli -hf ggml-org/Qwen3.5-0.8B-GGUF
+## 专项优化方向
 
-# Launch OpenAI-compatible API server
-llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
+围绕 V100 的硬件特点，从内核到运行时做了整体优化：
+
+- **多卡并行（自研）**：重做 4 卡张量并行的调度与发射，让 GPU 少等待。
+- **长上下文（自研）**：让预填充和吐字在超长上下文下保持稳定的速度。
+- **投机解码（自研）**：打通 DFlash2 投机解码的完整链路，并优化采样和每轮开销，提升吐字速度。
+- **计算内核**：部分关键算子移植自 1Cat-vLLM 并适配 Q8_0；大量算子融合为自研。
+- **平台适配（自研）**：针对 IBM AC922 的多卡互联和内存特点做了适配。
+
+---
+
+## 性能
+
+测试环境：
+- 服务器：IBM Power AC922（2 × POWER9），4 × Tesla V100-SXM2-16GB（NVLink），CUDA 12.4。
+- 模型：Qwen3.8-27B，Q8_0 GGUF；投机解码用 DFlash2 草稿模型，每轮起草 7 个。
+- 参数：见下文“推荐启动参数”。
+- 每个用例都在全新启动的服务上测。
+
+| 输入 | 预填充 | 吐字 | 每卡显存峰值 |
+|---|---:|---:|---:|
+| 合成 209715 token（输出 512） | 1652 tok/s | 281.5 tok/s | 14.3 GB |
+| 真实代码 209115 token（输出 1024） | 1646 tok/s | 每轮投机 28.3 ms | 14.3 GB |
+| 合成 131072 token（输出 512） | 1997 tok/s | 310.4 tok/s | 14.3 GB |
+| 真实代码 131188 token（输出 1024） | 1983 tok/s | 97.6 tok/s | 14.3 GB |
+| 真实代码 16499 token（输出 1024） | 2570 tok/s | 123.5 tok/s | 14.3 GB |
+
+真实内容的吐字速度随接受率波动较大，所以同时给出每轮投机耗时。
+
+### 官方推荐的采样参数
+
+按模型卡推荐的两套采样参数实测（真实代码，输出 1024）：
+
+| 模式 | 输入 | 预填充 | 吐字 | 接受率 | 每轮投机耗时 |
+|---|---|---:|---:|---:|---:|
+| 思考模式（T=1.0、top_p 0.95、top_k 20） | 16K | 2589 tok/s | 114.0 tok/s | 0.21 | 21.8 ms |
+| 思考模式 | 128K | 1985 tok/s | 99.1 tok/s | 0.22 | 25.7 ms |
+| 非思考模式（T=0.7、top_p 0.8、top_k 20、presence_penalty 1.5） | 16K | 2412 tok/s | 114.6 tok/s | 0.29 | 26.4 ms |
+| 非思考模式 | 128K | 1974 tok/s | 101.2 tok/s | 0.29 | 30.1 ms |
+
+- 思考模式走设备端采样的快速路径。每轮耗时与 T=0.6 时相同，吐字速度的差别只来自接受率。
+- 非思考模式的 `presence_penalty` 会让采样退回全词表，每轮慢约 4.5 ms（17~21%）；这类内容接受率更高，所以吐字速度相近。
+
+### 批大小（`-ub`）
+
+上下文 262144 时：
+
+| `-ub` | 结果 |
+|---|---|
+| 2048 | 正常运行，每卡显存峰值 14.3 GB |
+| 4096 | 显存不够，启动失败 |
+| 8192 | 显存不够，启动失败 |
+
+16 GB 的 V100 开满 256K 上下文时，2048 是上限。
+
+### 两路并发
+
+每路 256K（`-c 524288 -np 2`）显存不够，启动失败。每路 128K（`-c 262144 -np 2`）可以运行，每卡显存峰值 14.5~14.7 GB：
+
+| 场景 | 首字 | 每路吐字 | 合计吐字 |
+|---|---|---:|---:|
+| 单路 16K | 6.45 s | 117.1 tok/s | 117 tok/s |
+| 两路各 16K 同时请求 | 9.1 s / 16.5 s | 45.2 / 68.3 tok/s | 90 tok/s |
+| 单路约 11.5 万 token | 55.8 s | 101.5 tok/s | 102 tok/s |
+| 两路各约 11.5 万 token 同时请求 | 58.8 s / 131 s | 11.8 / 63.1 tok/s | 23 tok/s |
+
+目前两路并发比单路还慢：
+- 预填充基本排队，第二路要等第一路预填充完。
+- 一路吐字时如果另一路正在预填充，吐字那路每轮都要等对方的预填充块算完，速度明显下降。
+
+所以目前推荐单并发（`-np 1`）；并发优化列在“下一步”。
+
+---
+
+## 编译
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=70 -DGGML_CUDA_FA=ON -DGGML_CUDA_GRAPHS=ON \
+  -DGGML_CUDA_NCCL=ON -DNCCL_INCLUDE_DIR=/path/to/nccl/include -DNCCL_LIBRARY=/path/to/nccl/lib/libnccl.so.2
+cmake --build build -j --target llama-server
 ```
 
-<table align="center">
-    <tr>
-        <td align="center" width=50%>
-            <img width="1310" height="888" alt="VLM session with `llama cli`" src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" />
-            <i>VLM session with <b>llama cli</b></i>
-        </td>
-        <td align="center">
-            <img width="1392" height="958" alt="Built-in web UI against `llama serve` running Qwen 3.6" src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" />
-            <i>Built-in web UI against <b>llama serve</b></i>
-        </td>
-    </tr>
-<table>
+多卡张量并行需要 NCCL。编译器用 GCC 12 或更新的版本。
 
-## Description
+---
 
-The main goal of `llama.cpp` is to enable LLM (and VLM) inference with minimal setup and state-of-the-art performance on
-a wide range of hardware - locally and in the cloud.
+## 推荐启动参数
 
-- Plain C/C++ implementation without any dependencies
-- Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks
-- AVX, AVX2, AVX512 and AMX support for x86 architectures
-- RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures
-- 1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use
-- Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
-- Vulkan and SYCL backend support
-- CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
+以下就是本项目测试所用的参数：
 
-The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-org/ggml) library.
+```bash
+CUDA_VISIBLE_DEVICES=0,1,3,4 numactl --membind=0,8 ./build/bin/llama-server \
+  -m /path/to/Qwen3.8-27B-Q8_0.gguf -ngl 999 \
+  --split-mode tensor --tensor-split 1,1,1,1 \
+  -c 262144 -np 1 -fa on -ctk q8_0 -ctv q8_0 -b 2048 -ub 2048 \
+  --model-draft /path/to/Qwen3.8-27B-DFlash2-F16.gguf \
+  --spec-type draft-dflash --spec-draft-n-max 7 \
+  --host 127.0.0.1 --port 8080 --metrics
+```
 
-## Supported backends
+| 参数 | 说明 |
+|---|---|
+| `-ngl 999` | 所有层都放 GPU |
+| `--split-mode tensor --tensor-split 1,1,1,1` | 4 卡张量并行，均分 |
+| `-c 262144` | 上下文 256K，实测每卡显存峰值 14.3 GB；显存更紧时可以调小 |
+| `-np 1` | 单并发。目前只针对单并发优化，多路并发还没有优化（见“下一步”） |
+| `-fa on` | 开启 Flash Attention，SM70 注意力内核依赖它 |
+| `-ctk q8_0 -ctv q8_0` | KV 缓存用 8 位 |
+| `-b 2048 -ub 2048` | 批大小 2048，预填充按这个大小调优；开满 256K 上下文时，16 GB 的 V100 放不下更大的值 |
+| `--model-draft ...`、`--spec-type draft-dflash`、`--spec-draft-n-max 7` | DFlash2 投机解码，每轮起草 7 个 |
+| `--metrics` | 可选，开启 Prometheus 指标 |
 
-| Backend | Target devices |
-| --- | --- |
-| [BLAS](docs/build.md#blas-build) | All |
-| [BLIS](docs/backend/BLIS.md) | All |
-| [CANN](docs/build.md#cann) | Ascend NPU |
-| [CUDA](docs/build.md#cuda) | Nvidia GPU |
-| [HIP](docs/build.md#hip) | AMD GPU |
-| [Hexagon](docs/backend/snapdragon/README.md) | Snapdragon |
-| [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
-| [MUSA](docs/build.md#musa) | Moore Threads GPU |
-| [Metal](docs/build.md#metal-build) | Apple Silicon |
-| [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
-| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
-| [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
-| [SYCL](docs/backend/SYCL.md) | Intel GPU |
-| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
-| [Vulkan](docs/build.md#vulkan) | GPU |
-| [WebGPU](docs/build.md#webgpu) | All |
-| [ZenDNN](docs/build.md#zendnn) | AMD CPU |
+**AC922 平台注意事项：**
+- **限定 CPU 内存节点**：AC922 会把 GPU 显存上线成 NUMA 节点，页缓存可能落到显存上，导致 CUDA 显存不足。用 `numactl --membind=<CPU 节点>` 限定内存节点，本机是 0 和 8，用 `numactl -H` 查看。
+- **选卡**：4 卡时两颗 CPU 各选两张，本机是 0,1,3,4。
 
-## Documentation
+**采样参数：** `top_k ≤ 64` 且只用 top-k、top-p、min-p、temperature 时，走设备端 top-k + 稀疏拒绝采样的快速路径。Qwen 推荐的 `top_k=20` 正好满足。使用 penalties、DRY 等采样器，或者 `top_k` 更大时，会退回全词表采样，吐字变慢。例如官方非思考模式的 `presence_penalty=1.5`，每轮慢约 20%。
 
-#### Tools
+---
 
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [GBNF grammars](grammars/README.md)
+## 下一步
 
-#### Development
+- **多卡加载适配**：例如 6 卡时，千问模型的部分维度（如注意力头数）不能被 6 整除，无法直接均分到每张卡。我们会针对这类情况做加载与切分的优化适配。
+- **并发优化**：目前针对单并发优化，多路并发时预填充和吐字会互相拖慢。后续优化多路并发的调度与吞吐。
 
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Build on Android](docs/android.md)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-- [XCFramework](docs/xcframework.md)
-- [Completions](docs/completions.md)
-- [Models](docs/models.md)
-- [Release process](docs/release.md)
+---
 
-## Contributing
+## 贡献
 
-- Contributors can open PRs
-- Collaborators will be invited based on contributions
-- Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
-- Any help with managing issues, PRs and projects is very appreciated!
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
+- **仓库作者与 Claude 共同担任总调度与决策。**
+  - **仓库作者**：
+    - 提出项目，提供硬件与测试环境。
+    - 定下目标和关键方向：先单卡后多卡；内核直接移植已验证的实现、运行时按 llama.cpp 架构自己设计；8 位权重；以 200K 上下文为标准线；调参带来的提速不计入成果。
+    - 做关键取舍：哪些优化做、哪些不做。
+    - 在测试中发现问题、指导方向，例如多卡利用率不均衡、长上下文吐字变慢。
+    - 带来早先 V100 项目的经验和部分实现。
+  - **Claude**（Anthropic，Claude Opus 5.5，通过 Claude Code）：
+    - 技术方案与设计；
+    - 测量与根因分析：nvprof、perf、自写探针；
+    - 服务器上的全部编译、测试与压测；
+    - 审核每一处改动；
+    - 提交与文档。
+- **DeepSeek V4.1 Flash**：2026-09-26 晚起承担大部分代码实现，约 124 次任务。
+  - 实现举例：区间 mask、解码图跨请求保留、meta 后端的临时缓冲与计划淘汰、n_kv 粒度自适应。
+  - 也做源码调研、设计初稿和诊断脚本。
+  - 响应快，质量稳定。
+- **小米 MiMo v2.6-pro**：项目初期（2026-09-26）的主力，约 26 次任务。
+  - 前期代码调研。
+  - 第一版实现：grouped 验证注意力、DFlash2 拒绝采样。
+  - 词表分片 top-k 的设计与实现，DFlash2 草稿链路一致性审计。
+  - 后期承担并行调研，例如解码图保留、设备端整轮投机。
 
-## Acknowledgements
+感谢以上所有项目和参与者。
 
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [nothings/stb](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+---
+
+## 许可
+
+继承 llama.cpp 的 MIT 许可（见 `LICENSE`）。移植的代码保留原许可，出处与许可见各文件头。
