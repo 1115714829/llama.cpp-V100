@@ -406,6 +406,10 @@ bool ggml_cuda_sm70_d256_supported(int cc, const ggml_tensor * dst) {
     if (Q->ne[1] < 17) {
         return false;
     }
+    // Under tensor split a device can get 0 KV heads (fewer KV heads than devices); fall back to the generic path.
+    if (K->ne[2] == 0 || Q->ne[2] == 0) {
+        return false;
+    }
     if (Q->ne[2] % K->ne[2] != 0 || K->ne[2] != V->ne[2] || K->ne[3] != Q->ne[3] || V->ne[3] != Q->ne[3]) {
         return false;
     }
@@ -518,6 +522,9 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
     const int kv_len  = mask_range ? (int) K->ne[1] : (int) mask->ne[0];
     const int heads_q = (int) Q->ne[2];
     const int hkv     = (int) K->ne[2];
+    if (heads_q == 0 || hkv == 0) {
+        return; // defensive: the dispatch predicate already rejects 0 heads
+    }
     const int gqa     = heads_q / hkv;
     const int batch   = (int) Q->ne[3];
     const int q_pad   = (int) GGML_PAD(q_len, SM70_D256_BLOCK_M);

@@ -28,6 +28,10 @@ bool ggml_cuda_flash_attn_ext_sm70_grouped_supported(const ggml_tensor * dst, in
             }
         }
     }
+    // Under tensor split a device can get 0 KV heads (fewer KV heads than devices); fall back to the generic path.
+    if (K->ne[2] == 0 || Q->ne[2] == 0) {
+        return false;
+    }
     if (K->ne[2] != V->ne[2] || Q->ne[2] != 6*K->ne[2]) {
         return false;
     }
@@ -75,6 +79,9 @@ static void ggml_cuda_flash_attn_ext_sm70_grouped_launch(ggml_backend_cuda_conte
 
     constexpr int head_groups = GroupedVerifyTraits<MAX_QUERY_TOKENS>::kHeadGroups;
     const int grid_x = n_kv_heads * head_groups;
+    if (n_kv_heads == 0 || grid_x == 0) {
+        return; // defensive: the dispatch predicate already rejects 0 heads
+    }
     const int splits = std::max(1, std::min(80 / grid_x, (n_kv + 63) / 64));
 
     float scale = 1.0f;
