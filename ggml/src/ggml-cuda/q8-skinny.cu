@@ -15,6 +15,9 @@
 static const char q8_skinny_marker = 0;
 
 static int q8_skinny_split_k(const int64_t k) {
+    if (k <= 0) {
+        return 0;
+    }
     for (int split_k : {16, 8, 4}) {
         if ((k / 16) % split_k == 0) {
             return split_k;
@@ -900,7 +903,9 @@ bool ggml_cuda_q8_skinny_can_repack(const ggml_tensor * t) {
     // the small-M kernel needs a split-K that divides the group count; the N >= 32 bound only
     // keeps the tile grid non-empty. Small-N weights (wk/wv at 256, ...) usually run in a
     // group of projections that share the input, the multi-weight kernel below handles them.
-    return k % 32 == 0 && n % 32 == 0 && n >= 32 && q8_skinny_split_k(k) != 0;
+    // k >= 32: under tensor split a device can hold an empty K slice (e.g. attn_output on a
+    // device that gets no attention heads); such a weight is never multiplied, leave it as is.
+    return k >= 32 && k % 32 == 0 && n % 32 == 0 && n >= 32 && q8_skinny_split_k(k) != 0;
 #endif
 }
 
@@ -910,6 +915,7 @@ void ggml_cuda_q8_skinny_repack_inplace(ggml_backend_cuda_context & ctx, ggml_te
     const int64_t k = t->ne[0];
     const int64_t n = t->ne[1];
     const int64_t ntiles = n / 32;
+    GGML_ASSERT(k >= 32 && ntiles >= 1);
     const size_t tile_src_bytes = 34 * (size_t) k;
     const size_t tile_dst_bytes = 32 * (size_t) k;
     const size_t scales_bytes = (size_t) n * k / 16;
