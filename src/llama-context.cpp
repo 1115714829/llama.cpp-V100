@@ -740,6 +740,12 @@ void llama_context::sched_reserve() {
         sched_dec.reset();
     }
 
+    // the worst-case graphs take range masks under the same conditions as the ubatches (see decode())
+    if (memory) {
+        memory->set_kq_range_allowed(model.kq_range_mask_supported() && cparams.flash_attn && cparams.causal_attn &&
+                model.hparams.f_max_alibi_bias == 0.0f);
+    }
+
     llama_memory_context_ptr mctx;
     if (memory) {
         LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
