@@ -1,6 +1,6 @@
 # llama.cpp-v100
 
-面向 NVIDIA V100（SM70）的 llama.cpp 专项优化版本。当前版本 **1.0.0**。
+面向 NVIDIA V100（SM70）的 llama.cpp 专项优化版本。当前版本 **1.0.1**。
 
 ---
 
@@ -67,7 +67,7 @@
 
 ### 批大小（`-ub`）
 
-上下文 262144 时：
+4 卡、上下文 262144 时：
 
 | `-ub` | 结果 |
 |---|---|
@@ -75,7 +75,33 @@
 | 4096 | 显存不够，启动失败 |
 | 8192 | 显存不够，启动失败 |
 
-16 GB 的 V100 开满 256K 上下文时，2048 是上限。
+4 卡开满 256K 上下文时，2048 是上限；6 卡每卡放的权重更少，见下一节。
+
+### 6 卡
+
+从 1.0.1 起可以用 6 卡运行（`--tensor-split 1,1,1,1,1,1`，其余参数同上）。千问的注意力 KV 头只有 4 个，6 卡时每个注意力层有 2 张卡分不到头；这部分切分还没有优化，是下一步的方向。下面是目前的情况（上下文 262144，每个用例都在全新启动的服务上测）：
+
+| `-ub` | 输入 | 预填充 | 吐字 | 每轮投机耗时 | 每卡显存峰值 |
+|---|---|---:|---:|---:|---:|
+| 2048 | 合成 209715 token（输出 512） | 1720 tok/s | 272.9 tok/s | 29.3 ms | 11.3 GB |
+| 2048 | 真实代码 209233 token（输出 1024） | 1719 tok/s | 84.3 tok/s | 29.1 ms | 11.3 GB |
+| 2048 | 真实代码 16496 token（输出 1024） | 2592 tok/s | 135.3 tok/s | 22.6 ms | 11.3 GB |
+| 4096 | 合成 209715 token（输出 512） | 1912 tok/s | 273.6 tok/s | 29.2 ms | 13.5 GB |
+| 4096 | 真实代码 209229 token（输出 1024） | 1905 tok/s | 87.4 tok/s | 29.1 ms | 13.5 GB |
+| 4096 | 真实代码 16497 token（输出 1024） | 2731 tok/s | 115.7 tok/s | 22.6 ms | 13.5 GB |
+
+- 与 4 卡相比：200K 预填充在 `-ub 2048` 时快约 4%，`-ub 4096` 时快约 16%；吐字每轮慢约 3%（卡多了通信增加，注意力层有 2 张卡空闲）。
+- `-ub 6144` 也能启动（启动后每卡约 15.0 GB），`-ub 8192` 显存不够。
+
+**单并发 512K 上下文**：6 卡时每卡显存有富余，可以开到 512K。千问原生支持 262,144 token，更长需要按模型卡的建议用 YaRN 扩展，同时放开服务端“单路上下文不超过训练长度”的限制：
+
+```bash
+-c 524288 -np 1 -b 2048 -ub 2048 \
+  --rope-scaling yarn --rope-scale 2 --yarn-orig-ctx 262144 \
+  --override-kv qwen35.context_length=int:524288
+```
+
+实测合成 419430 token（512K 的 80%，输出 512）：首字 360 s，预填充 1165 tok/s，吐字 220.2 tok/s，每卡显存峰值 14.8 GB；`-ub 4096` 时显存不够。这里只测了速度和显存，没有评估 256K 以上的输出质量；YaRN 会作用于所有长度，不需要超过 256K 时不建议打开。
 
 ### 两路并发
 
@@ -102,10 +128,40 @@
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
   -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=70 -DGGML_CUDA_FA=ON -DGGML_CUDA_GRAPHS=ON \
   -DGGML_CUDA_NCCL=ON -DNCCL_INCLUDE_DIR=/path/to/nccl/include -DNCCL_LIBRARY=/path/to/nccl/lib/libnccl.so.2
-cmake --build build -j --target llama-server
+cmake --build build -j --target llama-server llama-quantize
 ```
 
 多卡张量并行需要 NCCL。编译器用 GCC 12 或更新的版本。
+
+GitHub 上每次推送都会自动按 sm_70 编译检查；发布版本时附带 x86_64 Linux 的预编译程序（CUDA 12，见 Releases 页面）。POWER9 等其他平台请按上面的命令自行编译。
+
+---
+
+## 模型下载
+
+本项目实测用的是下面两个模型。**国内用户建议从魔搭（ModelScope）下载**，速度快、连接稳定。
+
+| 用途 | 文件 | 魔搭 ModelScope | Hugging Face |
+|---|---|---|---|
+| 目标模型 | `Qwen3.8-27B-Q8_0.gguf`（约 29 GB） | [unsloth/Qwen3.8-27B-GGUF](https://modelscope.cn/models/unsloth/Qwen3.8-27B-GGUF) | [unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) |
+| 草稿模型（DFlash2） | `Qwen3.8-27B-DFlash2-BF16.gguf`（约 3.9 GB），下载后转成 F16 | [z-lab/Qwen3.8-27B-DFlash2-GGUF](https://modelscope.cn/models/z-lab/Qwen3.8-27B-DFlash2-GGUF) | [z-lab/Qwen3.8-27B-DFlash2-GGUF](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF) |
+
+目标模型下载后直接用。草稿模型官方只发布了 BF16、Q8_0、Q4_K_M 三种 GGUF，本项目实测用的是 F16（V100 没有 BF16 硬件支持），需要用本项目编译出的 `llama-quantize` 转换一次。
+
+先按上一节编译，然后一条命令完成下载和转换：
+
+```bash
+scripts/v100-get-models.sh            # 默认从魔搭下载到 ./models
+scripts/v100-get-models.sh -s hf      # 改用 Hugging Face
+```
+
+脚本会下载这两个 GGUF（支持断点续传，已下载的文件自动跳过），再把草稿模型转成 `Qwen3.8-27B-DFlash2-F16.gguf`。`-d` 指定模型目录，`-q` 指定 `llama-quantize` 的路径，`-h` 查看用法。
+
+如果已经自己下载好了，只需要转换这一步：
+
+```bash
+./build/bin/llama-quantize Qwen3.8-27B-DFlash2-BF16.gguf Qwen3.8-27B-DFlash2-F16.gguf F16
+```
 
 ---
 
@@ -115,10 +171,10 @@ cmake --build build -j --target llama-server
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,3,4 numactl --membind=0,8 ./build/bin/llama-server \
-  -m /path/to/Qwen3.8-27B-Q8_0.gguf -ngl 999 \
+  -m ./models/Qwen3.8-27B-Q8_0.gguf -ngl 999 \
   --split-mode tensor --tensor-split 1,1,1,1 \
   -c 262144 -np 1 -fa on -ctk q8_0 -ctv q8_0 -b 2048 -ub 2048 \
-  --model-draft /path/to/Qwen3.8-27B-DFlash2-F16.gguf \
+  --model-draft ./models/Qwen3.8-27B-DFlash2-F16.gguf \
   --spec-type draft-dflash --spec-draft-n-max 7 \
   --host 127.0.0.1 --port 8080 --metrics
 ```
@@ -145,7 +201,7 @@ CUDA_VISIBLE_DEVICES=0,1,3,4 numactl --membind=0,8 ./build/bin/llama-server \
 
 ## 下一步
 
-- **多卡加载适配**：例如 6 卡时，千问模型的部分维度（如注意力头数）不能被 6 整除，无法直接均分到每张卡。我们会针对这类情况做加载与切分的优化适配。
+- **多卡切分优化**：6 卡已能正常运行（1.0.1，现状见“性能 / 6 卡”）。千问模型的部分维度（如注意力头数）不能被 6 整除，目前按头切分时每个注意力层有 2 张卡空闲，吐字每轮比 4 卡慢约 3%。接下来优化这类不能均分时的切分效率，让多出来的卡真正带来提速。
 - **并发优化**：目前针对单并发优化，多路并发时预填充和吐字会互相拖慢。后续优化多路并发的调度与吞吐。
 
 ---
