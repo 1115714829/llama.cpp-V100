@@ -84,6 +84,12 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: CHANGELOG.md
+          sparse-checkout-cone-mode: false
+
       - name: Download package
         uses: actions/download-artifact@v7
         with:
@@ -93,10 +99,23 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cat > notes.md <<'EOF'
-          V100（sm_70）专项优化版 llama.cpp。
+          # the notes start with this version's section of CHANGELOG.md (a "## <version>（date）" heading)
+          ver="${GITHUB_REF_NAME#v100-}"
+          : > changes.md
+          if [ -f CHANGELOG.md ]; then
+            awk -v h="## ${ver}（" '/^## /{p = (index($0, h) == 1); next} p' CHANGELOG.md > changes.md
+          fi
+          {
+            if [ -s changes.md ]; then
+              echo "## 本版更新"
+              cat changes.md
+              echo
+            fi
+            cat <<'EOF'
+          V100（sm_70）专项优化版 llama.cpp。完整的更新日志见仓库里的 CHANGELOG.md。
 
           附件是 x86_64 Linux 版本：用 CUDA 12.6 编译，只含 sm_70（V100）的代码。运行需要 NVIDIA 驱动 525 或更新，以及 CUDA 12 的运行库（cudart、cuBLAS）和 NCCL 2。
           POWER9（ppc64le）等其他平台请按 README 自行编译。
           EOF
+          } > notes.md
           gh release create "$GITHUB_REF_NAME" llama-*.tar.gz --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --notes-file notes.md
