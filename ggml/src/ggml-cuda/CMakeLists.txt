@@ -149,7 +149,8 @@ if (CUDAToolkit_FOUND)
             "${CMAKE_CURRENT_SOURCE_DIR}/sm70-vendor")
         target_compile_options(ggml-cuda-sm70d256 PRIVATE
             "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--expt-extended-lambda>")
-        set_target_properties(ggml-cuda-sm70d256 PROPERTIES CUDA_ARCHITECTURES "70")
+        # position-independent: the objects are linked into the shared ggml-cuda library (x86-64 needs -fPIC)
+        set_target_properties(ggml-cuda-sm70d256 PROPERTIES CUDA_ARCHITECTURES "70" POSITION_INDEPENDENT_CODE ON)
         target_link_libraries(ggml-cuda PRIVATE $<TARGET_OBJECTS:ggml-cuda-sm70d256>)
 
         # SM70 (Volta) GDN chunked prefill (TileLang/FlashQLA based). Same
@@ -165,7 +166,7 @@ if (CUDAToolkit_FOUND)
             "${CMAKE_CURRENT_SOURCE_DIR}/sm70-vendor")
         target_compile_options(ggml-cuda-gdnchunk PRIVATE
             "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--expt-extended-lambda>")
-        set_target_properties(ggml-cuda-gdnchunk PROPERTIES CUDA_ARCHITECTURES "70")
+        set_target_properties(ggml-cuda-gdnchunk PROPERTIES CUDA_ARCHITECTURES "70" POSITION_INDEPENDENT_CODE ON)
         target_link_libraries(ggml-cuda PRIVATE $<TARGET_OBJECTS:ggml-cuda-gdnchunk>)
     endif()
 
