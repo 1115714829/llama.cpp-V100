@@ -1886,6 +1886,11 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
 }
 
+bool llama_kv_cache::get_kq_range_reserve() const {
+    // a single sequence in causal order (see get_kq_range_ok) takes range masks for all its ubatches
+    return kq_range_enabled && swa_type == LLAMA_SWA_TYPE_NONE && n_stream == 1 && n_seq_max == 1;
+}
+
 bool llama_kv_cache::get_kq_range_ok(const slot_info & sinfo, const llama_ubatch & ubatch) const {
     if (!kq_range_enabled) {
         return false;
@@ -1923,10 +1928,23 @@ bool llama_kv_cache::get_kq_range_ok(const slot_info & sinfo, const llama_ubatch
         return false;
     }
 
-    const llama_pos pos0 = cells.pos_get(0);
-
+    // the range [0, cell + 1) of a token equals its causal mask (see set_input_kq_mask) when the cells are in
+    // strict causal order: increasing positions, where the tokens of an image that share a position (M-RoPE)
+    // follow the order of the 2D causal mask
     for (uint32_t j = 1; j < n_used; ++j) {
-        if (cells.pos_get(j) != pos0 + (llama_pos) j) {
+        const llama_pos p_prev = cells.pos_get(j - 1);
+        const llama_pos p_cur  = cells.pos_get(j);
+
+        if (p_cur > p_prev) {
+            continue;
+        }
+
+        if (p_cur < p_prev) {
+            return false;
+        }
+
+        const llama_kv_cell_ext & e_prev = cells.ext_get(j - 1);
+        if (!cells.ext_get(j).is_2d_gt(e_prev.x, e_prev.y)) {
             return false;
         }
     }
@@ -1934,21 +1952,18 @@ bool llama_kv_cache::get_kq_range_ok(const slot_info & sinfo, const llama_ubatch
     return true;
 }
 
-void llama_kv_cache::set_input_kq_range(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+void llama_kv_cache::set_input_kq_range(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {
     GGML_ASSERT(dst->type == GGML_TYPE_I32);
     GGML_ASSERT(dst->ne[0] == 2);
     GGML_ASSERT(dst->ne[1] == ubatch->n_tokens);
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
-    const auto & cells = v_cells[seq_to_stream[ubatch->seq_id[0][0]]];
-
-    const llama_pos pos0 = cells.pos_get(0);
-
     int32_t * data = (int32_t *) dst->data;
 
+    // the cells are in strict causal order (see get_kq_range_ok): a token sees the cells up to its own
     for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
         data[2*i + 0] = 0;
-        data[2*i + 1] = ubatch->pos[i] - pos0 + 1;
+        data[2*i + 1] = (int32_t) sinfo.idxs[0][i] + 1;
     }
 }
 
@@ -2942,6 +2957,10 @@ llama_kv_cache_context::llama_kv_cache_context(
         sinfos[0].strm.push_back(s);
         sinfos[0].idxs[s].resize(1, 0);
     }
+
+    // the worst-case graph takes the mask the ubatches will take: a dense mask over the whole cache
+    // would reserve n_kv*n_ubatch mask elements that a single sequence never uses
+    kq_range = kv->get_kq_range_reserve();
 }
 
 llama_kv_cache_context::llama_kv_cache_context(
@@ -3064,7 +3083,7 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     if (dst->type == GGML_TYPE_I32) {
-        kv->set_input_kq_range(dst, ubatch);
+        kv->set_input_kq_range(dst, ubatch, sinfos[i_cur]);
 
         return;
     }
