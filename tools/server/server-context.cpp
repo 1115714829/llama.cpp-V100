@@ -1153,38 +1153,6 @@ private:
             load_progress_callback(1.0f, &load_progress_spec);
         }
 
-        if (has_mmproj) {
-            if (callback_state) {
-                callback_state(SERVER_STATE_LOADING, {{"stage", "mmproj_model"}});
-            }
-
-            if (!is_resume) {
-                mtmd_helper_log_set(common_log_default_callback, nullptr);
-            }
-
-            mctx = mtmd_init_from_file(mmproj_path.c_str(), model_tgt, mparams);
-            if (mctx == nullptr) {
-                SRV_ERR("failed to load multimodal model, '%s'\n", mmproj_path.c_str());
-                return false;
-            }
-            SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
-
-            init_opt.video_params.fps_target = params_base.video_fps;
-            init_opt.video_params.timestamp_interval_ms = params_base.video_timestamp_interval_ms;
-            init_opt.video_params.ffmpeg_bin_dir = params_base.video_ffmpeg_bin_dir.empty()
-                                ? nullptr : params_base.video_ffmpeg_bin_dir.c_str();
-
-            if (params_base.ctx_shift) {
-                params_base.ctx_shift = false;
-                SRV_WRN("%s\n", "ctx_shift is not supported by multimodal, it will be disabled");
-            }
-
-            if (params_base.n_cache_reuse) {
-                params_base.n_cache_reuse = 0;
-                SRV_WRN("%s\n", "cache_reuse is not supported by multimodal, it will be disabled");
-            }
-        }
-
         if (!llama_memory_can_shift(llama_get_memory(ctx_tgt))) {
             if (params_base.ctx_shift) {
                 params_base.ctx_shift = false;
@@ -1285,6 +1253,46 @@ private:
         if (!spec && params_base.speculative.has_synth()) {
             SRV_ERR("%s", "synthetic acceptance requires an initialized speculative decoding context\n");
             return false;
+        }
+
+        // the speculative implementation sets up what it reads from the target (e.g. the DFlash2 layer-input
+        // features) when it is created, which changes the compute graphs: reserve them now, before the mmproj
+        // is loaded on the same devices, so that the first request does not have to grow the compute buffers
+        llama_reserve(ctx_tgt);
+        if (ctx_dft) {
+            llama_reserve(ctx_dft);
+        }
+
+        if (has_mmproj) {
+            if (callback_state) {
+                callback_state(SERVER_STATE_LOADING, {{"stage", "mmproj_model"}});
+            }
+
+            if (!is_resume) {
+                mtmd_helper_log_set(common_log_default_callback, nullptr);
+            }
+
+            mctx = mtmd_init_from_file(mmproj_path.c_str(), model_tgt, mparams);
+            if (mctx == nullptr) {
+                SRV_ERR("failed to load multimodal model, '%s'\n", mmproj_path.c_str());
+                return false;
+            }
+            SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
+
+            init_opt.video_params.fps_target = params_base.video_fps;
+            init_opt.video_params.timestamp_interval_ms = params_base.video_timestamp_interval_ms;
+            init_opt.video_params.ffmpeg_bin_dir = params_base.video_ffmpeg_bin_dir.empty()
+                                ? nullptr : params_base.video_ffmpeg_bin_dir.c_str();
+
+            if (params_base.ctx_shift) {
+                params_base.ctx_shift = false;
+                SRV_WRN("%s\n", "ctx_shift is not supported by multimodal, it will be disabled");
+            }
+
+            if (params_base.n_cache_reuse) {
+                params_base.n_cache_reuse = 0;
+                SRV_WRN("%s\n", "cache_reuse is not supported by multimodal, it will be disabled");
+            }
         }
 
         for (int i = 0; i < params_base.n_parallel; i++) {

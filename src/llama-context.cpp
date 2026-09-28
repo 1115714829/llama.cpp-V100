@@ -1193,6 +1193,11 @@ void llama_context::set_logits_topk(int32_t k) {
     sched_need_reserve = true;
 }
 
+void llama_context::reserve_if_needed() {
+    // same as in decode/encode: sched_reserve() checks the flag and clears it
+    sched_reserve();
+}
+
 int32_t llama_context::get_logits_topk_ith(int32_t i, const llama_token ** ids, const float ** logits_out) {
     output_reorder();
 
@@ -4509,6 +4514,10 @@ float * llama_get_logits(llama_context * ctx) {
 
 void llama_set_logits_topk(llama_context * ctx, int32_t k) {
     ctx->set_logits_topk(k);
+}
+
+void llama_reserve(llama_context * ctx) {
+    ctx->reserve_if_needed();
 }
 
 int32_t llama_get_logits_topk_ith(llama_context * ctx, int32_t i, const llama_token ** ids, const float ** logits) {
