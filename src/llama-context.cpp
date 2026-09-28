@@ -1170,14 +1170,25 @@ void llama_context::set_logits_topk(int32_t k) {
         }
     }
 
-    if (k == cparams.logits_topk && n_shards == cparams.logits_topk_shards) {
+    if (k == 0) {
+        // a request that does not use the top-k output keeps the graph: it still computes the full logits,
+        // which are copied as usual while the top-k output is off (no rebuild, no new compute buffer)
+        cparams.logits_topk_active = false;
+        return;
+    }
+
+    cparams.logits_topk_active = true;
+
+    // a graph with at least as many candidates per shard serves the request: the sparse rejection keeps the
+    // best k of the candidates it gets (common_sampler_sparse_p), so only a larger bucket rebuilds the graph
+    if (k <= cparams.logits_topk && n_shards == cparams.logits_topk_shards) {
         return;
     }
 
     LLAMA_LOG_DEBUG("%s: k = %d, n_shards = %d\n", __func__, k, n_shards);
 
     cparams.logits_topk        = k;
-    cparams.logits_topk_shards = k > 0 ? n_shards : 1;
+    cparams.logits_topk_shards = n_shards;
 
     sched_need_reserve = true;
 }
@@ -2300,7 +2311,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     };
 
     // with the top-k output only a single row still gets its full logits
-    const bool logits_topk_only = cparams.logits_topk > 0 && n_outputs_all > 1;
+    const bool logits_topk_only = cparams.logits_topk > 0 && cparams.logits_topk_active && n_outputs_all > 1;
     logits_full = !logits_topk_only;
 
     // start a new sampling transaction for this logical batch

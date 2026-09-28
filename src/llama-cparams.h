@@ -59,6 +59,8 @@ struct llama_cparams {
     int32_t logits_topk        = 0; // output only the top k logits of every row, see llama_set_logits_topk
     int32_t logits_topk_shards = 1; // vocab shards that select their candidates independently
 
+    bool    logits_topk_active = false; // the current request reads the top-k output (the graph may keep a top-k output while it is off)
+
     enum llama_context_type ctx_type;
     enum llama_rope_scaling_type rope_scaling_type;
     enum llama_pooling_type pooling_type;
