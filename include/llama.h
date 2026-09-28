@@ -1146,6 +1146,11 @@ extern "C" {
     // no particular order, a superset of its top k. 0 disables it.
     LLAMA_API void llama_set_logits_topk(struct llama_context * ctx, int32_t k);
 
+    // Reserve the compute buffers now if a setting changed the graph (e.g. llama_set_logits_topk), instead of on
+    // the next decode. Lets an application size device memory before loading other models (e.g. a multimodal
+    // projector) on the same devices.
+    LLAMA_API void llama_reserve(struct llama_context * ctx);
+
     // Candidates of the output for the ith token (indexed like llama_get_logits_ith): returns their
     // number and sets `ids` and `logits` to them, or returns 0 if the top-k output is not enabled.
     LLAMA_API int32_t llama_get_logits_topk_ith(

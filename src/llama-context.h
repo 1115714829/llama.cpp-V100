@@ -98,6 +98,7 @@ struct llama_context {
     float * get_logits_ith(int32_t i);
 
     void    set_logits_topk(int32_t k);
+    void    reserve_if_needed();
     int32_t get_logits_topk_ith(int32_t i, const llama_token ** ids, const float ** logits);
 
     float * get_embeddings();
