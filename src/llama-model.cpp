@@ -831,6 +831,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return {blck_size_perf};
         }
 
+        // output: whole blocks of 32 vocab rows per device, which the q8 skinny kernels need (n % 32 == 0);
+        // a split that is already a multiple of 32 per device (e.g. 4 devices) keeps its boundaries
+        if (std::regex_match(tensor_name, pattern_output_weight) || std::regex_match(tensor_name, pattern_output_bias)) {
+            GGML_ASSERT(segments.size() == 1);
+            return {32};
+        }
+
         // everything else
         GGML_ASSERT(segments.size() == 1);
         return {1};
