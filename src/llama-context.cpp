@@ -1157,7 +1157,9 @@ void llama_context::set_logits_topk(int32_t k) {
     // selects its own candidates, so the selection needs no data from the other devices
     int32_t n_shards = 1;
     if (k > 0 && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && model.output != nullptr) {
-        const ggml_backend_meta_split_state ss = llama_meta_device_get_split_state(model.output, (void *) &model.get_split_state_ud);
+        // the callback takes a non-const userdata but only reads it
+        const ggml_backend_meta_split_state ss = llama_meta_device_get_split_state(model.output,
+            const_cast<llama_meta_device_get_split_state_userdata *>(&model.get_split_state_ud));
         const size_t n_devs = model.get_split_state_ud.n_devices;
         bool even = ss.axis == GGML_BACKEND_SPLIT_AXIS_1 && ss.n_segments == 1 && ss.nr[0] == 1 && n_devs > 1 && ss.ne[0] >= k;
         for (size_t j = 1; even && j < n_devs; ++j) {
