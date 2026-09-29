@@ -1905,6 +1905,67 @@ bool llama_kv_cache::get_kq_range_ok(const slot_info & sinfo, const llama_ubatch
         return false;
     }
 
+    // single stream: keep the original single-stream logic, the multi-stream below scans per stream
+    if (sinfo.n_stream() == 1) {
+        if (ubatch.n_seqs_unq != 1 || ubatch.n_tokens == 0) {
+            return false;
+        }
+
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            if (ubatch.n_seq_id[i] != 1) {
+                return false;
+            }
+        }
+
+        const llama_seq_id s = ubatch.seq_id_unq[0];
+
+        const auto & cells = v_cells[sinfo.strm[0]];
+
+        const uint32_t n_used = cells.get_used();
+
+        if (n_used == 0 || n_used != cells.used_max_p1()) {
+            return false;
+        }
+
+        if (cells.seq_n_cells(s) != n_used) {
+            return false;
+        }
+
+        // the range [0, cell + 1) of a token equals its causal mask (see set_input_kq_mask) when the cells are in
+        // strict causal order: increasing positions, where the tokens of an image that share a position (M-RoPE)
+        // follow the order of the 2D causal mask
+        //
+        // this runs for every ubatch over all used cells: text has strictly increasing positions, which a
+        // branch-free scan checks (it vectorizes); only shared positions take the per-cell check
+        const llama_pos * pos = cells.pos_data();
+
+        int32_t not_increasing = 0;
+        for (uint32_t j = 1; j < n_used; ++j) {
+            not_increasing |= pos[j] <= pos[j - 1];
+        }
+
+        if (!not_increasing) {
+            return true;
+        }
+
+        for (uint32_t j = 1; j < n_used; ++j) {
+            if (pos[j] > pos[j - 1]) {
+                continue;
+            }
+
+            if (pos[j] < pos[j - 1]) {
+                return false;
+            }
+
+            const llama_kv_cell_ext & e_prev = cells.ext_get(j - 1);
+            if (!cells.ext_get(j).is_2d_gt(e_prev.x, e_prev.y)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     const uint32_t n_stream = (uint32_t) sinfo.n_stream();
 
     // one sequence per stream: the unified cache (a single stream shared by several sequences)

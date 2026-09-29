@@ -1681,7 +1681,7 @@ bool llama_context::layer_inp_sink_get(size_t token_offset, size_t n_tokens, flo
 }
 
 int32_t llama_context::layer_inp_sink_col(llama_seq_id seq_id, llama_pos pos) const {
-    if (t_layer_inp_sink == nullptr) {
+    if (t_layer_inp_sink == nullptr || cparams.n_seq_max == 1) {
         return -1;
     }
 
@@ -2358,8 +2358,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         llama_sampler_backend_begin(entry.second);
     }
 
-    // DFlash2: a new batch starts a new sink column order
-    if (t_layer_inp_sink != nullptr) {
+    // DFlash2: a new batch starts a new sink column order. With a single sequence the sink order is
+    // the batch order, so the mapping is not needed and is not maintained
+    if (t_layer_inp_sink != nullptr && cparams.n_seq_max > 1) {
         sink_cols.clear();
         sink_cols_by_seq.clear();
     }
@@ -2424,7 +2425,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         // DFlash2: remember which (seq_id, pos) produced each sink column of this ubatch. The sink
         // is written in ubatch order, and sink_cols.size() is the column of the next token, which
         // matches the token_offset passed to process_ubatch
-        if (t_layer_inp_sink != nullptr) {
+        if (t_layer_inp_sink != nullptr && cparams.n_seq_max > 1) {
             for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
                 const llama_seq_id seq_id = ubatch.seq_id[i][0];
                 sink_cols.emplace_back(seq_id, ubatch.pos[i]);
