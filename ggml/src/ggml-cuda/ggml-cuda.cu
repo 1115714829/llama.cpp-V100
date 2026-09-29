@@ -4559,7 +4559,9 @@ static int ggml_cuda_try_ssm_conv_rollback_fusion(ggml_backend_cuda_context * cu
 
 // Collects up to four MUL_MAT nodes starting at node_idx that share one src1 and read only
 // weights the q8 skinny multi-weight kernel can handle: repacked weights, or narrow row-major
-// Q8_0 weights (N is not a multiple of 32) that the kernel dot path reads directly.
+// Q8_0 weights (N is not a multiple of 32) that the kernel dot path reads directly. Above
+// M = 16 the M=32 kernel replaces the multi-weight kernel, so every weight must be repacked;
+// groups with a narrow weight fall through to the large-M fusion below.
 static int ggml_cuda_match_mul_mat_multi(const ggml_cgraph * cgraph, int node_idx,
                                          const ggml_tensor * src0s[4], ggml_tensor * dsts[4]) {
     const ggml_tensor * first = cgraph->nodes[node_idx];
@@ -4568,7 +4570,7 @@ static int ggml_cuda_match_mul_mat_multi(const ggml_cgraph * cgraph, int node_id
     }
     const ggml_tensor * src1 = first->src[1];
     if (src1 == nullptr || src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) ||
-            src1->ne[2] != 1 || src1->ne[3] != 1 || src1->ne[1] < 1 || src1->ne[1] > 16) {
+            src1->ne[2] != 1 || src1->ne[3] != 1 || src1->ne[1] < 1 || src1->ne[1] > 64) {
         return 0;
     }
     const int64_t k = first->src[0]->ne[0];
@@ -4586,7 +4588,7 @@ static int ggml_cuda_match_mul_mat_multi(const ggml_cgraph * cgraph, int node_id
         const bool repacked = ggml_cuda_q8_skinny_is_repacked(w);
         const bool narrow = w->type == GGML_TYPE_Q8_0 && w->view_src == nullptr && w->op == GGML_OP_NONE &&
                             w->ne[1] % 32 != 0;
-        if (w->ne[0] != k || (!repacked && !narrow)) {
+        if (w->ne[0] != k || (!repacked && (!narrow || src1->ne[1] > 16))) {
             break;
         }
         if (node->type != GGML_TYPE_F32 || !ggml_is_contiguous(node)) {
