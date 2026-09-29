@@ -116,3 +116,31 @@ Performance note: on the generic attention paths Q4_0 KV prefill is slower
 than Q8_0 KV (35K needle: 1080 vs 1300 tok/s; 145K needle: 585 vs 1019
 tok/s) because K/V are dequantized to F16 staging. This is the gap the P3
 sm70 Q4_0 KV kernels close.
+
+## P3 sm70 attention kernels with Q4_0 KV (this commit)
+
+- `fattn-sm70-grouped` (decode / speculative verify, n_q 2..16): Q4_0 added
+  next to F16/Q8_0. The register prefetch and staging already work per type;
+  `flash_attn_sm70_grouped_dequant_kv` grows a q4_0 branch and the launch
+  table covers all 9 K/V type pairs for both the 8- and 16-token variants.
+- `fattn-sm70-d256` (prefill, q >= 17): `sm70_d256_kv_type_ok` accepts q4_0
+  and a q4_0 twin of the range-mask partial mirror kernel converts only the
+  rows the mask bounds allow. The full-mirror fallback path is unchanged
+  (generic to_fp16_nc). The partial/full choice is now per K/V tensor, which
+  also fixes a latent bug where a mixed Q8_0 K with a non-F16 V ran the q8_0
+  row kernel over V.
+
+Q4_0 block layout gotcha (cost a debug round): the 32 values of a q4_0 block
+are not nibble-interleaved. Low nibbles of qs[0..15] hold values 0..15 and
+high nibbles hold values 16..31 (see the vec_dot_q4_0_q8_0 pairing in
+ggml/src/ggml-cpu/quants.c).
+
+Verified (2-way TP, Q4_K_M weights):
+- perplexity 2048: 2.7796 (baseline 2.7792); 8192: 2.6048 (baseline 2.6050)
+- needle tests 35K and 145K tokens: both correct
+- prefill with q4_0 KV now matches q8_0 KV: 35K 1307 vs 1309 tok/s,
+  145K 1017 vs 1020 tok/s (before this commit the generic path gave
+  1080 and 585 tok/s)
+- DFlash2 speculative decode with q4_0 KV works through the grouped verify
+  kernel (96-token run, sensible output)
+- test-backend-ops FLASH_ATTN_EXT hsk=256 and MUL_MAT: pass; test-cuda-allreduce: ALL_OK
