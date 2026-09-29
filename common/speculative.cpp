@@ -1159,6 +1159,166 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         bool warned_sink_col = false;
 
+        // DFlash2 cross-sequence merge: group all mapped tokens of the batch by sink column, so
+        // tokens of concurrent sequences that form a contiguous sink range are injected with one
+        // draft decode instead of one decode per sequence
+        struct inject_tok {
+            llama_seq_id seq_id;
+            llama_pos    pos;
+            int32_t      sink_col;
+        };
+
+        std::vector<inject_tok> toks;
+        toks.reserve(n_tokens);
+        if (map_sink_col) {
+            int32_t n_seq_inj = 0;
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                n_seq_inj += i_batch_beg[seq_id] >= 0;
+            }
+
+            if (n_seq_inj > 1) {
+                bool all_mapped = true;
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq && all_mapped; ++seq_id) {
+                    if (i_batch_beg[seq_id] < 0) {
+                        continue;
+                    }
+                    for (int32_t k = i_batch_beg[seq_id]; k <= i_batch_end[seq_id]; ++k) {
+                        const int32_t col = llama_layer_inp_sink_col(ctx_tgt, seq_id, batch_in.pos[k]);
+                        if (col < 0) {
+                            all_mapped = false;
+                            break;
+                        }
+                        toks.push_back({ seq_id, batch_in.pos[k], col });
+                    }
+                }
+                if (!all_mapped) {
+                    toks.clear();
+                }
+            }
+        }
+
+        if (!toks.empty()) {
+            // sink column order is the target decode order; it also keeps the tokens of each
+            // sequence in position order
+            std::sort(toks.begin(), toks.end(), [](const inject_tok & a, const inject_tok & b) {
+                return a.sink_col < b.sink_col;
+            });
+
+            const char * fname = __func__;
+
+            auto inject = [&](const inject_tok * t, int32_t n_run, int32_t col_run) -> bool {
+                batch_inject.n_tokens = n_run;
+
+                if (link_ready) {
+                    // batch_inject.embd stays as a placeholder; process_ubatch copies the sink
+                    llama_set_embd_source(ctx_dft, true, col_run);
+                } else {
+                    llama_set_embd_source(ctx_dft, false, 0);
+
+                    // the features are on the target device: read back the columns of this run
+                    if (!llama_layer_inp_sink_get(ctx_tgt, (size_t) col_run, (size_t) n_run, batch_inject.embd)) {
+                        LOG_ERR("%s: failed to read the target feature sink\n", fname);
+                        return false;
+                    }
+                }
+
+                for (int32_t i = 0; i < n_run; ++i) {
+                    const llama_pos p = t[i].pos;
+                    batch_inject.pos[i] = p;
+                    if (is_mrope) {
+                        batch_inject.pos[1 * n_run + i] = p;
+                        batch_inject.pos[2 * n_run + i] = p;
+                        batch_inject.pos[3 * n_run + i] = 0;
+                    }
+                    batch_inject.n_seq_id[i]  = 1;
+                    batch_inject.seq_id[i][0] = t[i].seq_id;
+                    batch_inject.logits[i]    = false;
+                }
+
+                const int32_t rc = llama_decode(ctx_dft, batch_inject);
+                if (rc != 0) {
+                    LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, col=%d)\n",
+                            fname, rc, n_run, col_run);
+                    return false;
+                }
+
+                return true;
+            };
+
+            // cut the column order into runs of consecutive columns, then into ubatch-sized pieces
+            for (int32_t run_beg = 0; run_beg < (int32_t) toks.size(); ) {
+                int32_t run_end = run_beg + 1;
+                while (run_end < (int32_t) toks.size() && toks[run_end].sink_col == toks[run_end - 1].sink_col + 1) {
+                    ++run_end;
+                }
+
+                for (int32_t i_run = run_beg; i_run < run_end; i_run += n_ubatch) {
+                    const int32_t n_piece = std::min(n_ubatch, run_end - i_run);
+                    const inject_tok * piece = toks.data() + i_run;
+
+                    // the device path maps draft batch row i to sink column col_run + i, so the
+                    // draft batch must stay in sink order. split_equal() groups a multi-sequence
+                    // batch by sequence, which keeps that order only if each sequence appears as
+                    // one block, the sequence ids grow consecutively and all blocks but the last
+                    // have the same size. otherwise, decode the piece per sequence
+                    bool one_ubatch = true;
+                    {
+                        llama_seq_id prev_seq = -1;
+                        int32_t n_first = 0;
+                        int32_t n_cur   = 0;
+                        for (int32_t i = 0; i < n_piece; ++i) {
+                            const auto & t = piece[i];
+                            if (t.seq_id != prev_seq) {
+                                if (n_cur > 0) {
+                                    if (n_first == 0) {
+                                        n_first = n_cur;
+                                    } else if (n_cur != n_first) {
+                                        one_ubatch = false;
+                                    }
+                                }
+                                if (prev_seq >= 0 && t.seq_id != prev_seq + 1) {
+                                    one_ubatch = false;
+                                }
+                                prev_seq = t.seq_id;
+                                n_cur    = 1;
+                            } else {
+                                ++n_cur;
+                                if (t.pos <= piece[i - 1].pos) {
+                                    one_ubatch = false;
+                                }
+                            }
+                        }
+                        if (n_first > 0 && n_cur < n_first) {
+                            one_ubatch = false;
+                        }
+                    }
+
+                    if (one_ubatch) {
+                        if (!inject(piece, n_piece, piece[0].sink_col)) {
+                            return false;
+                        }
+                    } else {
+                        for (int32_t i = 0; i < n_piece; ) {
+                            const llama_seq_id seq_cur = piece[i].seq_id;
+                            int32_t j = i + 1;
+                            while (j < n_piece && piece[j].seq_id == seq_cur &&
+                                   piece[j].sink_col == piece[j - 1].sink_col + 1) {
+                                ++j;
+                            }
+                            if (!inject(piece + i, j - i, piece[i].sink_col)) {
+                                return false;
+                            }
+                            i = j;
+                        }
+                    }
+                }
+
+                run_beg = run_end;
+            }
+
+            return true;
+        }
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
                 continue;
