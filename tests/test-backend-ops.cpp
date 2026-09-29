@@ -5193,16 +5193,21 @@ struct test_gated_delta_net : public test_case {
     const bool    permuted;
     const bool    kda;
     const int64_t K; // snapshot slot count: 1 = final-only, >1 = last K states
+    const double  nmse_threshold; // 0 = test_case default
 
     std::string vars() override {
         return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
     }
 
+    double max_nmse_err() override {
+        return nmse_threshold > 0.0 ? nmse_threshold : test_case::max_nmse_err();
+    }
+
     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
-            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1)
+            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1, double nmse_threshold = 0.0)
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
-          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K) {}
+          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), nmse_threshold(nmse_threshold) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q;
@@ -12174,6 +12179,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 2048, 1, 3, false, false, /*K=*/1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 2048, 1, 3, false, false, /*K=*/8));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 2100, 1, 3, false, false, /*K=*/8));
+
+    // sm_70 chunked prefill at per-device head splits other than TP4 (H_v = 3 * H_k),
+    // with long sequences and a tail that is not a multiple of the chunk size. The
+    // chunked path stages q/k/v/a through f16, so it needs a looser NMSE bound than
+    // the f32 recurrent kernel.
+    for (int64_t head_count : {2, 3, 4, 5, 6, 8, 16}) {
+        for (int64_t n_seq_tokens : {200, 1000, 2085}) {
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, head_count, 128, n_seq_tokens, 1, 3, false, false, /*K=*/1, 5e-6));
+        }
+    }
 
     // gdn + cache cpy fusion (K > 1)
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2));

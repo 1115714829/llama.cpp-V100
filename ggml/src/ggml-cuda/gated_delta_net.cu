@@ -375,6 +375,8 @@ static void ggml_cuda_op_gated_delta_net_impl(
             args.beta     = b_d;
             args.s0       = s_d;
             args.n_tokens = n_c;
+            args.H        = H;
+            args.H_k      = neqk1;
             args.dst      = dst_d;
             args.h_out    = h_mid.get();
             ggml_cuda_gdn_chunk_sm70(ctx, args);
