@@ -57,11 +57,12 @@ template <> struct qskinny_codec<GGML_TYPE_Q4_K> {
     // One record holds 16 nibbles in physical order. The m8n8k4 B fragment pairs physical
     // slots (s, s+4), exactly like the Q8_0 decoder pairs bytes (i, i+4).
     static __device__ __forceinline__ void decode_record(const record_t rec, half2 out[8]) {
+        // the second byte goes to result byte 2, where the mask below reads it
         const unsigned pairs[4] = {
-            __byte_perm(rec.x, 0, 0x0020),  // bytes (0, 2)
-            __byte_perm(rec.x, 0, 0x0031),  // bytes (1, 3)
-            __byte_perm(rec.y, 0, 0x0020),  // bytes (4, 6)
-            __byte_perm(rec.y, 0, 0x0031),  // bytes (5, 7)
+            __byte_perm(rec.x, 0, 0x0200),  // bytes (0, 2)
+            __byte_perm(rec.x, 0, 0x0301),  // bytes (1, 3)
+            __byte_perm(rec.y, 0, 0x0200),  // bytes (4, 6)
+            __byte_perm(rec.y, 0, 0x0301),  // bytes (5, 7)
         };
         const unsigned offset_bits = 0x64006400u; // f16 1024 in both halves
         const half2 offset = *reinterpret_cast<const half2 *>(&offset_bits);
