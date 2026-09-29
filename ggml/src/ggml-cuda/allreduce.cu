@@ -748,7 +748,8 @@ static bool ggml_cuda_ar_allreduce_copy_outer(
 bool ggml_cuda_ar_allreduce(
         ggml_cuda_ar_pipeline * p,
         ggml_backend_t        * backends,
-        ggml_tensor           ** tensors) {
+        ggml_tensor           ** tensors,
+        bool                    exact) {
     GGML_ASSERT(p != nullptr);
 
     const int n = p->n_devices;
@@ -764,10 +765,12 @@ bool ggml_cuda_ar_allreduce(
 
     // BF16 round-trip: F32 inputs >= bf16_threshold are converted to BF16 for
     // the reduction (chunked or copy-engine), halving on-wire bytes. Matches
-    // NCCL's behaviour. The pre-conversion zeroes inactive shards so the
-    // inner paths see them as already-prepared compute tensors.
+    // NCCL's behaviour. Skipped for exact collectives, which must stay bitwise.
+    // The pre-conversion zeroes inactive shards so the inner paths see them as
+    // already-prepared compute tensors.
     const bool use_bf16 =
         input_type == GGML_TYPE_F32 &&
+        !exact &&
         p->bf16_threshold > 0 &&
         input_nbytes >= p->bf16_threshold;
 
@@ -970,7 +973,7 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int *, size_t) {
 }
 void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline *) {
 }
-bool ggml_cuda_ar_allreduce(ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tensor **) {
+bool ggml_cuda_ar_allreduce(ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tensor **, bool) {
     return false;
 }
 

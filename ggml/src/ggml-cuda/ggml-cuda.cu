@@ -1137,9 +1137,9 @@ static bool ggml_backend_cuda_comm_allreduce_nccl_rank(
 
 // Run the internal AR pipeline.  Returns false on unsupported / failed input
 // -- the caller decides whether to abort (env-forced) or fall back silently.
-// `exact` is ignored: for F32 this path is exact anyway.
+// exact is forwarded to the pipeline: it disables the BF16 wire round-trip.
 static bool ggml_backend_cuda_comm_allreduce_internal(
-        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors, bool /*exact*/) {
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors, bool exact) {
     GGML_ASSERT(comm_ctx->ar_pipeline != nullptr);
 
     const size_t n_backends = comm_ctx->backends.size();
@@ -1179,10 +1179,9 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
                            __func__, i, tensors[i]->data, (int) type, ne);
             return false;
         }
-        GGML_ASSERT((ggml_nbytes(tensors[i]) & 0xF) == 0);
     }
 
-    return ggml_cuda_ar_allreduce(comm_ctx->ar_pipeline, comm_ctx->backends.data(), tensors);
+    return ggml_cuda_ar_allreduce(comm_ctx->ar_pipeline, comm_ctx->backends.data(), tensors, exact);
 }
 
 // ---------------------------------------------------------------------------
