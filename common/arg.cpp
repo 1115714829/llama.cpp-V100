@@ -1700,6 +1700,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CTX_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--prefill-pace-steps"}, "N",
+        string_format("while a request is generating, process prompt chunks of other requests only every N steps (default: %d, 0 = disabled)\n"
+            "protects the generation speed of running requests at the cost of a slower time-to-first-token for new requests", params.n_prefill_pace_steps),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("prefill-pace-steps must be non-negative");
+            }
+            params.n_prefill_pace_steps = value;
+        }
+    ).set_env("LLAMA_ARG_PREFILL_PACE_STEPS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cms", "--checkpoint-min-step"}, "N",
         string_format("minimum spacing between context checkpoints in tokens (default: %d, 0 = no minimum)", params.checkpoint_min_step),
         [](common_params & params, int value) {
