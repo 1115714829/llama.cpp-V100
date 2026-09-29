@@ -133,6 +133,9 @@ LLAMA_API void llama_set_embd_source(struct llama_context * ctx, bool enable, in
 // in the same per-token layer order as the injection embd rows. Requires a sink.
 LLAMA_API bool llama_layer_inp_sink_get(struct llama_context * ctx, size_t token_offset, size_t n_tokens, float * dst);
 
+// DFlash2: the target sink column of token (seq_id, pos) of the last decoded batch, -1 if not in the sink
+LLAMA_API int32_t llama_layer_inp_sink_col(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos);
+
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
 //
