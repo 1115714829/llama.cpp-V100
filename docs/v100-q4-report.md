@@ -120,3 +120,31 @@ Q4_K_M 权重 + Q4_0 KV，2-way TP，`-c 147456 -b 2048 -ub 2048`，合成文本
   `GGML_CUDA_FA=ON`，`GGML_CUDA_GRAPHS=ON`，`GGML_CUDA_NCCL=ON`
 
 详细开发记录见 [v100-q4-support.md](v100-q4-support.md)。
+
+## Q4 路由核查（nsys 内核级证据）
+
+Q4_0 KV 走 sm70 专用内核而非通用回退：
+- 预填充：`flash::sm70_d256_splitd_dense_kernel` + `sm70_d256_dequant_q4_0_rows`
+  （range mask 部分镜像）+ `sm70_d256_range_bounds/stage_q/scatter`
+- 解码/投机验证：`flash_attn_ext_sm70_grouped<8|16, Q4_0, Q4_0>`（8 与 16 token 变体）
+
+Q4_K_M 权重走通用路径（P4 决策符合预期）：
+- `mul_mat_q<Q4_K/Q5_K/Q6_K>`（mmq）+ `mul_mat_vec_q<...>`（mmvq，小 M）+ cuBLAS
+  sgemm（大 M，符合 should_use_mmq 在 V100 的阈值）
+- trace 中无任何 skinny/repack 内核，Q4_K 被 can_repack 正确拒绝
+
+## 与 ~/llamacpp/llama.cpp-latest 的基准对比（同参数）
+
+llama.cpp-latest（0.3.0-dev，2026-08-27 构建的源码快照，无 .git）：
+
+| 用例 | 本分支 | llama.cpp-latest | 差距 |
+|---|---:|---:|---:|
+| 16K prefill | 1755.6 tok/s | 1723.7 tok/s | +1.8% |
+| 16K decode | 52.4 tok/s | 46.2 tok/s | +13.4% |
+| 128K prefill | 1250.6 tok/s | 915.7 tok/s | +36.6% |
+| 128K decode | 31.3 tok/s | 28.9 tok/s | +8.3% |
+| 显存/卡 | 10.7 GB | 11.2 GB | -0.5 GB |
+
+128K 预填充的 +36.6% 主要来自 sm70 d256 Q4_0 KV 内核。对比差异说明：
+llama.cpp-latest 的部署脚本带 `GGML_CUDA_P2P=1`、`GGML_CUDA_SCALE_LAUNCH_QUEUES=4x`
+等环境变量，对比按同命令行未启用这些变量。
