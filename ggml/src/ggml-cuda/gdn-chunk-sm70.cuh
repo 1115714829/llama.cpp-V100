@@ -18,11 +18,13 @@ struct ggml_cuda_gdn_chunk_args {
     bool    l2norm;                            // apply x * rsqrtf(ss/128 + eps) * scale in the prep kernel
     float   eps_q, scale_q, eps_k, scale_k;
     const float * v; int64_t sv1, sv2;         // strides in floats (head, token)
-    const float * g; const float * beta;       // contiguous [T][12]
-    const float * s0;                          // initial state [12][128][128]
+    const float * g; const float * beta;       // contiguous [T][H]
+    const float * s0;                          // initial state [H][128][128]
     int64_t n_tokens;                          // tokens processed by the chunked path (multiple of 64)
-    float * dst;                               // attention output, f32 [n_tokens][12][128]
-    float * h_out;                             // state after n_tokens tokens, [12][128][128]
+    int64_t H;                                 // number of v heads
+    int64_t H_k;                               // number of q/k heads
+    float * dst;                               // attention output, f32 [n_tokens][H][128]
+    float * h_out;                             // state after n_tokens tokens, [H][128][128]
 };
 
 // leading tokens for the chunked path (a multiple of 64, leaving >= K and >= 1 tokens for the recurrent kernel), 0 if not applicable
