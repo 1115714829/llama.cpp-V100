@@ -154,6 +154,7 @@ constexpr int kGroupedVerifyKVStride     = 264;
 constexpr int kGroupedVerifyScoreStride  = 64;
 constexpr int kGroupedVerifyProbStride   = 72; // BlockN + 8 half, keeps the WMMA A loads conflict free
 constexpr int kGroupedVerifyKVQ8RowBytes = 272; // 8 q8_0 blocks of 34 B
+constexpr int kGroupedVerifyKVQ4RowBytes = 144; // 8 q4_0 blocks of 18 B
 constexpr int kGroupedVerifyThreads      = 512;
 constexpr int kGroupedVerifyWarps        = kGroupedVerifyThreads / WARP_SIZE;
 constexpr int kGroupedVerifyQKWarps      = (kGroupedVerifyRows / 16) * (kGroupedVerifyBlockN / 16);
@@ -232,8 +233,9 @@ __device__ __forceinline__ float warp_reduce_max(float val) {
 // owns a contiguous row block of the staging buffer, see kGroupedVerifyStageRowsPerWarp.
 template <ggml_type type_KV>
 struct GroupedVerifyKVRegs {
-    static constexpr int kRowBytes  = type_KV == GGML_TYPE_F16 ? kGroupedVerifyHeadDim * (int) sizeof(__half)
-                                                               : kGroupedVerifyKVQ8RowBytes;
+    static constexpr int kRowBytes  = type_KV == GGML_TYPE_F16  ? kGroupedVerifyHeadDim * (int) sizeof(__half)
+                                     : type_KV == GGML_TYPE_Q4_0 ? kGroupedVerifyKVQ4RowBytes
+                                                                 : kGroupedVerifyKVQ8RowBytes;
     static constexpr int kVecsPerRow  = kRowBytes / 16;
     static constexpr int kVecsPerWarp = kGroupedVerifyStageRowsPerWarp * kVecsPerRow;
     static constexpr int kVecsPerThread = (kVecsPerWarp + WARP_SIZE - 1) / WARP_SIZE;
@@ -249,6 +251,15 @@ __device__ __forceinline__ __half2 grouped_verify_q8_pair_half2(const uint32_t p
     return __hmul2(d2, q);
 }
 
+// Unpack one q4_0 value pair (two code bytes) and scale it by d, all in half precision.
+// q4_0 packs values 0..15 into the low nibbles of qs[0..15] and 16..31 into the high nibbles.
+__device__ __forceinline__ __half2 grouped_verify_q4_pair_half2(const uint8_t b0, const uint8_t b1, const bool hi_half, const __half2 d2) {
+    const __half2 q = __halves2half2(
+        __short2half_rn((int) (hi_half ? (b0 >> 4) : (b0 & 0xf)) - 8),
+        __short2half_rn((int) (hi_half ? (b1 >> 4) : (b1 & 0xf)) - 8));
+    return __hmul2(d2, q);
+}
+
 __device__ __forceinline__ uint32_t grouped_verify_half2_uint(const __half2 h) {
     uint32_t u;
     memcpy(&u, &h, sizeof(u));
@@ -261,7 +272,8 @@ __device__ __forceinline__ void flash_attn_sm70_grouped_prefetch_kv(
         GroupedVerifyKVRegs<type_KV> & regs,
         const char * __restrict__ KV, const int64_t nb11, const int64_t nb12, const int64_t nb13,
         const int seq, const int kv_head, const int tile_start, const int n_kv) {
-    static_assert(type_KV == GGML_TYPE_F16 || type_KV == GGML_TYPE_Q8_0, "unsupported KV type");
+    static_assert(type_KV == GGML_TYPE_F16 || type_KV == GGML_TYPE_Q8_0 || type_KV == GGML_TYPE_Q4_0,
+                  "unsupported KV type");
     constexpr int kVecsPerRow  = GroupedVerifyKVRegs<type_KV>::kVecsPerRow;
     constexpr int kVecsPerWarp = GroupedVerifyKVRegs<type_KV>::kVecsPerWarp;
     const int warp_id  = threadIdx.x / WARP_SIZE;
@@ -310,7 +322,7 @@ __device__ __forceinline__ void flash_attn_sm70_grouped_store_kv(
     }
 }
 
-// Dequantize a staged q8_0 tile into the half panel. No-op for fp16, which is stored there directly.
+// Dequantize a staged quantized tile into the half panel. No-op for fp16, which is stored there directly.
 // Only the staging rows of this warp are read back, see kGroupedVerifyStageRowsPerWarp.
 template <ggml_type type_KV>
 __device__ __forceinline__ void flash_attn_sm70_grouped_dequant_kv(
@@ -321,6 +333,9 @@ __device__ __forceinline__ void flash_attn_sm70_grouped_dequant_kv(
     constexpr int kColsPerItem = 8;
     constexpr int kGroupsPerRow = kGroupedVerifyHeadDim / kColsPerItem;
     constexpr int kItemsPerWarp = kGroupedVerifyStageRowsPerWarp * kGroupsPerRow;
+    constexpr int kBlockBytes   = type_KV == GGML_TYPE_Q4_0 ? 18 : 34;
+    constexpr int kRowBytes     = type_KV == GGML_TYPE_Q4_0 ? kGroupedVerifyKVQ4RowBytes
+                                                            : kGroupedVerifyKVQ8RowBytes;
     const int warp_id  = threadIdx.x / WARP_SIZE;
     const int lane_id  = threadIdx.x % WARP_SIZE;
     const int row_base = warp_id * kGroupedVerifyStageRowsPerWarp;
@@ -329,16 +344,26 @@ __device__ __forceinline__ void flash_attn_sm70_grouped_dequant_kv(
         const int row = row_base + idx / kGroupsPerRow;
         const int c   = (idx % kGroupsPerRow) * kColsPerItem;
         const int blk = c / 32;
-        const int base = row * kGroupedVerifyKVQ8RowBytes + blk * 34;
+        const int base = row * kRowBytes + blk * kBlockBytes;
         const __half d = *reinterpret_cast<const __half *>(kv_stage + base);
         const __half2 d2 = __half2half2(d);
-        // 8 columns = 16 B, and base + 2 + (c % 32) is even, so use u16 loads and one uint4 store.
-        const uint16_t * packed = reinterpret_cast<const uint16_t *>(kv_stage + base + 2 + (c % 32));
         uint4 out;
-        out.x = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(packed[0], d2));
-        out.y = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(packed[1], d2));
-        out.z = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(packed[2], d2));
-        out.w = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(packed[3], d2));
+        if constexpr (type_KV == GGML_TYPE_Q4_0) {
+            // 8 columns = 8 values of one nibble half; codes are 8 consecutive bytes.
+            const uint8_t * codes = kv_stage + base + 2 + (c & 15);
+            const bool hi_half = (c % 32) >= 16;
+            out.x = grouped_verify_half2_uint(grouped_verify_q4_pair_half2(codes[0], codes[1], hi_half, d2));
+            out.y = grouped_verify_half2_uint(grouped_verify_q4_pair_half2(codes[2], codes[3], hi_half, d2));
+            out.z = grouped_verify_half2_uint(grouped_verify_q4_pair_half2(codes[4], codes[5], hi_half, d2));
+            out.w = grouped_verify_half2_uint(grouped_verify_q4_pair_half2(codes[6], codes[7], hi_half, d2));
+        } else {
+            // 8 columns = 16 B, and base + 2 + (c % 32) is even, so use u16 loads and one uint4 store.
+            const uint16_t * packed = reinterpret_cast<const uint16_t *>(kv_stage + base + 2 + (c % 32));
+            out.x = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(packed[0], d2));
+            out.y = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(packed[1], d2));
+            out.z = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(packed[2], d2));
+            out.w = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(packed[3], d2));
+        }
         __half * out_ptr = reinterpret_cast<__half *>(shared_kv + row * kGroupedVerifyKVStride) + c;
         *reinterpret_cast<uint4 *>(out_ptr) = out;
     }
@@ -610,10 +635,10 @@ static __global__ void flash_attn_ext_sm70_grouped(
             flash_attn_sm70_grouped_prefetch_kv<type_K>(
                 k_regs, K, nb11, nb12, nb13, seq, kv_head, tile_start + kGroupedVerifyBlockN, n_kv);
         }
-        if constexpr (type_V == GGML_TYPE_Q8_0) {
-            // The staging buffer is free again once the K dequantize is done. For q8_0
-            // the raw V tile waits there until the K panel dies after QK. The next V
-            // tile starts loading right away so its latency hides behind QK.
+        if constexpr (type_V != GGML_TYPE_F16) {
+            // The staging buffer is free again once the K dequantize is done. For a
+            // quantized V the raw tile waits there until the K panel dies after QK.
+            // The next V tile starts loading right away so its latency hides behind QK.
             flash_attn_sm70_grouped_store_kv<type_V>(shared_kv, kv_stage, v_regs);
             if (has_next) {
                 flash_attn_sm70_grouped_prefetch_kv<type_V>(
@@ -648,7 +673,7 @@ static __global__ void flash_attn_ext_sm70_grouped(
 
         grouped_verify_softmax_tile(
             shared_scores, shared_probs, smem.row_max, smem.row_sum, smem.row_scale, row_mask, warp_id, lane_id);
-        if constexpr (type_V == GGML_TYPE_Q8_0) {
+        if constexpr (type_V != GGML_TYPE_F16) {
             flash_attn_sm70_grouped_dequant_kv<type_V>(shared_kv, kv_stage);
         }
         // row_scale is written by every warp and read by every warp below, so the
