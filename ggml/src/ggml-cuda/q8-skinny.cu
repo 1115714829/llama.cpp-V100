@@ -6,6 +6,7 @@
 
 #include "common.cuh"
 #include "convert.cuh"
+#include "q-skinny-common.cuh"
 #include "q8-skinny.cuh"
 
 #include <algorithm>
@@ -27,21 +28,6 @@ static int q8_skinny_split_k(const int64_t k) {
 }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-
-// ---- 1Cat fp8_qpn8_sm70.cu:39-50 (lane/column mapping, unchanged) ----
-
-__device__ __forceinline__ int qpn8_col_from_lane(int lane) {
-    return ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) ? 4 : 0);
-}
-
-__device__ __forceinline__ int qpn8_lane_from_col(int col) {
-    return (col & 3) | (((col >> 3) & 3) << 2) | (((col >> 2) & 1) << 4);
-}
-
-__device__ __forceinline__ int qpn8_physical_k(int logical_k) {
-    const int local = logical_k & 7;
-    return (logical_k & 8) + (local >> 1) + ((local & 1) << 2);
-}
 
 // ---- int8 decoder (replaces the 1Cat FP8 decoder) ----
 

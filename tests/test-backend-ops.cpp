@@ -10847,6 +10847,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, 5120, {1, 1}, {1, 1}));
 
+    // Q4_K skinny GEMM (repacked codes + raw super-block meta, sm_70): M <= 16 runs the
+    // single-stage kernel, M = 17..64 expands the repacked weights to F16 and uses the regular
+    // dense path. The kernel rounds d*sc and dmin*m to F16 once per 32 values, a relative error
+    // of <= 2^-11 on a constant per sub-block, so the default 5e-4 NMSE of test_mul_mat covers it.
+    const std::vector<std::pair<int64_t, int64_t>> q4_k_skinny_shapes = {
+        { 4096, 5120}, { 5120, 4096}, { 256, 5120},
+    };
+    for (const auto & [n_out, k_red] : q4_k_skinny_shapes) {
+        for (int64_t n_tokens : {1, 2, 8, 16, 17, 32, 64}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, n_out, n_tokens, k_red, {1, 1}, {1, 1}));
+        }
+    }
+
     // Q8_0 skinny gated pair: both matmuls and the SWIGLU in one kernel on sm_70, M > 16 as two
     // M=32 kernels plus the elementwise SWIGLU
     for (int64_t n_tokens : {1, 8, 16, 24, 32, 48, 64}) {
