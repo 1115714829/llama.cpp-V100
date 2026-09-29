@@ -1887,8 +1887,13 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
 }
 
 bool llama_kv_cache::get_kq_range_reserve() const {
-    // a single sequence in causal order (see get_kq_range_ok) takes range masks for all its ubatches
-    return kq_range_enabled && swa_type == LLAMA_SWA_TYPE_NONE && n_stream == 1 && n_seq_max == 1;
+    // a single sequence in causal order (see get_kq_range_ok) takes range masks for all its ubatches;
+    // a non-unified cache with one sequence per stream can do the same per stream - the unified cache,
+    // where one stream is shared by several sequences, keeps the dense mask
+    // note: ubatches that fail get_kq_range_ok (e.g. holes from a context shift) fall back to the dense
+    //       mask and grow the buffer as needed, same as for a single sequence
+    return kq_range_enabled && swa_type == LLAMA_SWA_TYPE_NONE &&
+        (n_seq_max == 1 ? n_stream == 1 : n_stream == n_seq_max);
 }
 
 bool llama_kv_cache::get_kq_range_ok(const slot_info & sinfo, const llama_ubatch & ubatch) const {
