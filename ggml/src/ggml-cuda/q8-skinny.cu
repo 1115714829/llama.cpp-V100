@@ -815,6 +815,170 @@ static void q8_skinny_mul_mat_launch(const uint8_t * codes, const half * scales,
 
 #undef Q8_SKINNY_LAUNCH
 
+// ---- 1Cat fp8_qpn8_sm70.cu:445-573 (M=32 two-phase kernel, adapted) ----
+
+// M=32 needs four 8-row accumulator tiles. Keeping all logical split-K warps resident would
+// need 64 KiB of reduction storage for split-16, so half of the physical warps run the
+// original logical warp ranges in two ordered phases. The compact first-half sum keeps the
+// final reduction in the p0 + ... + p(SplitK-1) order at 36 KiB of shared memory. As in
+// q8_skinny_kernel, the FP8 decoder is replaced by s8x8_to_half2x4 plus the Q8_0 block
+// scale (one scale per two 16-element groups).
+template <int SplitK>
+__global__ void q8_skinny_m32_kernel(
+    const uint8_t * __restrict__ codes, const half * __restrict__ scales,
+    const half * __restrict__ input, float * __restrict__ output,
+    int n, int k, int m) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    static_assert(SplitK == 12 || SplitK == 16,
+                  "Q8 skinny M=32 two-phase kernel supports split-12 or split-16");
+    constexpr int kPhysicalWarps = SplitK / 2;
+    constexpr int kRowTiles = 4;
+    constexpr int kOutputElements = kRowTiles * 256;
+    __shared__ float reduction_storage[kPhysicalWarps + 1][kOutputElements];
+
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int tile = blockIdx.x;
+    const int quadpair = (lane >> 2) & 3;
+    const int row = (lane & 3) + ((lane & 16) ? 4 : 0);
+    const int groups_k16 = k >> 4;
+    const int groups_per_warp = groups_k16 / SplitK;
+    const uint4 * code_ptr = reinterpret_cast<const uint4 *>(codes) +
+                             (size_t) tile * groups_k16 * 32 + lane;
+    const half * scale_ptr = scales + tile * 32 + lane;
+
+#pragma unroll
+    for (int phase = 0; phase < 2; ++phase) {
+        float accum[kRowTiles][2][8];
+#pragma unroll
+        for (int row_tile = 0; row_tile < kRowTiles; ++row_tile) {
+#pragma unroll
+            for (int chain = 0; chain < 2; ++chain) {
+#pragma unroll
+                for (int index = 0; index < 8; ++index) {
+                    accum[row_tile][chain][index] = 0.0f;
+                }
+            }
+        }
+
+        const int logical_warp = warp + phase * kPhysicalWarps;
+        const int group_begin = logical_warp * groups_per_warp;
+        int loaded_scale_group = -1;
+        half loaded_scale = __float2half(0.0f);
+#pragma unroll 4
+        for (int group = group_begin; group < group_begin + groups_per_warp; ++group) {
+            const int scale_group = group >> 1;
+            if (scale_group != loaded_scale_group) {
+                loaded_scale = __ldg(scale_ptr + (size_t) scale_group * n);
+                loaded_scale_group = scale_group;
+            }
+
+            const uint4 packed = __ldcs(code_ptr + (size_t) group * 32);
+            half2 weights[8];
+            s8x8_to_half2x4(make_uint2(packed.x, packed.y), weights);
+            s8x8_to_half2x4(make_uint2(packed.z, packed.w), weights + 4);
+
+            const half2 scale2 = __halves2half2(loaded_scale, loaded_scale);
+#pragma unroll
+            for (int index = 0; index < 8; ++index) {
+                weights[index] = __hmul2(weights[index], scale2);
+            }
+
+            const unsigned * b = reinterpret_cast<const unsigned *>(weights);
+#pragma unroll
+            for (int row_tile = 0; row_tile < kRowTiles; ++row_tile) {
+                uint4 input01 = make_uint4(0, 0, 0, 0);
+                uint4 input23 = make_uint4(0, 0, 0, 0);
+                const int input_row_idx = row_tile * 8 + row;
+                if (input_row_idx < m) {
+                    const half * input_row = input + (size_t) input_row_idx * k;
+                    input01 = *reinterpret_cast<const uint4 *>(input_row + group * 16);
+                    input23 = *reinterpret_cast<const uint4 *>(input_row + group * 16 + 8);
+                }
+                const unsigned * a0 = reinterpret_cast<const unsigned *>(&input01);
+                const unsigned * a1 = reinterpret_cast<const unsigned *>(&input23);
+                Q8_SKINNY_MMA_8N8K4(accum[row_tile][0], a0[0], a0[1], b[0], b[1]);
+                Q8_SKINNY_MMA_8N8K4(accum[row_tile][1], a0[2], a0[3], b[2], b[3]);
+                Q8_SKINNY_MMA_8N8K4(accum[row_tile][0], a1[0], a1[1], b[4], b[5]);
+                Q8_SKINNY_MMA_8N8K4(accum[row_tile][1], a1[2], a1[3], b[6], b[7]);
+            }
+        }
+
+#pragma unroll
+        for (int row_tile = 0; row_tile < kRowTiles; ++row_tile) {
+#pragma unroll
+            for (int index = 0; index < 8; ++index) {
+                accum[row_tile][0][index] += accum[row_tile][1][index];
+                const int output_row =
+                    row_tile * 8 + (index & 2) + ((lane & 16) ? 4 : 0) + (lane & 1);
+                const int output_col =
+                    (index & 1) | (((lane >> 1) & 1) << 1) | ((index >> 2) << 2);
+                reduction_storage[warp][output_row * 32 + quadpair * 8 + output_col] =
+                    accum[row_tile][0][index];
+            }
+        }
+        __syncthreads();
+
+        for (int element = threadIdx.x; element < kOutputElements;
+             element += blockDim.x) {
+            float value = phase == 0 ? 0.0f : reduction_storage[kPhysicalWarps][element];
+#pragma unroll
+            for (int k_warp = 0; k_warp < kPhysicalWarps; ++k_warp) {
+                value += reduction_storage[k_warp][element];
+            }
+            if (phase == 0) {
+                reduction_storage[kPhysicalWarps][element] = value;
+            } else {
+                const int output_row = element >> 5;
+                const int output_col = element & 31;
+                if (output_row < m) {
+                    output[(size_t) output_row * n + tile * 32 + output_col] = value;
+                }
+            }
+        }
+        __syncthreads();
+    }
+#else
+    NO_DEVICE_CODE;
+    GGML_UNUSED_VARS(codes, scales, input, output, n, k, m);
+#endif
+}
+
+// Only split-16 is enabled in the launcher below: the shapes that reach M > 16 all select
+// split 16, and the kernel keeps the 1Cat split-12 variant unused.
+static void q8_skinny_m32_mul_mat_launch(const uint8_t * codes, const half * scales,
+                                         const half * input, float * output, int n, int k, int m,
+                                         cudaStream_t stream) {
+    constexpr int kSplitK = 16;
+    q8_skinny_m32_kernel<kSplitK><<<n / 32, 32 * (kSplitK / 2), 0, stream>>>(
+        codes, scales, input, output, n, k, m);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// Dispatches an already F16-converted input: M <= 16 keeps the single-stage kernel, M = 17..32
+// uses the two-phase M=32 kernel and M = 33..64 runs it on two row blocks. Shapes whose
+// split-K is not 16 have no M > 16 kernel and return false so the caller can fall back.
+static bool q8_skinny_mul_mat_dispatch(const uint8_t * codes, const half * scales,
+                                       const half * input, float * output, int n, int k, int m,
+                                       cudaStream_t stream) {
+    GGML_ASSERT(m >= 1 && m <= 64);
+    if (m <= 16) {
+        q8_skinny_mul_mat_launch(codes, scales, input, output, n, k, m, stream);
+        return true;
+    }
+    if (q8_skinny_config_for(n, k).split_k != 16) {
+        return false;
+    }
+    if (m <= 32) {
+        q8_skinny_m32_mul_mat_launch(codes, scales, input, output, n, k, m, stream);
+    } else {
+        q8_skinny_m32_mul_mat_launch(codes, scales, input, output, n, k, 32, stream);
+        q8_skinny_m32_mul_mat_launch(codes, scales, input + (size_t) 32 * k,
+                                     output + (size_t) 32 * n, n, k, m - 32, stream);
+    }
+    return true;
+}
+
 template <bool M1Only, int RowTiles>
 static void q8_skinny_gated_launch(const uint8_t * gate_codes, const half * gate_scales,
                                    const uint8_t * up_codes, const half * up_scales,
@@ -839,6 +1003,15 @@ static void q8_skinny_gated_mul_mat_launch(const uint8_t * gate_codes, const hal
                                          input, output, n, k, m, stream);
     }
     CUDA_CHECK(cudaGetLastError());
+}
+
+// Same epilogue as q8_skinny_gated_kernel, applied after both projections of an M > 16 run.
+__global__ void q8_skinny_swiglu_kernel(float * __restrict__ gate, const float * __restrict__ up,
+                                        int count) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < count; i += gridDim.x * blockDim.x) {
+        const float g = gate[i];
+        gate[i] = g / (1.0f + __expf(-g)) * up[i];
+    }
 }
 
 template <int SplitK, int NAcc, bool M1Only, int RowTiles>
@@ -1033,7 +1206,10 @@ bool ggml_cuda_q8_skinny_mul_mat(ggml_backend_cuda_context & ctx, const ggml_ten
     const int split_k = q8_skinny_split_k(k);
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || split_k == 0 ||
             !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst) ||
-            src1->ne[2] != 1 || src1->ne[3] != 1 || m < 1 || m > 16) {
+            src1->ne[2] != 1 || src1->ne[3] != 1 || m < 1 || m > 64) {
+        return false;
+    }
+    if (m > 16 && q8_skinny_config_for(n, k).split_k != 16) {
         return false;
     }
 
@@ -1043,9 +1219,9 @@ bool ggml_cuda_q8_skinny_mul_mat(ggml_backend_cuda_context & ctx, const ggml_ten
     to_fp16(src1->data, input.get(), m * k, ctx.stream());
 
     const uint8_t * data = (const uint8_t *) src0->data;
-    q8_skinny_mul_mat_launch(data, (const half *) (data + n * k), input.get(), (float *) dst->data,
-                             (int) n, (int) k, (int) m, ctx.stream());
-    return true;
+    return q8_skinny_mul_mat_dispatch(data, (const half *) (data + n * k), input.get(),
+                                      (float *) dst->data, (int) n, (int) k, (int) m,
+                                      ctx.stream());
 }
 
 bool ggml_cuda_q8_skinny_mul_mat_gated(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_w,
@@ -1062,8 +1238,11 @@ bool ggml_cuda_q8_skinny_mul_mat_gated(ggml_backend_cuda_context & ctx, const gg
             !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst) ||
             src1->ne[2] != 1 || src1->ne[3] != 1 ||
             dst->ne[0] != n || dst->ne[1] != m || dst->ne[2] != 1 || dst->ne[3] != 1 ||
-            m < 1 || m > 16 ||
+            m < 1 || m > 64 ||
             k % 16 != 0 || (k / 16) % 8 != 0 || n % 32 != 0) {
+        return false;
+    }
+    if (m > 16 && q8_skinny_config_for(n, k).split_k != 16) {
         return false;
     }
 
@@ -1074,10 +1253,29 @@ bool ggml_cuda_q8_skinny_mul_mat_gated(ggml_backend_cuda_context & ctx, const gg
 
     const uint8_t * gate_data = (const uint8_t *) gate_w->data;
     const uint8_t * up_data   = (const uint8_t *) up_w->data;
-    q8_skinny_gated_mul_mat_launch(gate_data, (const half *) (gate_data + n * k),
-                                   up_data, (const half *) (up_data + n * k),
-                                   input.get(), (float *) dst->data, (int) n, (int) k, (int) m,
-                                   ctx.stream());
+    if (m <= 16) {
+        q8_skinny_gated_mul_mat_launch(gate_data, (const half *) (gate_data + n * k),
+                                       up_data, (const half *) (up_data + n * k),
+                                       input.get(), (float *) dst->data, (int) n, (int) k, (int) m,
+                                       ctx.stream());
+        return true;
+    }
+
+    // M = 17..64: run both projections with the M=32 kernel, then the SwiGLU epilogue
+    float * gate = (float *) dst->data;
+    ggml_cuda_pool_alloc<float> up(ctx.pool(), n * m);
+    const bool gate_ok = q8_skinny_mul_mat_dispatch(gate_data, (const half *) (gate_data + n * k),
+                                                    input.get(), gate, (int) n, (int) k, (int) m,
+                                                    ctx.stream());
+    GGML_ASSERT(gate_ok);
+    const bool up_ok = q8_skinny_mul_mat_dispatch(up_data, (const half *) (up_data + n * k),
+                                                  input.get(), up.get(), (int) n, (int) k, (int) m,
+                                                  ctx.stream());
+    GGML_ASSERT(up_ok);
+
+    const int count = (int) (n * m);
+    q8_skinny_swiglu_kernel<<<(count + 255) / 256, 256, 0, ctx.stream()>>>(gate, up.get(), count);
+    CUDA_CHECK(cudaGetLastError());
     return true;
 }
 
@@ -1090,8 +1288,11 @@ bool ggml_cuda_q8_skinny_mul_mat_multi(ggml_backend_cuda_context & ctx,
     const int64_t k = src0s[0]->ne[0];
     const int64_t m = src1->ne[1];
     if (src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) ||
-            src1->ne[2] != 1 || src1->ne[3] != 1 || m < 1 || m > 16 ||
+            src1->ne[2] != 1 || src1->ne[3] != 1 || m < 1 || m > 64 ||
             k % 32 != 0 || q8_skinny_split_k(k) == 0) {
+        return false;
+    }
+    if (m > 16 && q8_skinny_multi_config_for(k).split_k != 16) {
         return false;
     }
 
@@ -1117,8 +1318,10 @@ bool ggml_cuda_q8_skinny_mul_mat_multi(ggml_backend_cuda_context & ctx,
             seg.n = (int) n;
             seg.dst = (float *) dst->data;
         } else {
-            // narrow rows keep the row-major Q8_0 layout, the dot path reads them directly
-            if (w->type != GGML_TYPE_Q8_0 || w->view_src != nullptr || w->op != GGML_OP_NONE || n % 32 == 0) {
+            // narrow rows keep the row-major Q8_0 layout, the dot path reads them directly;
+            // the M=32 kernel has no dot path, so M > 16 only takes repacked weights
+            if (m > 16 || w->type != GGML_TYPE_Q8_0 || w->view_src != nullptr ||
+                    w->op != GGML_OP_NONE || n % 32 == 0) {
                 return false;
             }
             if (p.n_dot >= 4) {
@@ -1146,7 +1349,19 @@ bool ggml_cuda_q8_skinny_mul_mat_multi(ggml_backend_cuda_context & ctx,
     to_fp16(src1->data, input.get(), m * k, ctx.stream());
     p.input = input.get();
 
-    q8_skinny_multi_mul_mat_launch(p, ctx.stream());
+    if (m <= 16) {
+        q8_skinny_multi_mul_mat_launch(p, ctx.stream());
+        return true;
+    }
+
+    // M = 17..64: the M=32 kernel has no segment/dot dispatch, so each repacked weight gets
+    // its own launch from the one converted input
+    for (int s = 0; s < p.n_seg; ++s) {
+        const q8_skinny_multi_seg & seg = p.seg[s];
+        const bool ok = q8_skinny_mul_mat_dispatch(seg.codes, seg.scales, p.input, seg.dst,
+                                                   seg.n, p.k, (int) m, ctx.stream());
+        GGML_ASSERT(ok);
+    }
     return true;
 }
 
