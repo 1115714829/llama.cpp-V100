@@ -87,3 +87,32 @@ CUDA_VISIBLE_DEVICES=0,1 ./build/bin/llama-server \
   --split-mode tensor --tensor-split 1,1 \
   -c 32768 -np 1 -fa on -ctk q4_0 -ctv q4_0 -b 2048 -ub 2048
 ```
+
+## P5.1 Q4_0 KV cache quality (this commit)
+
+Perplexity on a 300 KB repo-docs corpus (2-way TP, Q4_K_M weights, -fa on):
+
+| KV cache | PPL ctx=2048 | PPL ctx=8192 |
+|---|---:|---:|
+| f16 / f16 | 2.7734 | - |
+| q8_0 / q8_0 | 2.7734 | 2.6017 |
+| q4_0 / q8_0 | 2.7765 | 2.6024 |
+| q4_0 / q4_0 | 2.7792 | 2.6050 |
+
+Needle test (magic word buried at 50% of the context, greedy decode):
+
+| Context | q8_0/q8_0 | q4_0/q8_0 | q4_0/q4_0 |
+|---|---|---|---|
+| ~35K tokens | correct | correct | correct |
+| ~145K tokens | correct | - | correct |
+
+Conclusion: K=q4_0 V=q4_0 is usable as-is. The PPL delta (<= 0.006 at 2K,
+<= 0.003 at 8K) is inside the measurement noise and the needle tests pass at
+both lengths. No need for the mixed K=q4_0 / V=q8_0 fallback on quality
+grounds; the sm70 kernel work should still cover the mixed pair (it is the
+same code path with different launch templates).
+
+Performance note: on the generic attention paths Q4_0 KV prefill is slower
+than Q8_0 KV (35K needle: 1080 vs 1300 tok/s; 145K needle: 585 vs 1019
+tok/s) because K/V are dequantized to F16 staging. This is the gap the P3
+sm70 Q4_0 KV kernels close.
