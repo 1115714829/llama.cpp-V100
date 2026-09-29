@@ -425,6 +425,9 @@ private:
     // prefill allocations do not invalidate them across requests, see gf_res_slot
     ggml_backend_sched_ptr sched_dec;
 
+    // max tokens of a batch that sched_dec accepts and is reserved for, set once in the constructor
+    uint32_t n_dec_max = 0;
+
     bool sched_need_reserve = true;
 
     ggml_backend_t backend_cpu = nullptr;
