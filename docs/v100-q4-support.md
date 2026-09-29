@@ -175,3 +175,21 @@ The support is kept enabled; the measurements say Q4_0 weights are currently
 better off on the generic mmvq/mmq path on this hardware, so gating
 `ggml_cuda_q8_skinny_can_repack` to Q8_0 only is a one-line change if a
 benchmark on the target machine disagrees.
+
+## P6 regression and 16K/128K benchmarks (this commit)
+
+Original functionality regression (Q8_0 KV, the 1.0.3 README configuration):
+perplexity 2.7734 / 2.6017 at 2048 / 8192 ctx (bit-identical to the pre-change
+measurements), 145K needle correct, DFlash2 spec decode 75.0 tok/s, multimodal
+mmproj image understanding correct, test-cuda-allreduce and test-spec-reject
+pass, test-backend-ops 1604/1604 on both devices.
+
+16K / 128K context with Q4_K_M weights, Q4_0 KV and DFlash2 spec decode
+(147456 ctx, 2-way TP, cache_prompt off):
+
+| ctx | prefill | decode | decode (spec) |
+|---|---:|---:|---:|
+| 16K | 1755.6 tok/s | 52.4 tok/s | 171.8 tok/s |
+| 128K | 1250.6 tok/s | 31.3 tok/s | 107.0 tok/s |
+
+Full change report: [v100-q4-report.md](v100-q4-report.md).
