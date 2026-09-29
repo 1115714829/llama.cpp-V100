@@ -11818,6 +11818,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // multi-stream (non-unified KV) range masks: one sequence per stream, so the mask row of a
+    // token is indexed by (stream, token) like the dense mask. Split-D prefill and grouped verify
+    // must read each stream's own range.
+    for (int n_stream : { 2, 3 }) {
+        for (int kv : { 1024, 4096 }) {
+            for (int nb : { 64, 256 }) {
+                for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+                    for (int range : { 1, 2 }) {
+                        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, n_stream}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, true, false, 0, false, range));
+                    }
+                }
+            }
+        }
+        // verify: q = 8 per stream reaches the grouped sm_70 kernel
+        for (int kv : { 1024, 4096 }) {
+            for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+                for (int range : { 1, 2 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, n_stream}, kv, 8, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, true, false, 0, false, range));
+                }
+            }
+        }
+    }
+
     // generic fallback shapes with range masks
     for (const std::array<int64_t, 2> & nr23 : { std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{4, 1} }) {
         for (int kv : { 512, 1024 }) {
