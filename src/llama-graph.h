@@ -1394,7 +1394,7 @@ struct llm_graph_context {
     //
 
     // range_mask: the model feeds the attention mask to ggml_flash_attn_ext only (build_attn), so a
-    // single-sequence causal ubatch may use an I32 [lo, hi) range mask instead of the dense mask
+    // causal ubatch with one sequence per stream may use an I32 [lo, hi) range mask instead of the dense mask
     llm_graph_input_mem_hybrid * build_inp_mem_hybrid(bool range_mask = false) const;
     llm_graph_input_mem_hybrid_k * build_inp_mem_hybrid_k() const;
 
