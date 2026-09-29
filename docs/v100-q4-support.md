@@ -47,3 +47,43 @@ Smoke test (`llama-cli --single-turn`, 4096 ctx): correct output, exit 0.
 Follow-up phases: P1 2-way TP verification, P5.1 Q4_0 KV quality evaluation,
 P3 sm70 attention Q4_0 KV, P2 q4_0-skinny, P4 Q4_K weight path decision,
 P6 tests and benchmarks.
+
+## P1 2-way tensor parallel (this commit)
+
+Topology: 2 x V100-SXM2-16GB on NV2 NVLink (P2P available), PCIe gen3 x8.
+
+All-reduce dispatch per call: push (small F32, <= 512 KiB, flat kernel for 2
+ranks) in front, then NCCL (Linux default) or the internal 2-GPU copy-engine
+pipeline (`GGML_CUDA_ALLREDUCE=internal`). The 2+2 / 3+3 clique reductions
+apply to 4/6 ranks only; 2 ranks always use the flat kernel.
+
+Verified:
+- `test-cuda-allreduce`: ALL_OK on NCCL and internal, including the
+  CUDA-graph chain cases (20-320 KB chained calls 3-10 us).
+- `test-backend-ops -o MUL_MAT,RMS_NORM`: pass on all backends.
+- Greedy decode deterministic across repeated runs.
+- Tensor split 1,1 vs 1,3 perplexity (3 chunks of a 20 KB corpus, 2048 ctx):
+  1.7380/2.0739/2.3896 vs 1.7395/2.0755/2.3890. The delta (<= 0.002) comes
+  from the BF16 wire rounding of large reductions at different split
+  boundaries, not from split errors.
+
+Fixed in the internal (2-GPU) all-reduce path:
+- `exact` collectives were reduced over the BF16 wire and lost bitwise
+  equality (observed: exact test got -0.116211 vs -0.11619). The flag now
+  disables the BF16 round-trip, so exact payloads reduce in F32.
+- A hard `GGML_ASSERT` on 16-byte-multiple nbytes aborted instead of falling
+  back. The kernels handle tails, so the check was dropped; unaligned nbytes
+  now pass through the pipeline like any other size.
+
+Known pre-existing issue (not introduced here): the full `test-backend-ops`
+run aborts in `fattn-mma-f16.cuh` `cudaFuncSetAttribute` for the hsk=320
+FLASH_ATTN_EXT case (dynamic shared memory above the V100 48 KB limit).
+
+Launch template:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 ./build/bin/llama-server \
+  -m Qwen3.8-27B-Q4_K_M.gguf -ngl 999 \
+  --split-mode tensor --tensor-split 1,1 \
+  -c 32768 -np 1 -fa on -ctk q4_0 -ctv q4_0 -b 2048 -ub 2048
+```

@@ -21,9 +21,12 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * pipeline);
 // tensors[i] must live on the device managed by backends[i] and be
 // contiguous F32, F16, or BF16.
 // Preconditions are checked by the CUDA comm dispatcher before calling this.
+// exact: the result must be bitwise identical on every rank, so the BF16
+// wire round-trip is skipped.
 // Returns true once the reduction work has been enqueued successfully.
 bool ggml_cuda_ar_allreduce(
     ggml_cuda_ar_pipeline * pipeline,
     ggml_backend_t        * backends,
-    ggml_tensor           ** tensors);
+    ggml_tensor           ** tensors,
+    bool                    exact);
 
