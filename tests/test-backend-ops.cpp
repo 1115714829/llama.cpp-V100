@@ -10830,25 +10830,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
 
     // Q8_0 skinny GEMM (repacked QPN8 layout, sm_70) on the DFlash2 verify shapes. M <= 16 uses
-    // the new kernel, M = 17/32 the dequant fallback; N = 256 is too small and stays on the old path.
+    // the single-stage kernel, M = 17..32 the two-phase M=32 kernel, M = 33..64 two M=32 calls;
+    // N = 256 is too small and stays on the old path.
     const std::vector<std::pair<int64_t, int64_t>> q8_0_skinny_shapes = {
         { 4352, 5120}, { 5120, 4352}, { 2560, 5120}, { 1536, 5120}, { 5120, 1536}, { 3072, 5120}, {62080, 5120},
     };
     for (const auto & [n_out, k_red] : q8_0_skinny_shapes) {
-        for (int64_t n_tokens : {1, 2, 4, 7, 8, 9, 16, 17, 32}) {
+        for (int64_t n_tokens : {1, 2, 4, 7, 8, 9, 16, 17, 24, 32, 40, 48, 64}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, n_out, n_tokens, k_red, {1, 1}, {1, 1}));
         }
     }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, 5120, {1, 1}, {1, 1}));
 
-    // Q8_0 skinny gated pair: both matmuls and the SWIGLU in one kernel on sm_70
-    for (int64_t n_tokens : {1, 8, 16}) {
+    // Q8_0 skinny gated pair: both matmuls and the SWIGLU in one kernel on sm_70, M > 16 as two
+    // M=32 kernels plus the elementwise SWIGLU
+    for (int64_t n_tokens : {1, 8, 16, 24, 32, 48, 64}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0, GGML_GLU_OP_SWIGLU, n_tokens, 4352, 5120,
             false, 1, 1, false, false, true, false, {1, 1}));
     }
 
     // multiple Q8_0 matmuls sharing one input: one input conversion and one multi-weight kernel
-    for (int64_t n_tokens : {1, 8, 16}) {
+    for (int64_t n_tokens : {1, 8, 16, 32}) {
         test_cases.emplace_back(new test_mul_mat_multi({2560, 1536, 12, 12}, n_tokens, 5120));
         test_cases.emplace_back(new test_mul_mat_multi({3072, 256, 256}, n_tokens, 5120));
     }
