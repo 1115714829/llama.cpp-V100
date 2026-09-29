@@ -244,15 +244,15 @@ public:
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     // the KQ mask of this ubatch is exactly one [lo, hi) range of visible cells per token:
-    // a non-SWA cache, one stream, one sequence, and cells [0, n_used) all holding that sequence
-    // in strict causal order (O(n_used) check)
+    // a non-SWA cache, one sequence per stream, and cells [0, n_used) all holding that sequence
+    // in strict causal order (O(n_used) check per stream)
     bool get_kq_range_ok(const slot_info & sinfo, const llama_ubatch & ubatch) const;
 
     // true if every ubatch of a single sequence can take a range mask, so the worst-case graphs take one too
     bool get_kq_range_reserve() const;
 
-    // fills an I32 [2, n_tokens, 1, 1] range mask: [0, cell + 1) for every token, where cell is the
-    // index of the cell that the token was stored in (see get_kq_range_ok)
+    // fills an I32 [2, n_tokens/n_stream, 1, n_stream] range mask: [0, cell + 1) for every token,
+    // where cell is the index of the cell that the token was stored in (see get_kq_range_ok)
     void set_input_kq_range(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
 
     // true if llama_kv_cell_ext holds information that has to survive a state save/restore

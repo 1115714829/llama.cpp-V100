@@ -1900,11 +1900,18 @@ bool llama_kv_cache::get_kq_range_ok(const slot_info & sinfo, const llama_ubatch
         return false;
     }
 
-    if (sinfo.n_stream() != 1) {
+    const uint32_t n_stream = (uint32_t) sinfo.n_stream();
+
+    // one sequence per stream: the unified cache (a single stream shared by several sequences)
+    // keeps the dense mask
+    if (n_stream == 0 || ubatch.n_seqs_unq != n_stream || ubatch.n_tokens == 0) {
         return false;
     }
 
-    if (ubatch.n_seqs_unq != 1 || ubatch.n_tokens == 0) {
+    // the tokens of each stream are contiguous in the ubatch (see split_equal)
+    const uint32_t n_tps = ubatch.n_tokens/n_stream;
+
+    if (n_tps == 0 || ubatch.n_tokens != n_tps*n_stream) {
         return false;
     }
 
@@ -1912,51 +1919,57 @@ bool llama_kv_cache::get_kq_range_ok(const slot_info & sinfo, const llama_ubatch
         if (ubatch.n_seq_id[i] != 1) {
             return false;
         }
+
+        if (ubatch.seq_id[i][0] != ubatch.seq_id_unq[i/n_tps]) {
+            return false;
+        }
     }
 
-    const llama_seq_id s = ubatch.seq_id_unq[0];
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        const llama_seq_id seq_id = ubatch.seq_id_unq[s];
 
-    const auto & cells = v_cells[sinfo.strm[0]];
+        const auto & cells = v_cells[sinfo.strm[s]];
 
-    const uint32_t n_used = cells.get_used();
+        const uint32_t n_used = cells.get_used();
 
-    if (n_used == 0 || n_used != cells.used_max_p1()) {
-        return false;
-    }
+        if (n_used == 0 || n_used != cells.used_max_p1()) {
+            return false;
+        }
 
-    if (cells.seq_n_cells(s) != n_used) {
-        return false;
-    }
+        if (cells.seq_n_cells(seq_id) != n_used) {
+            return false;
+        }
 
-    // the range [0, cell + 1) of a token equals its causal mask (see set_input_kq_mask) when the cells are in
-    // strict causal order: increasing positions, where the tokens of an image that share a position (M-RoPE)
-    // follow the order of the 2D causal mask
-    //
-    // this runs for every ubatch over all used cells: text has strictly increasing positions, which a
-    // branch-free scan checks (it vectorizes); only shared positions take the per-cell check
-    const llama_pos * pos = cells.pos_data();
+        // the range [0, cell + 1) of a token equals its causal mask (see set_input_kq_mask) when the cells are in
+        // strict causal order: increasing positions, where the tokens of an image that share a position (M-RoPE)
+        // follow the order of the 2D causal mask
+        //
+        // this runs for every ubatch over all used cells: text has strictly increasing positions, which a
+        // branch-free scan checks (it vectorizes); only shared positions take the per-cell check
+        const llama_pos * pos = cells.pos_data();
 
-    int32_t not_increasing = 0;
-    for (uint32_t j = 1; j < n_used; ++j) {
-        not_increasing |= pos[j] <= pos[j - 1];
-    }
+        int32_t not_increasing = 0;
+        for (uint32_t j = 1; j < n_used; ++j) {
+            not_increasing |= pos[j] <= pos[j - 1];
+        }
 
-    if (!not_increasing) {
-        return true;
-    }
-
-    for (uint32_t j = 1; j < n_used; ++j) {
-        if (pos[j] > pos[j - 1]) {
+        if (!not_increasing) {
             continue;
         }
 
-        if (pos[j] < pos[j - 1]) {
-            return false;
-        }
+        for (uint32_t j = 1; j < n_used; ++j) {
+            if (pos[j] > pos[j - 1]) {
+                continue;
+            }
 
-        const llama_kv_cell_ext & e_prev = cells.ext_get(j - 1);
-        if (!cells.ext_get(j).is_2d_gt(e_prev.x, e_prev.y)) {
-            return false;
+            if (pos[j] < pos[j - 1]) {
+                return false;
+            }
+
+            const llama_kv_cell_ext & e_prev = cells.ext_get(j - 1);
+            if (!cells.ext_get(j).is_2d_gt(e_prev.x, e_prev.y)) {
+                return false;
+            }
         }
     }
 
@@ -1966,15 +1979,21 @@ bool llama_kv_cache::get_kq_range_ok(const slot_info & sinfo, const llama_ubatch
 void llama_kv_cache::set_input_kq_range(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {
     GGML_ASSERT(dst->type == GGML_TYPE_I32);
     GGML_ASSERT(dst->ne[0] == 2);
-    GGML_ASSERT(dst->ne[1] == ubatch->n_tokens);
+    GGML_ASSERT(dst->ne[3] == (int64_t) sinfo.n_stream());
+    GGML_ASSERT(dst->ne[1]*dst->ne[3] == ubatch->n_tokens);
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
     int32_t * data = (int32_t *) dst->data;
 
+    const uint32_t n_stream = (uint32_t) sinfo.n_stream();
+    const uint32_t n_tps    = ubatch->n_tokens/n_stream;
+
     // the cells are in strict causal order (see get_kq_range_ok): a token sees the cells up to its own
-    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
-        data[2*i + 0] = 0;
-        data[2*i + 1] = (int32_t) sinfo.idxs[0][i] + 1;
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        for (uint32_t i = 0; i < n_tps; ++i) {
+            data[2*(s*n_tps + i) + 0] = 0;
+            data[2*(s*n_tps + i) + 1] = (int32_t) sinfo.idxs[s][i] + 1;
+        }
     }
 }
 
