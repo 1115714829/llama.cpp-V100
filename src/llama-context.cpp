@@ -136,6 +136,11 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+// verification and single-token decode batches are small and get the dedicated decode scheduler;
+// larger token batches still use the regular prefill scheduler
+static constexpr uint32_t LLAMA_DEC_SLOT_MAX_TOKENS       = 16;
+static constexpr uint32_t LLAMA_DEC_SLOT_MAX_TOKENS_MULTI = 64;
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -305,6 +310,12 @@ llama_context::llama_context(
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
             cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
+
+    // verification batches of all sequences: up to 16 tokens for one sequence (unchanged), 8 per sequence
+    // beyond that (DFlash2 verifies 1 + 7 tokens per sequence), at most 64
+    n_dec_max = cparams.n_seq_max <= 1 ? LLAMA_DEC_SLOT_MAX_TOKENS :
+            std::min<uint32_t>(LLAMA_DEC_SLOT_MAX_TOKENS_MULTI, std::max<uint32_t>(LLAMA_DEC_SLOT_MAX_TOKENS, 8*cparams.n_seq_max));
+    n_dec_max = std::min(n_dec_max, cparams.n_ubatch);
 
     // Initialize backend samplers here so they are part of the sampling graph
     // before the reserve passes run later in this function. This avoids a later
@@ -685,10 +696,6 @@ static bool is_dflash_draft(const llama_model & model, const llama_cparams & cpa
         && model.hparams.dsv4_hc_mult == 0;
 }
 
-// verification and single-token decode batches are small and get the dedicated decode scheduler;
-// larger token batches still use the regular prefill scheduler
-static constexpr uint32_t LLAMA_DEC_SLOT_MAX_TOKENS = 16;
-
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -851,14 +858,12 @@ void llama_context::sched_reserve() {
 
     // reserve the decode graph (verification/single-token batch) on its own scheduler
     if (sched_dec) {
-        const uint32_t n_dec_tokens = std::min<uint32_t>(LLAMA_DEC_SLOT_MAX_TOKENS, cparams.n_ubatch);
-
         std::vector<size_t> sizes_dec;
         if (model.hparams.no_alloc) {
             sizes_dec.assign(backend_ptrs.size(), 0);
         }
 
-        auto * gf = graph_reserve(n_dec_tokens, 1, n_dec_tokens, mctx.get(), model.hparams.no_alloc,
+        auto * gf = graph_reserve(n_dec_max, 1, n_dec_max, mctx.get(), model.hparams.no_alloc,
                 model.hparams.no_alloc ? sizes_dec.data() : nullptr, 0, sched_dec.get());
         if (!gf) {
             throw std::runtime_error("failed to allocate compute decode buffers");
@@ -915,6 +920,7 @@ void llama_context::sched_reserve() {
                 dec_info += format(" %s=%.2f MiB", ggml_backend_buft_name(backend_buft[i]),
                         ggml_backend_sched_get_buffer_size(sched_dec.get(), backend_ptrs[i]) / 1024.0 / 1024.0);
             }
+            LLAMA_LOG_INFO("%s: decode scheduler for up to %u tokens\n", __func__, n_dec_max);
         }
         LLAMA_LOG_INFO("%s: decode scheduler %s\n", __func__, dec_info.c_str());
     }
@@ -2941,7 +2947,7 @@ llm_graph_result * llama_context::get_gf_res_prev(int slot) {
 
 int llama_context::gf_res_slot(const llama_ubatch & ubatch) const {
     // verification/single-token decode batches of regular contexts get the dedicated decode scheduler
-    if (sched_dec && ubatch.embd == nullptr && n_outputs == ubatch.n_tokens && ubatch.n_tokens <= LLAMA_DEC_SLOT_MAX_TOKENS) {
+    if (sched_dec && ubatch.embd == nullptr && n_outputs == ubatch.n_tokens && ubatch.n_tokens <= n_dec_max) {
         return 2;
     }
 
