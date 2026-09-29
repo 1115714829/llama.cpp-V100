@@ -273,6 +273,9 @@ struct server_slot {
     int32_t n_keep  = 0;
     int32_t i_batch = -1;
 
+    // prefill pacing: the step at which this slot may add prompt tokens again
+    int64_t prefill_next_step = 0;
+
     // effective generation limit for the current task, -1 means unlimited
     int32_t n_predict_max = -1;
 
@@ -400,6 +403,8 @@ struct server_slot {
         n_accepted_per_pos.clear();
 
         n_predict_max = -1;
+
+        prefill_next_step = 0;
 
         llama_set_sampler(ctx_tgt, id, nullptr);
 
@@ -914,6 +919,9 @@ private:
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
 
     int n_empty_consecutive = 0;
+
+    // incremented on each update_slots(), used by prefill pacing (see n_prefill_pace_steps)
+    int64_t n_update_step = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
@@ -2856,6 +2864,8 @@ private:
             }
         }
 
+        ++n_update_step; // prefill pacing step counter
+
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
@@ -3133,6 +3143,10 @@ private:
             slot.handle_last_sampled_token(batch);
         });
 
+        // prefill pacing: if a generating slot already added tokens to the batch, a slot that is
+        // still processing its prompt gets a chunk only every n_prefill_pace_steps steps
+        const bool pace_active = params_base.n_prefill_pace_steps > 0 && batch.size() > 0;
+
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
@@ -3166,6 +3180,12 @@ private:
 
                 // this slot still has a prompt to be processed
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
+                    // paced: no prompt tokens for this slot in this step, wait for a later one
+                    // note: SLOT_STATE_STARTED is never paced, the first chunk is always processed
+                    if (pace_active && slot.state == SLOT_STATE_PROCESSING_PROMPT && n_update_step < slot.prefill_next_step) {
+                        return;
+                    }
+
                     const auto & input_tokens = slot.task->tokens;
 
                     // used to determine the number of tokens added to the batch for the current slot
@@ -3613,6 +3633,16 @@ private:
 
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.size() - n_tokens_prev;
+
+                    // prefill pacing: this chunk was added while another slot generates,
+                    // wait N steps before adding the next one
+                    if (params_base.n_prefill_pace_steps > 0 && pace_active && n_tokens_cur > 0 &&
+                            slot.prompt.n_tokens() < slot.task->n_tokens()) {
+                        slot.prefill_next_step = n_update_step + params_base.n_prefill_pace_steps;
+
+                        SLT_DBG(slot, "prefill pacing: chunk at step %" PRId64 ", next chunk at step %" PRId64 "\n",
+                                n_update_step, slot.prefill_next_step);
+                    }
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
