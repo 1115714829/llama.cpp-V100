@@ -253,12 +253,14 @@ __device__ __forceinline__ __half2 grouped_verify_q8_pair_half2(const uint32_t p
     return __hmul2(d2, q);
 }
 
-// Unpack one q4_0 value pair (two code bytes) and scale it by d, all in half precision.
-// q4_0 packs values 0..15 into the low nibbles of qs[0..15] and 16..31 into the high nibbles.
-__device__ __forceinline__ __half2 grouped_verify_q4_pair_half2(const uint8_t b0, const uint8_t b1, const bool hi_half, const __half2 d2) {
+// Unpack one q4_0 value pair (two code bytes in the low half of packed) and scale it by d,
+// all in half precision. q4_0 packs values 0..15 into the low nibbles of qs[0..15] and
+// 16..31 into the high nibbles.
+__device__ __forceinline__ __half2 grouped_verify_q4_pair_half2(const uint32_t packed, const bool hi_half, const __half2 d2) {
+    const int shift = hi_half ? 4 : 0;
     const __half2 q = __halves2half2(
-        __short2half_rn((int) (hi_half ? (b0 >> 4) : (b0 & 0xf)) - 8),
-        __short2half_rn((int) (hi_half ? (b1 >> 4) : (b1 & 0xf)) - 8));
+        __short2half_rn((int) ((packed >> shift) & 0xf) - 8),
+        __short2half_rn((int) ((packed >> (8 + shift)) & 0xf) - 8));
     return __hmul2(d2, q);
 }
 
@@ -352,12 +354,18 @@ __device__ __forceinline__ void flash_attn_sm70_grouped_dequant_kv(
         uint4 out;
         if constexpr (type_KV == GGML_TYPE_Q4_0) {
             // 8 columns = 8 values of one nibble half; codes are 8 consecutive bytes.
+            // The 18 B block makes qs only 2 B aligned, so assemble each u32 code word
+            // from two u16 loads and shift the nibbles out.
             const uint8_t * codes = kv_stage + base + 2 + (c & 15);
+            const uint32_t w0 = (uint32_t) *reinterpret_cast<const uint16_t *>(codes)
+                              | (uint32_t) *reinterpret_cast<const uint16_t *>(codes + 2) << 16;
+            const uint32_t w1 = (uint32_t) *reinterpret_cast<const uint16_t *>(codes + 4)
+                              | (uint32_t) *reinterpret_cast<const uint16_t *>(codes + 6) << 16;
             const bool hi_half = (c % 32) >= 16;
-            out.x = grouped_verify_half2_uint(grouped_verify_q4_pair_half2(codes[0], codes[1], hi_half, d2));
-            out.y = grouped_verify_half2_uint(grouped_verify_q4_pair_half2(codes[2], codes[3], hi_half, d2));
-            out.z = grouped_verify_half2_uint(grouped_verify_q4_pair_half2(codes[4], codes[5], hi_half, d2));
-            out.w = grouped_verify_half2_uint(grouped_verify_q4_pair_half2(codes[6], codes[7], hi_half, d2));
+            out.x = grouped_verify_half2_uint(grouped_verify_q4_pair_half2(w0,      hi_half, d2));
+            out.y = grouped_verify_half2_uint(grouped_verify_q4_pair_half2(w0 >> 16, hi_half, d2));
+            out.z = grouped_verify_half2_uint(grouped_verify_q4_pair_half2(w1,      hi_half, d2));
+            out.w = grouped_verify_half2_uint(grouped_verify_q4_pair_half2(w1 >> 16, hi_half, d2));
         } else {
             // 8 columns = 16 B, and base + 2 + (c % 32) is even, so use u16 loads and one uint4 store.
             const uint16_t * packed = reinterpret_cast<const uint16_t *>(kv_stage + base + 2 + (c % 32));

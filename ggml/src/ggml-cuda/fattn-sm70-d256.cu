@@ -321,16 +321,64 @@ static void sm70_d256_dequant_kv_tensor(
             t->nb[1] / ts, t->nb[2] / ts, t->nb[3] / ts, stream);
 }
 
-// q8_0 -> f16 mirror of the rows [0, *kv_limit) only. With a range mask the dense kernel never reads
+// Block layout of the quantized K/V types the partial mirror supports. QK8_0 == QK4_0 == 32
+// values per block, so one lane of the row kernel decodes 8 values from one block.
+template <ggml_type type>
+struct sm70_d256_dequant_block;
+
+template <>
+struct sm70_d256_dequant_block<GGML_TYPE_Q8_0> {
+    static constexpr int kBlockBytes = sizeof(block_q8_0);
+
+    // iq is the lane's 8-value group inside the block, d its scale.
+    static __device__ __forceinline__ void decode(const char * block, const int iq, const float d, half2 * h) {
+        const int8_t * qs = reinterpret_cast<const int8_t *>(block) + sizeof(__half);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            h[i] = __floats2half2_rn(d * qs[iq + 2*i], d * qs[iq + 2*i + 1]);
+        }
+    }
+};
+
+template <>
+struct sm70_d256_dequant_block<GGML_TYPE_Q4_0> {
+    static constexpr int kBlockBytes = sizeof(block_q4_0);
+
+    static __device__ __forceinline__ __half2 pair(const uint32_t packed, const int shift, const float d) {
+        return __floats2half2_rn(d * ((int) ((packed >> shift) & 0xf) - 8),
+                                 d * ((int) ((packed >> (8 + shift)) & 0xf) - 8));
+    }
+
+    // q4_0 packs values 0..15 into the low nibbles of qs[0..15] and 16..31 into the high nibbles.
+    static __device__ __forceinline__ void decode(const char * block, const int iq, const float d, half2 * h) {
+        // The 18 B block makes qs only 2 B aligned, so assemble each u32 code word from two
+        // u16 loads and shift the nibbles out.
+        const char * codes = block + sizeof(__half) + (iq & 15);
+        const uint32_t w0 = (uint32_t) *reinterpret_cast<const uint16_t *>(codes)
+                          | (uint32_t) *reinterpret_cast<const uint16_t *>(codes + 2) << 16;
+        const uint32_t w1 = (uint32_t) *reinterpret_cast<const uint16_t *>(codes + 4)
+                          | (uint32_t) *reinterpret_cast<const uint16_t *>(codes + 6) << 16;
+        const int shift = iq >= 16 ? 4 : 0;
+        h[0] = pair(w0,      shift, d);
+        h[1] = pair(w0 >> 16, shift, d);
+        h[2] = pair(w1,      shift, d);
+        h[3] = pair(w1 >> 16, shift, d);
+    }
+};
+
+// q8_0/q4_0 -> f16 mirror of the rows [0, *kv_limit) only. With a range mask the dense kernel never reads
 // a KV row at or past kv_limit, so a K/V view much wider than the attended range (a prompt ubatch that
 // attends the whole cache) costs no conversion. Output layout as sm70_d256_dequant_kv:
 // [ne3][ne2][ne1][ne0] contiguous, i.e. ((i3*ne2 + i2)*ne1 + i1)*ne0 + i0.
 // One warp per row, grid.y = ne2, grid.z = ne3, rows i1 >= *kv_limit are skipped.
-static __global__ void sm70_d256_dequant_q8_0_rows(
+template <ggml_type type>
+static __global__ void sm70_d256_dequant_rows(
         const char * __restrict__ src, half * __restrict__ dst,
         const int ne0, const int ne1, const int ne2,
         const int64_t nb1, const int64_t nb2, const int64_t nb3,
         const int * __restrict__ kv_limit) {
+    static_assert(type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0, "unsupported KV type");
+
     const int i1 = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
     if (i1 >= *kv_limit) {
         return;
@@ -340,19 +388,17 @@ static __global__ void sm70_d256_dequant_q8_0_rows(
     const int i2 = blockIdx.y;
     const int i3 = blockIdx.z;
 
-    // lane's q8_0 block of the row and its 8-value group inside the block
+    // lane's block of the row and its 8-value group inside the block
     const int ib = lane / 4;
     const int iq = (lane % 4) * 8;
 
-    const block_q8_0 * src_row = (const block_q8_0 *) (src + (int64_t) i3*nb3 + (int64_t) i2*nb2 + (int64_t) i1*nb1);
+    const char * src_row = src + (int64_t) i3*nb3 + (int64_t) i2*nb2 + (int64_t) i1*nb1;
     half * dst_row = dst + (((int64_t) i3*ne2 + i2)*ne1 + i1)*ne0;
 
-    const float d = __half2float(src_row[ib].d);
+    const char * src_block = src_row + ib * sm70_d256_dequant_block<type>::kBlockBytes;
+    const float d = __half2float(*reinterpret_cast<const __half *>(src_block));
     half2 h[4];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        h[i] = __floats2half2_rn(d * src_row[ib].qs[iq + 2*i], d * src_row[ib].qs[iq + 2*i + 1]);
-    }
+    sm70_d256_dequant_block<type>::decode(src_block, iq, d, h);
     uint4 out;
     memcpy(&out.x, &h[0], sizeof(uint32_t));
     memcpy(&out.y, &h[1], sizeof(uint32_t));
@@ -361,47 +407,23 @@ static __global__ void sm70_d256_dequant_q8_0_rows(
     *reinterpret_cast<uint4 *>(dst_row + ib*32 + iq) = out;
 }
 
-// q4_0 -> f16 mirror of the rows [0, *kv_limit) only, same layout and indexing as
-// the q8_0 variant above. One warp per row, 8 values per lane.
-static __global__ void sm70_d256_dequant_q4_0_rows(
-        const char * __restrict__ src, half * __restrict__ dst,
-        const int ne0, const int ne1, const int ne2,
-        const int64_t nb1, const int64_t nb2, const int64_t nb3,
-        const int * __restrict__ kv_limit) {
-    const int i1 = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
-    if (i1 >= *kv_limit) {
-        return;
+// Partial mirror of one q8_0/q4_0 K/V tensor: rows [0, *kv_limit) only, bounds known host side.
+static void sm70_d256_dequant_kv_partial(
+        const ggml_tensor * t, half * dst, const int * kv_limit, cudaStream_t stream) {
+    GGML_ASSERT(t->ne[0] == SM70_D256_D);
+    const dim3 grid((unsigned) ((t->ne[1] + 7) / 8), (unsigned) t->ne[2], (unsigned) t->ne[3]);
+    if (t->type == GGML_TYPE_Q8_0) {
+        sm70_d256_dequant_rows<GGML_TYPE_Q8_0><<<grid, 256, 0, stream>>>(
+            (const char *) t->data, dst,
+            (int) t->ne[0], (int) t->ne[1], (int) t->ne[2],
+            t->nb[1], t->nb[2], t->nb[3], kv_limit);
+    } else {
+        sm70_d256_dequant_rows<GGML_TYPE_Q4_0><<<grid, 256, 0, stream>>>(
+            (const char *) t->data, dst,
+            (int) t->ne[0], (int) t->ne[1], (int) t->ne[2],
+            t->nb[1], t->nb[2], t->nb[3], kv_limit);
     }
-
-    const int lane = threadIdx.x & 31;
-    const int i2 = blockIdx.y;
-    const int i3 = blockIdx.z;
-
-    // lane's q4_0 block of the row and its 8-value group inside the block
-    const int ib = lane / 4;
-    const int iq = (lane % 4) * 8;
-
-    const block_q4_0 * src_row = (const block_q4_0 *) (src + (int64_t) i3*nb3 + (int64_t) i2*nb2 + (int64_t) i1*nb1);
-    half * dst_row = dst + (((int64_t) i3*ne2 + i2)*ne1 + i1)*ne0;
-
-    const float d = __half2float(src_row[ib].d);
-    // q4_0 packs values 0..15 into the low nibbles of qs[0..15] and 16..31 into the high nibbles.
-    const uint8_t * codes = src_row[ib].qs + (iq & 15);
-    const bool hi_half = iq >= 16;
-    half2 h[4];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const uint8_t b0 = codes[2*i];
-        const uint8_t b1 = codes[2*i + 1];
-        h[i] = __floats2half2_rn(d * ((hi_half ? (b0 >> 4) : (b0 & 0xf)) - 8),
-                                 d * ((hi_half ? (b1 >> 4) : (b1 & 0xf)) - 8));
-    }
-    uint4 out;
-    memcpy(&out.x, &h[0], sizeof(uint32_t));
-    memcpy(&out.y, &h[1], sizeof(uint32_t));
-    memcpy(&out.z, &h[2], sizeof(uint32_t));
-    memcpy(&out.w, &h[3], sizeof(uint32_t));
-    *reinterpret_cast<uint4 *>(dst_row + ib*32 + iq) = out;
+    CUDA_CHECK(cudaGetLastError());
 }
 
 // F16 is read in place: contiguous rows plus 16 B aligned strides for the
@@ -411,13 +433,8 @@ static bool sm70_d256_kv_type_ok(const ggml_tensor * t) {
         return t->nb[0] == sizeof(half) && t->nb[1] % 16 == 0 &&
                t->nb[2] % 16 == 0 && t->nb[3] % 16 == 0;
     }
-    if (t->type == GGML_TYPE_Q8_0) {
-        const size_t ts = ggml_type_size(GGML_TYPE_Q8_0);
-        return t->nb[0] == ts && t->nb[1] % ts == 0 &&
-               t->nb[2] % ts == 0 && t->nb[3] % ts == 0;
-    }
-    if (t->type == GGML_TYPE_Q4_0) {
-        const size_t ts = ggml_type_size(GGML_TYPE_Q4_0);
+    if (t->type == GGML_TYPE_Q8_0 || t->type == GGML_TYPE_Q4_0) {
+        const size_t ts = ggml_type_size(t->type);
         return t->nb[0] == ts && t->nb[1] % ts == 0 &&
                t->nb[2] % ts == 0 && t->nb[3] % ts == 0;
     }
@@ -656,36 +673,10 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
 
         if (k_partial) {
             // the bounds are known now: mirror only the rows they allow
-            GGML_ASSERT(K->ne[0] == SM70_D256_D);
-            const dim3 grid_k((unsigned) ((K->ne[1] + 7) / 8), (unsigned) K->ne[2], (unsigned) K->ne[3]);
-            if (K->type == GGML_TYPE_Q8_0) {
-                sm70_d256_dequant_q8_0_rows<<<grid_k, 256, 0, stream>>>(
-                    (const char *) K->data, (half *) scratch.f16_extra.K,
-                    (int) K->ne[0], (int) K->ne[1], (int) K->ne[2],
-                    K->nb[1], K->nb[2], K->nb[3], kv_limit);
-            } else {
-                sm70_d256_dequant_q4_0_rows<<<grid_k, 256, 0, stream>>>(
-                    (const char *) K->data, (half *) scratch.f16_extra.K,
-                    (int) K->ne[0], (int) K->ne[1], (int) K->ne[2],
-                    K->nb[1], K->nb[2], K->nb[3], kv_limit);
-            }
-            CUDA_CHECK(cudaGetLastError());
+            sm70_d256_dequant_kv_partial(K, (half *) scratch.f16_extra.K, kv_limit, stream);
         }
         if (v_partial) {
-            GGML_ASSERT(V->ne[0] == SM70_D256_D);
-            const dim3 grid_v((unsigned) ((V->ne[1] + 7) / 8), (unsigned) V->ne[2], (unsigned) V->ne[3]);
-            if (V->type == GGML_TYPE_Q8_0) {
-                sm70_d256_dequant_q8_0_rows<<<grid_v, 256, 0, stream>>>(
-                    (const char *) V->data, (half *) scratch.f16_extra.V,
-                    (int) V->ne[0], (int) V->ne[1], (int) V->ne[2],
-                    V->nb[1], V->nb[2], V->nb[3], kv_limit);
-            } else {
-                sm70_d256_dequant_q4_0_rows<<<grid_v, 256, 0, stream>>>(
-                    (const char *) V->data, (half *) scratch.f16_extra.V,
-                    (int) V->ne[0], (int) V->ne[1], (int) V->ne[2],
-                    V->nb[1], V->nb[2], V->nb[3], kv_limit);
-            }
-            CUDA_CHECK(cudaGetLastError());
+            sm70_d256_dequant_kv_partial(V, (half *) scratch.f16_extra.V, kv_limit, stream);
         }
     } else {
         const int n_splits = (kv_len + SM70_D256_MASK_SPLIT - 1) / SM70_D256_MASK_SPLIT;
