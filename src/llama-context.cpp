@@ -13,6 +13,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -1673,6 +1674,27 @@ bool llama_context::layer_inp_sink_get(size_t token_offset, size_t n_tokens, flo
     return true;
 }
 
+int32_t llama_context::layer_inp_sink_col(llama_seq_id seq_id, llama_pos pos) const {
+    if (t_layer_inp_sink == nullptr) {
+        return -1;
+    }
+
+    const auto it = sink_cols_by_seq.find(seq_id);
+    if (it == sink_cols_by_seq.end()) {
+        return -1;
+    }
+
+    const auto & cols = it->second;
+
+    // the positions of one sequence grow within a batch
+    const auto lo = std::lower_bound(cols.begin(), cols.end(), std::make_pair(pos, -1));
+    if (lo == cols.end() || lo->first != pos) {
+        return -1;
+    }
+
+    return lo->second;
+}
+
 void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
@@ -2330,6 +2352,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         llama_sampler_backend_begin(entry.second);
     }
 
+    // DFlash2: a new batch starts a new sink column order
+    if (t_layer_inp_sink != nullptr) {
+        sink_cols.clear();
+        sink_cols_by_seq.clear();
+    }
+
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
@@ -2384,6 +2412,17 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 case GGML_STATUS_ALLOC_FAILED: return -2;
                 case GGML_STATUS_FAILED:       return -3;
                 case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
+            }
+        }
+
+        // DFlash2: remember which (seq_id, pos) produced each sink column of this ubatch. The sink
+        // is written in ubatch order, and sink_cols.size() is the column of the next token, which
+        // matches the token_offset passed to process_ubatch
+        if (t_layer_inp_sink != nullptr) {
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                const llama_seq_id seq_id = ubatch.seq_id[i][0];
+                sink_cols.emplace_back(seq_id, ubatch.pos[i]);
+                sink_cols_by_seq[seq_id].emplace_back(ubatch.pos[i], (int32_t) sink_cols.size() - 1);
             }
         }
 
@@ -4595,6 +4634,10 @@ void llama_set_embd_source(struct llama_context * ctx, bool enable, int32_t toke
 
 bool llama_layer_inp_sink_get(struct llama_context * ctx, size_t token_offset, size_t n_tokens, float * dst) {
     return ctx->layer_inp_sink_get(token_offset, n_tokens, dst);
+}
+
+int32_t llama_layer_inp_sink_col(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos) {
+    return ctx->layer_inp_sink_col(seq_id, pos);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {
