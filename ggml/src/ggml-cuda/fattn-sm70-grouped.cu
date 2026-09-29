@@ -1,3 +1,10 @@
+// SPDX-FileCopyrightText: Copyright 2026 the llama.cpp authors
+// SPDX-License-Identifier: MIT
+//
+// SM70 (Volta) grouped verify attention, host side: dispatch predicate, K/V
+// type combination selection and kernel launch. K/V cache types: F16, Q8_0 or
+// Q4_0. Device kernel: fattn-sm70-grouped.cuh.
+
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-sm70-grouped.cuh"

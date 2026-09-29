@@ -11739,6 +11739,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // the same grouped shapes with q4_0 KV: raw q4_0 rows are staged and dequantized in shared memory
+    for (int nh : { 1, 4 }) {
+        for (int kv : { 113, 1025, 4096 }) {
+            for (int nb : { 2, 9, 16 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+            }
+        }
+    }
+    // mixed K/V quantization pairs of the grouped kernel, one side q4_0
+    for (const std::array<ggml_type, 2> & type_KV : {
+            std::array<ggml_type, 2>{GGML_TYPE_Q4_0, GGML_TYPE_Q8_0},
+            std::array<ggml_type, 2>{GGML_TYPE_Q8_0, GGML_TYPE_Q4_0},
+            std::array<ggml_type, 2>{GGML_TYPE_F16,  GGML_TYPE_Q4_0},
+            std::array<ggml_type, 2>{GGML_TYPE_Q4_0, GGML_TYPE_F16},
+    }) {
+        for (int nb : { 2, 16 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1025, nb, true, false, 0, 0, GGML_PREC_F32, type_KV[0], type_KV[1]));
+        }
+    }
+
     // D256 prefill production shapes for the sm_70 Split-D kernel: 6 Q heads
     // sharing 1 KV head (TP4 per-device shape), full 2048-row chunks, the
     // q >= 17 lower bound and a long-context KV length. The long KV length is
@@ -11784,8 +11804,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // the same causal range-mask production shapes with q4_0 KV: the split-d
+    // conversion mirrors the q4_0 rows below the range limit
+    for (int kv : { 4096, 32768 }) {
+        for (int nb : { 2048, 17, 100 }) {
+            for (const std::array<int32_t, 4> & perm : { std::array<int32_t, 4>{0, 1, 2, 3}, std::array<int32_t, 4>{0, 2, 1, 3} }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, perm, true, false, 0, false, 1));
+            }
+        }
+    }
     for (int nb : { 2048, 100 }) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0, false, 2));
+    }
+    for (int nb : { 2048, 100 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 0, false, 2));
     }
 
     // range masks that stop at half of the KV view (the split-d conversion must
@@ -11793,6 +11825,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int kv : { 4096, 32768 }) {
         for (int nb : { 2048, 100 }) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, false, 3));
+        }
+    }
+    for (int kv : { 4096, 32768 }) {
+        for (int nb : { 2048, 100 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}, true, false, 0, false, 3));
         }
     }
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 4096, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, true, false, 0, false, 3));
@@ -11810,6 +11847,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // the same grouped range-mask shapes with q4_0 KV
+    for (int nh : { 1, 4 }) {
+        for (int kv : { 113, 1025 }) {
+            for (int nb : { 2, 16 }) {
+                for (int range : { 1, 2 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 0, false, range));
+                }
+            }
+        }
+    }
+
     // the same grouped shapes with a range mask that stops at half of the KV view: the split must
     // follow the range, not the view width
     for (int nh : { 1, 4 }) {
@@ -11817,6 +11865,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             for (int nb : { 2, 8, 16 }) {
                 test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0, false, 3));
             }
+        }
+    }
+    for (int nh : { 1, 4 }) {
+        for (int nb : { 2, 16 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh, {6, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 0, false, 3));
         }
     }
 
@@ -11841,6 +11894,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
+    }
+
+    // the same multi-stream shapes with q4_0 KV
+    for (int n_stream : { 2, 3 }) {
+        for (int kv : { 1024, 4096 }) {
+            for (int range : { 1, 2 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, n_stream}, kv, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}, true, false, 0, false, range));
+            }
+        }
+        // verify: q = 8 per stream reaches the grouped sm_70 kernel
+        for (int range : { 1, 2, 3 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, n_stream}, 1024, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}, true, false, 0, false, range));
+        }
+        // split-d prefill that views a longer cache but attends only its first half
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, n_stream}, 4096, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}, true, false, 0, false, 3));
     }
 
     // generic fallback shapes with range masks

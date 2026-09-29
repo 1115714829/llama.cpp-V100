@@ -1,6 +1,8 @@
 // Adapted from 1Cat-vLLM (Apache-2.0), https://github.com/1CatAI/1Cat-vLLM:
 //   include/fused_mma.h (Volta WMMA wrapper)
 //   csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu (grouped verify kernel)
+// K/V cache types: F16, Q8_0 or Q4_0. Quantized tiles are staged in raw block
+// form and dequantized into the shared memory panel.
 
 #pragma once
 
@@ -163,7 +165,7 @@ constexpr int kGroupedVerifyOutputTilesPerWarp = kGroupedVerifyOutputTiles / kGr
 constexpr int kGroupedVerifyRowsPerWarp  = kGroupedVerifyRows / kGroupedVerifyWarps;
 // Two adjacent KV columns per lane, so mask, scores and probabilities move in pairs.
 constexpr int kGroupedVerifyColsPerLane  = kGroupedVerifyBlockN / WARP_SIZE;
-// The q8_0 staging buffer is split into one row block per warp. A warp only reads
+// The quantized (q8_0/q4_0) staging buffer is split into one row block per warp. A warp only reads
 // back its own rows, so the store and the dequantize need no block wide fence.
 constexpr int kGroupedVerifyStageRowsPerWarp = kGroupedVerifyBlockN / kGroupedVerifyWarps;
 
@@ -188,7 +190,7 @@ struct GroupedVerifyTraits {
 //   kv       64 * 264 * 2 = 33792 B  one K or V tile panel
 //   scores   48 *  64 * 4 = 12288 B
 //   probs    48 *  72 * 2 =  6912 B
-//   stage    64 * 272     = 17408 B  raw q8_0 tile
+//   stage    64 * 272     = 17408 B  raw q8_0/q4_0 tile (q4_0 rows use 144 B)
 //   rows          3 * 48 * 4 =  576 B
 //   total                  = 96512 B
 struct alignas(256) GroupedVerifySmem {
@@ -296,7 +298,7 @@ __device__ __forceinline__ void flash_attn_sm70_grouped_prefetch_kv(
     }
 }
 
-// fp16 tiles go straight into the half panel, q8_0 tiles into the raw staging buffer.
+// fp16 tiles go straight into the half panel, quantized (q8_0/q4_0) tiles into the raw staging buffer.
 template <ggml_type type_KV>
 __device__ __forceinline__ void flash_attn_sm70_grouped_store_kv(
         __half * shared_kv, uint8_t * kv_stage, const GroupedVerifyKVRegs<type_KV> & regs) {

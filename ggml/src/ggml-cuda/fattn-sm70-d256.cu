@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: MIT
 //
 // SM70 (Volta) D256 Split-D prefill attention, host side: dispatch predicate,
-// scratch layout, K/V dequant, Q staging, mask pre-scan, kernel launch and O
-// scatter. Device kernel provenance: fattn-sm70-d256-kernel.cuh.
+// scratch layout, K/V dequant (F16 read in place, Q8_0 or Q4_0 mirrored to f16),
+// Q staging, mask pre-scan, kernel launch and O scatter. Device kernel
+// provenance: fattn-sm70-d256-kernel.cuh.
 
 // The HIP and MUSA backends glob ../ggml-cuda/*.cu into their own libraries and
 // cannot compile CuTe/CUTLASS. This file is only used by the CUDA backend.
@@ -404,7 +405,7 @@ static __global__ void sm70_d256_dequant_q4_0_rows(
 }
 
 // F16 is read in place: contiguous rows plus 16 B aligned strides for the
-// 128-bit global loads. The q8_0 mirror needs block-aligned source strides.
+// 128-bit global loads. The q8_0/q4_0 mirrors need block-aligned source strides.
 static bool sm70_d256_kv_type_ok(const ggml_tensor * t) {
     if (t->type == GGML_TYPE_F16) {
         return t->nb[0] == sizeof(half) && t->nb[1] % 16 == 0 &&
