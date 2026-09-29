@@ -144,3 +144,34 @@ Verified (2-way TP, Q4_K_M weights):
 - DFlash2 speculative decode with q4_0 KV works through the grouped verify
   kernel (96-token run, sensible output)
 - test-backend-ops FLASH_ATTN_EXT hsk=256 and MUL_MAT: pass; test-cuda-allreduce: ALL_OK
+
+## P2 q4_0-skinny (this commit)
+
+The q8-skinny pipeline (weight repack, small-M GEMM, fused gate/up + SwiGLU,
+multi-weight batching, to_f16 fallback) is templated on the code format and
+now also accepts Q4_0 weights. The QPN8 execution layout is unchanged: one
+(group, lane) code record is 16 int8 bytes or 8 nibble-packed bytes, and both
+decode to the same half2 weight pairs. Q4_0 block gotcha applies here too
+(values 0..15 in the low nibbles, 16..31 in the high nibbles). The narrow-row
+dot path of the multi-weight kernel reads plain Q4_0 blocks. Repacked tensors
+carry a per-type marker; mixed types are rejected by the gated and multi
+entry points.
+
+Measured on 2 x V100 (2-way TP, Q4_0 target model, Q8_0 KV):
+
+| case | q4-skinny on | generic path |
+|---|---:|---:|
+| perplexity 2048 | 2.8333 | 2.8333 |
+| greedy decode 512 tok | 52.0 tok/s | 64.2 tok/s |
+| DFlash2 spec decode 512 tok | 94.2 tok/s | 97.4 tok/s |
+| prefill 512 tok (spec) | 57.3 tok/s | 76.7 tok/s |
+
+Q8_0 weights on the same setup are neutral (42.8 vs 43.1 tok/s decode,
+75.7 vs 76.0 tok/s prefill). Note that the M > 16 fallback expands the
+repacked weights to f16 on every MUL_MAT, which is the prefill gap; the
+small-M kernel itself is bandwidth bound at M = 1 on these 16 GB cards.
+
+The support is kept enabled; the measurements say Q4_0 weights are currently
+better off on the generic mmvq/mmq path on this hardware, so gating
+`ggml_cuda_q8_skinny_can_repack` to Q8_0 only is a one-line change if a
+benchmark on the target machine disagrees.

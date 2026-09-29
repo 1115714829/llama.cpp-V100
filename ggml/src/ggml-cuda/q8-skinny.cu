@@ -9,10 +9,17 @@
 #include "q8-skinny.cuh"
 
 #include <algorithm>
+#include <type_traits>
 #include <vector>
 
-// sentinel object whose address tags a repacked tensor (not const: it is stored in tensor->extra)
+// sentinel objects whose addresses tag a repacked tensor (not const: it is stored in tensor->extra)
 static char q8_skinny_marker = 0;
+static char q4_skinny_marker = 0;
+
+// Reordered code bytes per (group, lane): 16 int8 or 8 nibble-packed bytes.
+static size_t q8_skinny_codes_bytes(int64_t n, int64_t k, bool q4) {
+    return (q4 ? n * k / 2 : n * k);
+}
 
 static int q8_skinny_split_k(const int64_t k) {
     if (k <= 0) {
@@ -62,6 +69,57 @@ __device__ __forceinline__ void s8x8_to_half2x4(uint2 q, half2 out[4]) {
     }
 }
 
+// ---- q4_0 decoder for the q4 twin of the layout ----
+
+// One uint32 holds 4 code bytes = 8 values of a group record. The slot order matches the
+// int8 decoder: out[i] pairs slot i with slot 4 + i. The repack stores group value v at
+// byte v/2 of the record, low nibble for even v and high nibble for odd v. q4_0 stores
+// values 0..15 in the low nibbles of the block bytes and 16..31 in the high nibbles.
+// Nibbles are expanded to offset-binary bytes (n | 0x80) and fed through the int8 merge
+// above; the bias of 1160 = 1152 + 8 subtracts the byte offset and the q4_0 zero point.
+__device__ __forceinline__ void s4x8_to_half2x4(uint32_t p, half2 out[4]) {
+    // nibble streams with the sign bit set (n | 0x80): even slots from the low nibbles,
+    // odd slots from the high nibbles
+    const unsigned ev = (p & 0x0f0f0f0fu) | 0x80808080u;
+    const unsigned od = ((p >> 4) & 0x0f0f0f0fu) | 0x80808080u;
+    // interleave into slot order: xs = slots 0..3, ys = slots 4..7
+    const unsigned xs = ( ev        & 0x000000ffu) | ((ev & 0x0000ff00u) << 8) |
+                        ((od        & 0x000000ffu) << 8) | ((od & 0x0000ff00u) << 16);
+    const unsigned ys = ((ev >> 16) & 0x000000ffu) | ((ev & 0xff000000u) >> 8) |
+                        ((od >>  8) & 0x0000ff00u) | ( od & 0xff000000u);
+    const unsigned bias_bits = 0x64886488u; // f16 1160, 1160
+    const half2 bias = *reinterpret_cast<const half2 *>(&bias_bits);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const unsigned packed = (__byte_perm(xs, ys, 0x0400u + 0x0101u*i) & 0x00FF00FFu) | 0x64006400u;
+        out[i] = __hsub2(*reinterpret_cast<const half2 *>(&packed), bias);
+    }
+}
+
+// One (group, lane) code record: 16 int8 bytes or 8 nibble-packed bytes.
+template <bool Q4>
+struct q_skinny_code {
+    using packed_t = typename std::conditional<Q4, uint2, uint4>::type;
+
+    static __device__ __forceinline__ packed_t ld(const packed_t * p) {
+        if constexpr (Q4) {
+            return *p;
+        } else {
+            return __ldcs(p);
+        }
+    }
+
+    static __device__ __forceinline__ void decode(packed_t p, half2 out[8]) {
+        if constexpr (Q4) {
+            s4x8_to_half2x4(p.x, out);
+            s4x8_to_half2x4(p.y, out + 4);
+        } else {
+            s8x8_to_half2x4(make_uint2(p.x, p.y), out);
+            s8x8_to_half2x4(make_uint2(p.z, p.w), out + 4);
+        }
+    }
+};
+
 // ---- 1Cat fp8_qpn8_sm70.cu:168-175 (mma.m8n8k4 macro, unchanged) ----
 
 #define Q8_SKINNY_MMA_8N8K4(C, A0, A1, B0, B1)                       \
@@ -77,25 +135,47 @@ __device__ __forceinline__ void s8x8_to_half2x4(uint2 q, half2 out[4]) {
 
 // One CTA per tile. src points at the first tile of the range, codes at its codes
 // destination and scales at the full scales array indexed by the global tile.
+template <bool Q4>
 __global__ void q8_skinny_repack_kernel(const uint8_t * __restrict__ src, uint8_t * __restrict__ codes,
                                         half * __restrict__ scales, int n, int k, int tile0) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
     const int blocks_k = k >> 5;
     const int tile = tile0 + blockIdx.x;
-    uint8_t * codes_tile = codes + (size_t) blockIdx.x * 32 * k;
+    const size_t block_bytes = Q4 ? 18 : 34;
+    uint8_t * codes_tile = codes + (size_t) blockIdx.x * (Q4 ? 16 : 32) * (size_t) k;
     for (int i = threadIdx.x; i < 32 * blocks_k; i += blockDim.x) {
         const int row = i / blocks_k;
         const int kb  = i - row * blocks_k;
-        const uint8_t * block = src + ((size_t) blockIdx.x * 32 + row) * blocks_k * 34 + (size_t) kb * 34;
+        const uint8_t * block = src + ((size_t) blockIdx.x * 32 + row) * blocks_k * block_bytes + (size_t) kb * block_bytes;
         const half d = *reinterpret_cast<const half *>(block);
         const uint8_t * qs = block + 2;
         const int lane   = qpn8_lane_from_col(row & 31);
         const int group0 = kb * 2;
+        if constexpr (Q4) {
+            // Byte j of the block holds value j in the low nibble and value 16 + j in the
+            // high nibble. Group record value v sits at byte v/2, nibble v % 2 (low first).
+            uint8_t rec0[8] = {};
+            uint8_t rec1[8] = {};
 #pragma unroll
-        for (int j = 0; j < 16; ++j) {
-            const int physical_k = qpn8_physical_k(j);
-            codes_tile[((size_t) (group0 + 0) * 32 + lane) * 16 + physical_k] = qs[j];
-            codes_tile[((size_t) (group0 + 1) * 32 + lane) * 16 + physical_k] = qs[16 + j];
+            for (int j = 0; j < 16; ++j) {
+                const int s = qpn8_physical_k(j);
+                rec0[s >> 1] |= (uint8_t) ((qs[j] & 0x0f) << (4 * (s & 1)));
+                rec1[s >> 1] |= (uint8_t) ((qs[j] >> 4)  << (4 * (s & 1)));
+            }
+            uint8_t * r0 = codes_tile + ((size_t) (group0 + 0) * 32 + lane) * 8;
+            uint8_t * r1 = codes_tile + ((size_t) (group0 + 1) * 32 + lane) * 8;
+#pragma unroll
+            for (int b = 0; b < 8; ++b) {
+                r0[b] = rec0[b];
+                r1[b] = rec1[b];
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                const int physical_k = qpn8_physical_k(j);
+                codes_tile[((size_t) (group0 + 0) * 32 + lane) * 16 + physical_k] = qs[j];
+                codes_tile[((size_t) (group0 + 1) * 32 + lane) * 16 + physical_k] = qs[16 + j];
+            }
         }
         scales[(size_t) kb * n + tile * 32 + lane] = d;
     }
@@ -110,6 +190,7 @@ __global__ void q8_skinny_repack_kernel(const uint8_t * __restrict__ src, uint8_
 // One CTA per tile of 32 rows and 8 groups (128 K). A code word decodes to one output row,
 // so warps stage the decoded values in shared memory first. That keeps the stores to global
 // memory coalesced along K instead of one 4-byte store per row.
+template <bool Q4>
 __global__ void q8_skinny_to_f16_kernel(half * __restrict__ output, const uint8_t * __restrict__ codes,
                                         const half * __restrict__ scales, int n, int k) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
@@ -125,11 +206,11 @@ __global__ void q8_skinny_to_f16_kernel(half * __restrict__ output, const uint8_
 
     // warp `warp` decodes group `g0 + warp` into the rows of the tile
     if (group < groups) {
-        const uint4 packed =
-            reinterpret_cast<const uint4 *>(codes)[((size_t) tile * groups + group) * 32 + lane];
+        using code_t = q_skinny_code<Q4>;
+        const typename code_t::packed_t packed =
+            reinterpret_cast<const typename code_t::packed_t *>(codes)[((size_t) tile * groups + group) * 32 + lane];
         half2 weights[8];
-        s8x8_to_half2x4(make_uint2(packed.x, packed.y), weights);
-        s8x8_to_half2x4(make_uint2(packed.z, packed.w), weights + 4);
+        code_t::decode(packed, weights);
 
         const half scale   = __ldg(scales + (size_t) (group >> 1) * n + tile * 32 + lane);
         const half2 scale2 = __halves2half2(scale, scale);
@@ -160,12 +241,13 @@ __global__ void q8_skinny_to_f16_kernel(half * __restrict__ output, const uint8_
 
 // ---- 1Cat fp8_qpn8_sm70.cu:207-432 (main kernel, adapted) ----
 
-template <int SplitK, int NAcc, bool PrefetchCodes, bool M1Only = false, int RowTiles = 1>
+template <bool Q4, int SplitK, int NAcc, bool PrefetchCodes, bool M1Only = false, int RowTiles = 1>
 __global__ void q8_skinny_kernel(
     const uint8_t * __restrict__ codes, const half * __restrict__ scales,
     const half * __restrict__ input, float * __restrict__ output,
     int n, int k, int m) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    using code_t = q_skinny_code<Q4>;
     static_assert(RowTiles == 1 || RowTiles == 2,
                   "Q8 skinny supports one or two 8-row tiles");
     static_assert(!M1Only || RowTiles == 1,
@@ -180,8 +262,9 @@ __global__ void q8_skinny_kernel(
     const int groups_k16 = k >> 4;
     const int groups_per_warp = groups_k16 / SplitK;
     const int group_begin = warp * groups_per_warp;
-    const uint4 * code_ptr = reinterpret_cast<const uint4 *>(codes) +
-                             (size_t) tile * groups_k16 * 32 + lane;
+    const typename code_t::packed_t * code_ptr =
+        reinterpret_cast<const typename code_t::packed_t *>(codes) +
+        (size_t) tile * groups_k16 * 32 + lane;
     const half * scale_ptr = scales + tile * 32 + lane;
 
     float accum[RowTiles][NAcc][8];
@@ -197,9 +280,9 @@ __global__ void q8_skinny_kernel(
     }
     int loaded_scale_group = -1;
     half loaded_scale = __float2half(0.0f);
-    uint4 prefetched = make_uint4(0, 0, 0, 0);
+    typename code_t::packed_t prefetched = {};
     if constexpr (PrefetchCodes) {
-        prefetched = __ldcs(code_ptr + (size_t) group_begin * 32);
+        prefetched = code_t::ld(code_ptr + (size_t) group_begin * 32);
     }
 
 #pragma unroll 4
@@ -210,18 +293,17 @@ __global__ void q8_skinny_kernel(
             loaded_scale_group = scale_group;
         }
 
-        const uint4 packed =
+        const typename code_t::packed_t packed =
             PrefetchCodes ? prefetched
-                          : __ldcs(code_ptr + (size_t) group * 32);
-        uint4 next = make_uint4(0, 0, 0, 0);
+                          : code_t::ld(code_ptr + (size_t) group * 32);
+        typename code_t::packed_t next = {};
         if constexpr (PrefetchCodes) {
             if (group + 1 < group_begin + groups_per_warp) {
-                next = __ldcs(code_ptr + (size_t) (group + 1) * 32);
+                next = code_t::ld(code_ptr + (size_t) (group + 1) * 32);
             }
         }
         half2 weights[8];
-        s8x8_to_half2x4(make_uint2(packed.x, packed.y), weights);
-        s8x8_to_half2x4(make_uint2(packed.z, packed.w), weights + 4);
+        code_t::decode(packed, weights);
 
         const half2 scale2 = __halves2half2(loaded_scale, loaded_scale);
 #pragma unroll
@@ -357,9 +439,10 @@ struct q8_skinny_multi_params {
 
 // Same execution as q8_skinny_kernel, but each CTA picks its segment from blockIdx.x and
 // writes to that segment's dst with its own row length. The dot CTAs have no split-K.
-template <int SplitK, int NAcc, bool M1Only = false, int RowTiles = 1>
+template <bool Q4, int SplitK, int NAcc, bool M1Only = false, int RowTiles = 1>
 __global__ void q8_skinny_multi_kernel(const q8_skinny_multi_params p) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    using code_t = q_skinny_code<Q4>;
     static_assert(RowTiles == 1 || RowTiles == 2,
                   "Q8 skinny multi supports one or two 8-row tiles");
     static_assert(!M1Only || RowTiles == 1,
@@ -371,7 +454,7 @@ __global__ void q8_skinny_multi_kernel(const q8_skinny_multi_params p) {
 
     if ((int) blockIdx.x >= p.n_main_tiles) {
         // One narrow row per CTA: all threads split K, so that each warp step reads exactly one
-        // Q8_0 block (a broadcast scale and 32 contiguous quants), then the block reduces in a
+        // quant block (a broadcast scale and 32 contiguous values), then the block reduces in a
         // fixed order. With one warp per row the K loop was latency bound and these few rows
         // outlasted all repacked tiles of the launch.
         const int row_all = (int) blockIdx.x - p.n_main_tiles;
@@ -380,7 +463,6 @@ __global__ void q8_skinny_multi_kernel(const q8_skinny_multi_params p) {
             ++seg;
         }
         const int row = row_all - p.dot[seg].first_row;
-        const block_q8_0 * wrow = reinterpret_cast<const block_q8_0 *>(p.dot[seg].rows) + (size_t) row * (p.k / QK8_0);
 
         float accum[16];
 #pragma unroll
@@ -389,8 +471,18 @@ __global__ void q8_skinny_multi_kernel(const q8_skinny_multi_params p) {
         }
 #pragma unroll 2
         for (int i = threadIdx.x; i < p.k; i += blockDim.x) {
-            const block_q8_0 * block = wrow + i / QK8_0;
-            const float weight = __half2float(block->d) * (float) block->qs[i % QK8_0];
+            float weight;
+            if constexpr (Q4) {
+                // q4_0: value v is the low nibble of qs[v] for v < 16 and the high nibble of qs[v - 16] above
+                const block_q4_0 * block = reinterpret_cast<const block_q4_0 *>(p.dot[seg].rows) +
+                                          (size_t) row * (p.k / 32) + i / 32;
+                const int vui = block->qs[i & 15];
+                weight = __half2float(block->d) * (float) ((i & 16 ? (vui >> 4) : (vui & 0x0f)) - 8);
+            } else {
+                const block_q8_0 * block = reinterpret_cast<const block_q8_0 *>(p.dot[seg].rows) +
+                                          (size_t) row * (p.k / QK8_0) + i / QK8_0;
+                weight = __half2float(block->d) * (float) block->qs[i % QK8_0];
+            }
 #pragma unroll
             for (int t = 0; t < 16; ++t) {
                 if (t < p.m) {
@@ -444,8 +536,9 @@ __global__ void q8_skinny_multi_kernel(const q8_skinny_multi_params p) {
     const int groups_k16 = k >> 4;
     const int groups_per_warp = groups_k16 / SplitK;
     const int group_begin = warp * groups_per_warp;
-    const uint4 * code_ptr = reinterpret_cast<const uint4 *>(codes) +
-                             (size_t) tile * groups_k16 * 32 + lane;
+    const typename code_t::packed_t * code_ptr =
+        reinterpret_cast<const typename code_t::packed_t *>(codes) +
+        (size_t) tile * groups_k16 * 32 + lane;
     const half * scale_ptr = scales + tile * 32 + lane;
 
     float accum[RowTiles][NAcc][8];
@@ -470,10 +563,9 @@ __global__ void q8_skinny_multi_kernel(const q8_skinny_multi_params p) {
             loaded_scale_group = scale_group;
         }
 
-        const uint4 packed = __ldcs(code_ptr + (size_t) group * 32);
+        const typename code_t::packed_t packed = code_t::ld(code_ptr + (size_t) group * 32);
         half2 weights[8];
-        s8x8_to_half2x4(make_uint2(packed.x, packed.y), weights);
-        s8x8_to_half2x4(make_uint2(packed.z, packed.w), weights + 4);
+        code_t::decode(packed, weights);
 
         const half2 scale2 = __halves2half2(loaded_scale, loaded_scale);
 #pragma unroll
@@ -572,13 +664,14 @@ __global__ void q8_skinny_multi_kernel(const q8_skinny_multi_params p) {
 // gate and up are two separate tensors instead of one combined weight: projection p
 // (0 = gate, 1 = up) reads its own codes/scales, both for the tile at blockIdx.x. The
 // epilogue applies silu(gate) * up and writes float.
-template <int SplitK, int NAcc, bool PrefetchCodes, bool M1Only = false, int RowTiles = 1>
+template <bool Q4, int SplitK, int NAcc, bool PrefetchCodes, bool M1Only = false, int RowTiles = 1>
 __global__ void q8_skinny_gated_kernel(
     const uint8_t * __restrict__ gate_codes, const half * __restrict__ gate_scales,
     const uint8_t * __restrict__ up_codes, const half * __restrict__ up_scales,
     const half * __restrict__ input, float * __restrict__ output,
     int n, int k, int m) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    using code_t = q_skinny_code<Q4>;
     static_assert(RowTiles == 1 || RowTiles == 2,
                   "Q8 skinny gated pair supports one or two 8-row tiles");
     static_assert(!M1Only || RowTiles == 1,
@@ -597,8 +690,9 @@ __global__ void q8_skinny_gated_kernel(
     const int group_begin = warp * groups_per_warp;
     const uint8_t * codes = projection ? up_codes : gate_codes;
     const half * scales = projection ? up_scales : gate_scales;
-    const uint4 * code_ptr = reinterpret_cast<const uint4 *>(codes) +
-                             (size_t) tile * groups_k16 * 32 + lane;
+    const typename code_t::packed_t * code_ptr =
+        reinterpret_cast<const typename code_t::packed_t *>(codes) +
+        (size_t) tile * groups_k16 * 32 + lane;
     const half * scale_ptr = scales + tile * 32 + lane;
 
     float accum[RowTiles][NAcc][8];
@@ -614,9 +708,9 @@ __global__ void q8_skinny_gated_kernel(
     }
     int loaded_scale_group = -1;
     half loaded_scale = __float2half(0.0f);
-    uint4 prefetched = make_uint4(0, 0, 0, 0);
+    typename code_t::packed_t prefetched = {};
     if constexpr (PrefetchCodes) {
-        prefetched = __ldcs(code_ptr + (size_t) group_begin * 32);
+        prefetched = code_t::ld(code_ptr + (size_t) group_begin * 32);
     }
 
 #pragma unroll 4
@@ -627,18 +721,17 @@ __global__ void q8_skinny_gated_kernel(
             loaded_scale_group = scale_group;
         }
 
-        const uint4 packed =
+        const typename code_t::packed_t packed =
             PrefetchCodes ? prefetched
-                          : __ldcs(code_ptr + (size_t) group * 32);
-        uint4 next = make_uint4(0, 0, 0, 0);
+                          : code_t::ld(code_ptr + (size_t) group * 32);
+        typename code_t::packed_t next = {};
         if constexpr (PrefetchCodes) {
             if (group + 1 < group_begin + groups_per_warp) {
-                next = __ldcs(code_ptr + (size_t) (group + 1) * 32);
+                next = code_t::ld(code_ptr + (size_t) (group + 1) * 32);
             }
         }
         half2 weights[8];
-        s8x8_to_half2x4(make_uint2(packed.x, packed.y), weights);
-        s8x8_to_half2x4(make_uint2(packed.z, packed.w), weights + 4);
+        code_t::decode(packed, weights);
 
         const half2 scale2 = __halves2half2(loaded_scale, loaded_scale);
 #pragma unroll
@@ -771,25 +864,26 @@ static q8_skinny_config q8_skinny_multi_config_for(const int64_t k) {
     return {q8_skinny_split_k(k), k >= 4096 ? 2 : 1, false};
 }
 
-template <int SplitK, int NAcc, bool PrefetchCodes, bool M1Only, int RowTiles>
+template <bool Q4, int SplitK, int NAcc, bool PrefetchCodes, bool M1Only, int RowTiles>
 static void q8_skinny_launch(const uint8_t * codes, const half * scales, const half * input,
                              float * output, int n, int k, int m, cudaStream_t stream) {
-    q8_skinny_kernel<SplitK, NAcc, PrefetchCodes, M1Only, RowTiles><<<n / 32, 32 * SplitK, 0, stream>>>(
+    q8_skinny_kernel<Q4, SplitK, NAcc, PrefetchCodes, M1Only, RowTiles><<<n / 32, 32 * SplitK, 0, stream>>>(
         codes, scales, input, output, n, k, m);
 }
 
 #define Q8_SKINNY_LAUNCH(NAcc, M1Only, RowTiles)                                            \
     do {                                                                                    \
         switch (config.split_k) {                                                           \
-            case 16: q8_skinny_launch<16, NAcc, false, M1Only, RowTiles>(codes, scales,     \
+            case 16: q8_skinny_launch<Q4, 16, NAcc, false, M1Only, RowTiles>(codes, scales, \
                          input, output, n, k, m, stream); break;                            \
-            case 8:  q8_skinny_launch<8, NAcc, false, M1Only, RowTiles>(codes, scales,      \
+            case 8:  q8_skinny_launch<Q4, 8, NAcc, false, M1Only, RowTiles>(codes, scales,  \
                          input, output, n, k, m, stream); break;                            \
-            default: q8_skinny_launch<4, NAcc, false, M1Only, RowTiles>(codes, scales,      \
+            default: q8_skinny_launch<Q4, 4, NAcc, false, M1Only, RowTiles>(codes, scales,  \
                          input, output, n, k, m, stream); break;                            \
         }                                                                                   \
     } while (0)
 
+template <bool Q4>
 static void q8_skinny_mul_mat_launch(const uint8_t * codes, const half * scales, const half * input,
                                      float * output, int n, int k, int m, cudaStream_t stream) {
     const q8_skinny_config config = q8_skinny_config_for(n, k);
@@ -797,11 +891,11 @@ static void q8_skinny_mul_mat_launch(const uint8_t * codes, const half * scales,
         // only (K=5120, N=4352) selects prefetching, always at split 16 with one chain
         GGML_ASSERT(config.split_k == 16 && config.n_acc == 1);
         if (m == 1) {
-            q8_skinny_launch<16, 1, true, true, 1>(codes, scales, input, output, n, k, m, stream);
+            q8_skinny_launch<Q4, 16, 1, true, true, 1>(codes, scales, input, output, n, k, m, stream);
         } else if (m <= 8) {
-            q8_skinny_launch<16, 1, true, false, 1>(codes, scales, input, output, n, k, m, stream);
+            q8_skinny_launch<Q4, 16, 1, true, false, 1>(codes, scales, input, output, n, k, m, stream);
         } else {
-            q8_skinny_launch<16, 1, true, false, 2>(codes, scales, input, output, n, k, m, stream);
+            q8_skinny_launch<Q4, 16, 1, true, false, 2>(codes, scales, input, output, n, k, m, stream);
         }
     } else if (config.n_acc == 2) {
         if (m == 1) { Q8_SKINNY_LAUNCH(2, true, 1); } else if (m <= 8) { Q8_SKINNY_LAUNCH(2, false, 1); }
@@ -815,48 +909,50 @@ static void q8_skinny_mul_mat_launch(const uint8_t * codes, const half * scales,
 
 #undef Q8_SKINNY_LAUNCH
 
-template <bool M1Only, int RowTiles>
+template <bool Q4, bool M1Only, int RowTiles>
 static void q8_skinny_gated_launch(const uint8_t * gate_codes, const half * gate_scales,
                                    const uint8_t * up_codes, const half * up_scales,
                                    const half * input, float * output, int n, int k, int m,
                                    cudaStream_t stream) {
-    q8_skinny_gated_kernel<8, 2, true, M1Only, RowTiles><<<n / 32, 64 * 8, 0, stream>>>(
+    q8_skinny_gated_kernel<Q4, 8, 2, true, M1Only, RowTiles><<<n / 32, 64 * 8, 0, stream>>>(
         gate_codes, gate_scales, up_codes, up_scales, input, output, n, k, m);
 }
 
+template <bool Q4>
 static void q8_skinny_gated_mul_mat_launch(const uint8_t * gate_codes, const half * gate_scales,
                                            const uint8_t * up_codes, const half * up_scales,
                                            const half * input, float * output, int n, int k, int m,
                                            cudaStream_t stream) {
     if (m == 1) {
-        q8_skinny_gated_launch<true, 1>(gate_codes, gate_scales, up_codes, up_scales,
+        q8_skinny_gated_launch<Q4, true, 1>(gate_codes, gate_scales, up_codes, up_scales,
                                         input, output, n, k, m, stream);
     } else if (m <= 8) {
-        q8_skinny_gated_launch<false, 1>(gate_codes, gate_scales, up_codes, up_scales,
+        q8_skinny_gated_launch<Q4, false, 1>(gate_codes, gate_scales, up_codes, up_scales,
                                          input, output, n, k, m, stream);
     } else {
-        q8_skinny_gated_launch<false, 2>(gate_codes, gate_scales, up_codes, up_scales,
+        q8_skinny_gated_launch<Q4, false, 2>(gate_codes, gate_scales, up_codes, up_scales,
                                          input, output, n, k, m, stream);
     }
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <int SplitK, int NAcc, bool M1Only, int RowTiles>
+template <bool Q4, int SplitK, int NAcc, bool M1Only, int RowTiles>
 static void q8_skinny_multi_launch(const q8_skinny_multi_params & p, cudaStream_t stream) {
     // one CTA per narrow row after the repacked tiles
     const int n_tiles = p.n_main_tiles + p.n_dot_rows;
-    q8_skinny_multi_kernel<SplitK, NAcc, M1Only, RowTiles><<<n_tiles, 32 * SplitK, 0, stream>>>(p);
+    q8_skinny_multi_kernel<Q4, SplitK, NAcc, M1Only, RowTiles><<<n_tiles, 32 * SplitK, 0, stream>>>(p);
 }
 
 #define Q8_SKINNY_MULTI_LAUNCH(NAcc, M1Only, RowTiles)                                      \
     do {                                                                                    \
         switch (config.split_k) {                                                           \
-            case 16: q8_skinny_multi_launch<16, NAcc, M1Only, RowTiles>(p, stream); break;  \
-            case 8:  q8_skinny_multi_launch<8, NAcc, M1Only, RowTiles>(p, stream); break;   \
-            default: q8_skinny_multi_launch<4, NAcc, M1Only, RowTiles>(p, stream); break;   \
+            case 16: q8_skinny_multi_launch<Q4, 16, NAcc, M1Only, RowTiles>(p, stream); break;  \
+            case 8:  q8_skinny_multi_launch<Q4, 8, NAcc, M1Only, RowTiles>(p, stream); break;   \
+            default: q8_skinny_multi_launch<Q4, 4, NAcc, M1Only, RowTiles>(p, stream); break;   \
         }                                                                                   \
     } while (0)
 
+template <bool Q4>
 static void q8_skinny_multi_mul_mat_launch(const q8_skinny_multi_params & p, cudaStream_t stream) {
     const q8_skinny_config config = q8_skinny_multi_config_for(p.k);
     GGML_ASSERT(!config.prefetch);
@@ -875,7 +971,11 @@ static void q8_skinny_multi_mul_mat_launch(const q8_skinny_multi_params & p, cud
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 bool ggml_cuda_q8_skinny_is_repacked(const ggml_tensor * t) {
-    return t->extra == (const void *) &q8_skinny_marker;
+    return t->extra == (const void *) &q8_skinny_marker || t->extra == (const void *) &q4_skinny_marker;
+}
+
+static bool q8_skinny_is_repacked_q4(const ggml_tensor * t) {
+    return t->extra == (const void *) &q4_skinny_marker;
 }
 
 bool ggml_cuda_q8_skinny_can_repack(const ggml_tensor * t) {
@@ -883,7 +983,8 @@ bool ggml_cuda_q8_skinny_can_repack(const ggml_tensor * t) {
     GGML_UNUSED(t);
     return false;
 #else
-    if (t->type != GGML_TYPE_Q8_0 || t->view_src != nullptr || t->op != GGML_OP_NONE || t->extra != nullptr) {
+    if ((t->type != GGML_TYPE_Q8_0 && t->type != GGML_TYPE_Q4_0) ||
+            t->view_src != nullptr || t->op != GGML_OP_NONE || t->extra != nullptr) {
         return false;
     }
     if (t->buffer == nullptr || ggml_backend_buffer_get_type(t->buffer) != ggml_backend_cuda_buffer_type(ggml_cuda_get_device())) {
@@ -915,9 +1016,10 @@ void ggml_cuda_q8_skinny_repack_inplace(ggml_backend_cuda_context & ctx, ggml_te
     const int64_t k = t->ne[0];
     const int64_t n = t->ne[1];
     const int64_t ntiles = n / 32;
+    const bool q4 = t->type == GGML_TYPE_Q4_0;
     GGML_ASSERT(k >= 32 && ntiles >= 1);
-    const size_t tile_src_bytes = 34 * (size_t) k;
-    const size_t tile_dst_bytes = 32 * (size_t) k;
+    const size_t tile_src_bytes = (q4 ? 18 : 34) * (size_t) k;
+    const size_t tile_dst_bytes = (q4 ? 16 : 32) * (size_t) k;
     const size_t scales_bytes = (size_t) n * k / 16;
 
     constexpr size_t staging_max = 32ull * 1024 * 1024;
@@ -945,19 +1047,26 @@ void ggml_cuda_q8_skinny_repack_inplace(ggml_backend_cuda_context & ctx, ggml_te
         const int64_t t1 = std::min(t0 + (int64_t) tiles_per_chunk, ntiles);
         CUDA_CHECK(cudaMemcpyAsync(staging, data + t0 * tile_src_bytes, (t1 - t0) * tile_src_bytes,
                                    cudaMemcpyDeviceToDevice, stream));
-        q8_skinny_repack_kernel<<<(unsigned) (t1 - t0), 256, 0, stream>>>(
-            (const uint8_t *) staging, data + t0 * tile_dst_bytes, (half *) scales_tmp,
-            (int) n, (int) k, (int) t0);
+        if (q4) {
+            q8_skinny_repack_kernel<true><<<(unsigned) (t1 - t0), 256, 0, stream>>>(
+                (const uint8_t *) staging, data + t0 * tile_dst_bytes, (half *) scales_tmp,
+                (int) n, (int) k, (int) t0);
+        } else {
+            q8_skinny_repack_kernel<false><<<(unsigned) (t1 - t0), 256, 0, stream>>>(
+                (const uint8_t *) staging, data + t0 * tile_dst_bytes, (half *) scales_tmp,
+                (int) n, (int) k, (int) t0);
+        }
         CUDA_CHECK(cudaGetLastError());
     }
-    CUDA_CHECK(cudaMemcpyAsync(data + n * k, scales_tmp, scales_bytes, cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(data + q8_skinny_codes_bytes(n, k, q4), scales_tmp, scales_bytes,
+                               cudaMemcpyDeviceToDevice, stream));
 
     // no pool: the staging must not stay resident after the one-time repack
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaFree(staging));
     CUDA_CHECK(cudaFree(scales_tmp));
 
-    t->extra = &q8_skinny_marker;
+    t->extra = q4 ? (void *) &q4_skinny_marker : (void *) &q8_skinny_marker;
 }
 
 void ggml_cuda_q8_skinny_prepass(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph) {
@@ -967,7 +1076,7 @@ void ggml_cuda_q8_skinny_prepass(ggml_backend_cuda_context & ctx, ggml_cgraph * 
         return;
     }
 
-    // candidates: Q8_0 weights used as MUL_MAT src0; none in steady state
+    // candidates: Q8_0/Q4_0 weights used as MUL_MAT src0; none in steady state
     std::vector<ggml_tensor *> candidates;
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -1043,15 +1152,23 @@ bool ggml_cuda_q8_skinny_mul_mat(ggml_backend_cuda_context & ctx, const ggml_ten
     to_fp16(src1->data, input.get(), m * k, ctx.stream());
 
     const uint8_t * data = (const uint8_t *) src0->data;
-    q8_skinny_mul_mat_launch(data, (const half *) (data + n * k), input.get(), (float *) dst->data,
-                             (int) n, (int) k, (int) m, ctx.stream());
+    const bool q4 = q8_skinny_is_repacked_q4(src0);
+    const half * scales = (const half *) (data + q8_skinny_codes_bytes(n, k, q4));
+    if (q4) {
+        q8_skinny_mul_mat_launch<true>(data, scales, input.get(), (float *) dst->data,
+                                       (int) n, (int) k, (int) m, ctx.stream());
+    } else {
+        q8_skinny_mul_mat_launch<false>(data, scales, input.get(), (float *) dst->data,
+                                        (int) n, (int) k, (int) m, ctx.stream());
+    }
     return true;
 }
 
 bool ggml_cuda_q8_skinny_mul_mat_gated(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_w,
                                        const ggml_tensor * up_w, const ggml_tensor * src1,
                                        ggml_tensor * dst) {
-    if (!ggml_cuda_q8_skinny_is_repacked(gate_w) || !ggml_cuda_q8_skinny_is_repacked(up_w)) {
+    if (!ggml_cuda_q8_skinny_is_repacked(gate_w) || !ggml_cuda_q8_skinny_is_repacked(up_w) ||
+            q8_skinny_is_repacked_q4(gate_w) != q8_skinny_is_repacked_q4(up_w)) {
         return false;
     }
     const int64_t k = gate_w->ne[0];
@@ -1074,10 +1191,19 @@ bool ggml_cuda_q8_skinny_mul_mat_gated(ggml_backend_cuda_context & ctx, const gg
 
     const uint8_t * gate_data = (const uint8_t *) gate_w->data;
     const uint8_t * up_data   = (const uint8_t *) up_w->data;
-    q8_skinny_gated_mul_mat_launch(gate_data, (const half *) (gate_data + n * k),
-                                   up_data, (const half *) (up_data + n * k),
-                                   input.get(), (float *) dst->data, (int) n, (int) k, (int) m,
-                                   ctx.stream());
+    const bool q4 = q8_skinny_is_repacked_q4(gate_w);
+    const size_t codes_bytes = q8_skinny_codes_bytes(n, k, q4);
+    if (q4) {
+        q8_skinny_gated_mul_mat_launch<true>(gate_data, (const half *) (gate_data + codes_bytes),
+                                         up_data, (const half *) (up_data + codes_bytes),
+                                         input.get(), (float *) dst->data, (int) n, (int) k, (int) m,
+                                         ctx.stream());
+    } else {
+        q8_skinny_gated_mul_mat_launch<false>(gate_data, (const half *) (gate_data + codes_bytes),
+                                          up_data, (const half *) (up_data + codes_bytes),
+                                          input.get(), (float *) dst->data, (int) n, (int) k, (int) m,
+                                          ctx.stream());
+    }
     return true;
 }
 
@@ -1098,6 +1224,10 @@ bool ggml_cuda_q8_skinny_mul_mat_multi(ggml_backend_cuda_context & ctx,
     q8_skinny_multi_params p = {};
     p.k = (int) k;
     p.m = (int) m;
+    // one code format per launch: the first weight picks it, the rest must match
+    const bool q4 = ggml_cuda_q8_skinny_is_repacked(src0s[0])
+        ? q8_skinny_is_repacked_q4(src0s[0])
+        : src0s[0]->type == GGML_TYPE_Q4_0;
     for (int i = 0; i < n_nodes; ++i) {
         const ggml_tensor * w = src0s[i];
         ggml_tensor * dst = dsts[i];
@@ -1108,17 +1238,18 @@ bool ggml_cuda_q8_skinny_mul_mat_multi(ggml_backend_cuda_context & ctx,
             return false;
         }
         if (ggml_cuda_q8_skinny_is_repacked(w)) {
-            if (p.n_seg >= 4) {
+            if (p.n_seg >= 4 || q8_skinny_is_repacked_q4(w) != q4) {
                 return false;
             }
             q8_skinny_multi_seg & seg = p.seg[p.n_seg++];
             seg.codes = (const uint8_t *) w->data;
-            seg.scales = (const half *) (seg.codes + n * k);
+            seg.scales = (const half *) (seg.codes + q8_skinny_codes_bytes(n, k, q4));
             seg.n = (int) n;
             seg.dst = (float *) dst->data;
         } else {
-            // narrow rows keep the row-major Q8_0 layout, the dot path reads them directly
-            if (w->type != GGML_TYPE_Q8_0 || w->view_src != nullptr || w->op != GGML_OP_NONE || n % 32 == 0) {
+            // narrow rows keep the row-major layout, the dot path reads them directly
+            if (w->type != (q4 ? GGML_TYPE_Q4_0 : GGML_TYPE_Q8_0) ||
+                    w->view_src != nullptr || w->op != GGML_OP_NONE || n % 32 == 0) {
                 return false;
             }
             if (p.n_dot >= 4) {
@@ -1146,17 +1277,27 @@ bool ggml_cuda_q8_skinny_mul_mat_multi(ggml_backend_cuda_context & ctx,
     to_fp16(src1->data, input.get(), m * k, ctx.stream());
     p.input = input.get();
 
-    q8_skinny_multi_mul_mat_launch(p, ctx.stream());
+    if (q4) {
+        q8_skinny_multi_mul_mat_launch<true>(p, ctx.stream());
+    } else {
+        q8_skinny_multi_mul_mat_launch<false>(p, ctx.stream());
+    }
     return true;
 }
 
 void ggml_cuda_q8_skinny_to_f16(const ggml_tensor * src0, half * dst, cudaStream_t stream) {
     const int n = (int) src0->ne[1];
     const int k = (int) src0->ne[0];
+    const bool q4 = q8_skinny_is_repacked_q4(src0);
     const uint8_t * data = (const uint8_t *) src0->data;
     const dim3 grid((unsigned) ((k / 16 + 7) / 8), (unsigned) (n / 32), 1);
-    q8_skinny_to_f16_kernel<<<grid, 256, 0, stream>>>(
-        dst, data, (const half *) (data + n * k), n, k);
+    if (q4) {
+        q8_skinny_to_f16_kernel<true><<<grid, 256, 0, stream>>>(
+            dst, data, (const half *) (data + q8_skinny_codes_bytes(n, k, true)), n, k);
+    } else {
+        q8_skinny_to_f16_kernel<false><<<grid, 256, 0, stream>>>(
+            dst, data, (const half *) (data + q8_skinny_codes_bytes(n, k, false)), n, k);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
