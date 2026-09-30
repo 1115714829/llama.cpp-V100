@@ -1710,20 +1710,22 @@ private:
         return res;
     }
 
-    // probe the other slots for a cached prompt that shares a longer prefix with the incoming prompt
-    // than this slot's own cache; read-only, logs the result but does not copy KV or restore checkpoints
-    // (step 1 of the cross-slot prefix reuse, see docs/design/v107-711-spec.md)
-    void probe_cross_slot_prefix(const server_slot & slot, const server_tokens & input_tokens, size_t n_past_self) const {
+    // look for another slot whose cached prompt shares a longer prefix with the incoming prompt
+    // than this slot's own cache; if one is found together with a usable memory checkpoint, take
+    // over its KV cache and state and return the new n_past; otherwise return n_past_self unchanged
+    // (see docs/design/v107-711-spec.md)
+    size_t try_cross_slot_prefix_reuse(server_slot & slot, const server_tokens & input_tokens, size_t n_past_self) {
         if (slots.size() <= 1) {
-            return;
+            return n_past_self;
         }
 
         llama_memory_t mem = llama_get_memory(ctx_tgt);
         if (mem == nullptr) {
-            return;
+            return n_past_self;
         }
 
-        int       id_other     = -1;
+        const server_slot *             slot_other = nullptr;
+        const common_prompt_checkpoint * ckpt_other = nullptr;
         size_t    n_past_other = 0;
         llama_pos pos_ckpt     = 0;
 
@@ -1732,8 +1734,37 @@ private:
                 continue;
             }
 
-            // the shared prefix must be intact from position 0
-            if (llama_memory_seq_pos_min(mem, other.id) != 0) {
+            // a live slot keeps its prompt tokens aligned with its memory, so the shared prefix is
+            // intact as long as the memory covers it; hybrid memories report max(attention pos_min,
+            // tail pos) here, so accept a nonzero pos_min only when there is no SWA cache that
+            // could have evicted the beginning of the attention KV
+            const llama_pos pos_min = llama_memory_seq_pos_min(mem, other.id);
+            if (pos_min < 0) {
+                continue;
+            }
+            if (pos_min > 0 && !(n_swa == 0 && llama_model_is_hybrid(model_tgt))) {
+                continue;
+            }
+
+            // the shared prefix is copied as text token positions - multimodal chunks do not map to it
+            if (other.prompt.tokens.has_mtmd || input_tokens.has_mtmd) {
+                continue;
+            }
+
+            // a context-shifted prompt may no longer match its older checkpoints
+            if (other.truncated) {
+                continue;
+            }
+
+            // the KV of the other slot is only reliable when its prompt was cached
+            const bool other_caches_prompt = other.task ? other.task->params.cache_prompt
+                                                        : (other.task_prev && other.task_prev->params.cache_prompt);
+            if (!other_caches_prompt) {
+                continue;
+            }
+
+            // the KV cache depends on the adapters in use
+            if (!are_lora_equal(slot.lora, other.lora)) {
                 continue;
             }
 
@@ -1744,24 +1775,113 @@ private:
             }
 
             n_past_other = lcp_len;
-            id_other     = other.id;
+            slot_other   = &other;
 
-            // nearest checkpoint with GDN state at or before the shared prefix, 0 if none
-            pos_ckpt = 0;
+            // nearest checkpoint whose memory state lies inside the shared prefix, 0 if none
+            // note: only checkpoints of the current prompt lineage are valid - checkpoints older
+            //       than the task that last set this prompt may describe different tokens
+            ckpt_other = nullptr;
+            pos_ckpt   = 0;
+
+            const int id_task_other = other.task ? other.task->id : (other.task_prev ? other.task_prev->id : -1);
 
             for (const auto & ckpt : other.prompt.checkpoints) {
-                if (!ckpt.empty() && ckpt.pos_max > pos_ckpt && ckpt.pos_max <= (llama_pos) lcp_len) {
-                    pos_ckpt = ckpt.pos_max;
+                if (ckpt.id_task != id_task_other) {
+                    continue;
                 }
+                if (!ckpt.empty() && ckpt.pos_max > pos_ckpt && ckpt.pos_max < (llama_pos) lcp_len) {
+                    pos_ckpt   = ckpt.pos_max;
+                    ckpt_other = &ckpt;
+                }
+            }
+
+            // the checkpoint layout must be one this code understands:
+            // - pos_min == 0: attention checkpoint, the state lies in [0, pos_max]
+            // - pos_min == pos_max: recurrent checkpoint, the state covers the token at pos_max
+            if (ckpt_other != nullptr &&
+                    (ckpt_other->pos_min != 0 && ckpt_other->pos_min != ckpt_other->pos_max)) {
+                ckpt_other = nullptr;
+                pos_ckpt   = 0;
+            }
+
+            // the other slot must still hold the memory up to the checkpoint
+            if (ckpt_other != nullptr && ckpt_other->pos_max > llama_memory_seq_pos_max(mem, other.id)) {
+                ckpt_other = nullptr;
+                pos_ckpt   = 0;
             }
         }
 
-        if (id_other < 0 || n_past_other <= n_past_self + 256) {
-            return;
+        if (slot_other == nullptr || n_past_other <= n_past_self + 256) {
+            return n_past_self;
         }
 
         SRV_INF("cross-slot prefix: self=%d other=%d (slot %d) ckpt=%d n_prompt=%d\n",
-                (int) n_past_self, (int) n_past_other, id_other, (int) pos_ckpt, (int) input_tokens.size());
+                (int) n_past_self, (int) n_past_other, slot_other->id, (int) pos_ckpt, (int) input_tokens.size());
+
+        // the copy below shares KV cells between two sequences; under a unified KV buffer both slots
+        // live in the same stream, so this is a metadata update instead of a full buffer copy
+        if (!params_base.kv_unified) {
+            return n_past_self;
+        }
+
+        // only completion tasks use the generated-token flow this reuse is written for
+        if (!slot.task->params.cache_prompt || slot.task->type != SERVER_TASK_TYPE_COMPLETION) {
+            return n_past_self;
+        }
+
+        // aLoRA adapters activate in the middle of the prompt, so the prefix is not adapter-free
+        if (lora_all_alora(slot.lora)) {
+            return n_past_self;
+        }
+
+        // without a checkpoint there is no way to restore the state of the recurrent layers
+        if (ckpt_other == nullptr) {
+            return n_past_self;
+        }
+
+        // position to resume from, same as in the checkpoint restore path of update_slots();
+        // for recurrent checkpoints (pos_min == pos_max) the state already covers the token at pos_max
+        const size_t n_past_new = std::min(
+                (size_t) std::max(ckpt_other->pos_min + 1, ckpt_other->pos_max),
+                (size_t) ckpt_other->n_tokens);
+
+        // the checkpoint must be far enough past this slot's own cache to be worth the copy
+        if (n_past_new <= n_past_self + 256) {
+            return n_past_self;
+        }
+
+        // the token at n_past_new must still be evaluated for logits
+        if (n_past_new >= input_tokens.size()) {
+            return n_past_self;
+        }
+
+        // the draft state must be recoverable too
+        if (ctx_dft != nullptr && ckpt_other->data_dft.empty()) {
+            return n_past_self;
+        }
+
+        // all checks passed - from here on the slot state is replaced
+
+        // drop this slot's own sequence (target and draft)
+        slot.prompt_clear();
+
+        // share the KV of the shared prefix with the other slot
+        slot.mem.seq_cp(slot_other->id, slot.id, 0, (llama_pos) n_past_new);
+
+        // restore the memory state of the target and the draft at the checkpoint
+        ckpt_other->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        ckpt_other->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+        // restore the draft's speculative state
+        common_speculative_set_state(spec.get(), slot.id, ckpt_other->data_spec);
+
+        // cache the first n_past_new tokens of the incoming prompt
+        slot.prompt.tokens = input_tokens.clone();
+        slot.prompt.tokens.keep_first(n_past_new);
+
+        SLT_INF(slot, "cross-slot prefix reused: %d tokens from slot %d\n", (int) n_past_new, slot_other->id);
+
+        return n_past_new;
     }
 
     std::vector<common_adapter_lora_info> construct_lora_list(const std::map<int, float> & config) const {
@@ -3579,13 +3699,14 @@ private:
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
 
+                        // when another slot shares a longer prefix with this request, take over its
+                        // KV cache and state instead of processing the prefix again
+                        n_past = try_cross_slot_prefix_reuse(slot, input_tokens, n_past);
+
                         slot.stats.n_prompt_cached    = n_past;
                         slot.stats.n_prompt_processed = 0;
 
                         metrics.add_prompt_cached(n_past);
-
-                        // read-only probe, does not affect the scheduling or the cache state
-                        probe_cross_slot_prefix(slot, input_tokens, n_past);
 
                         slot.prompt.tokens.keep_first(n_past);
 
