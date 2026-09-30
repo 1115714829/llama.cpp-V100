@@ -241,6 +241,127 @@ static void test_sparse_penalties() {
     printf("sparse penalties OK\n");
 }
 
+static bool find_logit(const llama_token_data_array & cur_p, llama_token id, float & logit) {
+    for (size_t i = 0; i < cur_p.size; ++i) {
+        if (cur_p.data[i].id == id) {
+            logit = cur_p.data[i].logit;
+            return true;
+        }
+    }
+    return false;
+}
+
+// a draft token accepted in the same round must enter the penalty window of the later rows: the
+// sparse row 1 is replayed on a clone of the chain advanced with draft[0], like the sequential path
+static void test_sparse_penalty_draft_in_window() {
+    const int32_t n_vocab = 256;
+    const int32_t top_k   = 20;
+    const int32_t last_n  = 32;
+    const float   freq    = 2.0f;
+    const float   present = 5.0f;
+
+    const llama_token draft0 = 0; // drafted from row 0, not yet in the penalty window
+
+    std::vector<llama_token_data> row(n_vocab);
+    for (llama_token id = 0; id < n_vocab; ++id) {
+        row[id] = { id, -20.0f, 0.0f };
+    }
+
+    // row 1: the draft token is the raw top-1, the next top_k - 1 tokens follow just below it
+    row[draft0].logit = 9.0f;
+    for (llama_token id = 1; id < top_k; ++id) {
+        row[id].logit = 9.0f - 0.1f * id;
+    }
+
+    // the penalty window holds last_n distinct tokens below the raw top-k, none of them is draft0
+    for (llama_token id = 100; id < 100 + last_n; ++id) {
+        row[id].logit = 7.0f - 0.01f * (id - 100);
+    }
+
+    std::vector<llama_token_data> sorted = row;
+    std::sort(sorted.begin(), sorted.end(), [](const llama_token_data & a, const llama_token_data & b) {
+        return a.logit > b.logit;
+    });
+
+    llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    llama_sampler_chain_add(chain, llama_sampler_init_penalties(n_vocab, last_n, 1.0f, freq, present));
+    llama_sampler_chain_add(chain, llama_sampler_init_top_k(top_k));
+
+    for (llama_token id = 100; id < 100 + last_n; ++id) {
+        llama_sampler_accept(chain, id);
+    }
+
+    // sequential path: row 1 sees the chain after draft0 was accepted
+    llama_sampler * chain_seq = llama_sampler_clone(chain);
+    llama_sampler_accept(chain_seq, draft0);
+
+    std::vector<llama_token_data> full = row;
+    llama_token_data_array cur_full = { full.data(), full.size(), -1, false };
+    llama_sampler_apply(chain_seq, &cur_full);
+
+    // sparse path with the fix: same, but replayed on the raw top_k + last_n candidates
+    llama_sampler * chain_sparse = llama_sampler_clone(chain);
+    llama_sampler_accept(chain_sparse, draft0);
+
+    std::vector<llama_token_data> sparse = sorted;
+    sparse.resize(top_k + last_n);
+    llama_token_data_array cur_sparse = { sparse.data(), sparse.size(), -1, false };
+    llama_sampler_apply(chain_sparse, &cur_sparse);
+
+    // without the draft token accepted the stale row keeps its raw logit
+    llama_sampler * chain_stale = llama_sampler_clone(chain);
+
+    std::vector<llama_token_data> stale = sorted;
+    stale.resize(top_k + last_n);
+    llama_token_data_array cur_stale = { stale.data(), stale.size(), -1, false };
+    llama_sampler_apply(chain_stale, &cur_stale);
+
+    assert(cur_full.size   == (size_t) top_k);
+    assert(cur_sparse.size == (size_t) top_k);
+    assert(cur_stale.size  == (size_t) top_k);
+
+    const std::vector<float> p_full   = softmax(cur_full.data,   cur_full.size);
+    const std::vector<float> p_sparse = softmax(cur_sparse.data, cur_sparse.size);
+
+    for (size_t i = 0; i < cur_full.size; ++i) {
+        const llama_token id = cur_full.data[i].id;
+
+        float logit = 0.0f;
+        assert(find_logit(cur_sparse, id, logit));
+        assert(fabs(cur_full.data[i].logit - logit) < 1e-5f);
+
+        size_t j = 0;
+        while (j < cur_sparse.size && cur_sparse.data[j].id != id) {
+            ++j;
+        }
+        assert(j < cur_sparse.size);
+        assert(fabs(p_full[i] - p_sparse[j]) < 1e-5f);
+    }
+
+    // draft0 was accepted, so row 1 penalizes it in both the sequential and the fixed sparse row
+    float logit_full = 0.0f;
+    float logit_sparse = 0.0f;
+    float logit_stale = 0.0f;
+    assert(find_logit(cur_full,   draft0, logit_full));
+    assert(find_logit(cur_sparse, draft0, logit_sparse));
+    assert(find_logit(cur_stale,  draft0, logit_stale));
+
+    assert(fabs(logit_full   - (9.0f - freq - present)) < 1e-5f);
+    assert(fabs(logit_sparse - logit_full) < 1e-5f);
+    assert(fabs(logit_stale  - 9.0f) < 1e-5f);
+
+    // the stale chain keeps the draft token on top, the fixed one demotes it below the unpenalized tokens
+    assert(cur_full.data[0].id == 1);
+    assert(cur_stale.data[0].id == draft0);
+
+    llama_sampler_free(chain);
+    llama_sampler_free(chain_seq);
+    llama_sampler_free(chain_sparse);
+    llama_sampler_free(chain_stale);
+
+    printf("sparse penalty draft window OK\n");
+}
+
 int main() {
     // p == q
     test_single_step(
@@ -269,6 +390,7 @@ int main() {
 
     test_multi_step();
     test_sparse_penalties();
+    test_sparse_penalty_draft_in_window();
 
     return 0;
 }

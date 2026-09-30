@@ -136,6 +136,8 @@ int32_t common_sampler_sparse_k(const struct common_sampler * gsmpl);
 // - accepts draft tokens with probability min(1, p/q), resamples rejects from relu(p - q)
 //   and draws a bonus token from the last row if all draft tokens are accepted
 // - draws all random numbers from the dist sampler of the chain
+// - if the chain has penalties, the rows are replayed on a clone advanced with the draft tokens
+//   accepted before them, so that the targets match the sequential path
 //
 // requires: common_sampler_can_sparse_reject(gsmpl) and idxs.size() == draft.size() + 1
 std::vector<llama_token> common_sampler_reject_and_accept_n(

@@ -967,8 +967,9 @@ std::vector<llama_token> common_sampler_reject_core(
 }
 
 // top-k logits of the idx-th row of ctx, replayed through the sampler chain to get p
+// the chain may be a clone of the one of gsmpl, advanced with the draft tokens accepted before the row
 static common_sampler_sparse_probs common_sampler_sparse_p(
-        struct common_sampler * gsmpl,
+        struct llama_sampler * chain,
         struct llama_context * ctx,
         int idx,
         int32_t k) {
@@ -1020,7 +1021,6 @@ static common_sampler_sparse_probs common_sampler_sparse_p(
     llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
 
     // replay the chain without the final dist sampler
-    struct llama_sampler * chain = gsmpl->chain;
     const int32_t n = llama_sampler_chain_n(chain);
     for (int32_t i = 0; i < n - 1; ++i) {
         llama_sampler_apply(llama_sampler_chain_get(chain, i), &cur_p);
@@ -1069,11 +1069,24 @@ std::vector<llama_token> common_sampler_reject_and_accept_n(
 
     const int32_t k = common_sampler_sparse_k(gsmpl);
 
+    // penalties depend on the tokens accepted before a row, so with penalties in the chain replay
+    // the rows on a clone advanced with draft[0..i-1] like the sequential path does; without
+    // penalties no clone is needed and the chain is stateless within the round
+    struct llama_sampler * chain_draft = nullptr;
+    if (!draft.empty() && common_sampler_sparse_n_penalized(gsmpl) > 0) {
+        chain_draft = llama_sampler_clone(gsmpl->chain);
+    }
+
     std::vector<common_sampler_sparse_probs> p_rows;
     p_rows.reserve(idxs.size());
     for (size_t i = 0; i < idxs.size(); ++i) {
-        p_rows.push_back(common_sampler_sparse_p(gsmpl, ctx, idxs[i], k));
+        if (i > 0 && chain_draft) {
+            llama_sampler_accept(chain_draft, draft[i - 1]);
+        }
+        p_rows.push_back(common_sampler_sparse_p(chain_draft ? chain_draft : gsmpl->chain, ctx, idxs[i], k));
     }
+
+    llama_sampler_free(chain_draft);
 
     const int32_t n = llama_sampler_chain_n(gsmpl->chain);
     struct llama_sampler * dist = llama_sampler_chain_get(gsmpl->chain, n - 1);
