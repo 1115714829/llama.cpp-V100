@@ -29,7 +29,7 @@ Thanks also to:
 
 ## Introduction
 
-Based on llama.cpp (master `08618ff8e` as of 2026-09-26, already includes upstream v0.5.0). Some SM70 compute kernels are ported from 1Cat-vLLM; see the file headers and the `licenses/` directory for provenance and license.
+Based on llama.cpp (master `08618ff8e` as of 2026-09-26, already includes upstream v0.5.0). Some SM70 compute kernels are ported from other open-source projects; see the file headers and the `licenses/` directory for provenance and license.
 
 The test data below all uses Qwen3.8-27B (Q8_0) with DFlash2 speculative decoding.
 
@@ -42,7 +42,7 @@ Systematic optimization around the hardware characteristics of the V100 (SM70), 
 - **Multi-GPU parallelism**: optimized scheduling and kernel launching for tensor parallelism to reduce the time GPUs wait for the host; all-reduce between GPUs is done hierarchically following the NVLink topology; supports split optimization for the case where the number of attention heads is not divisible by the number of GPUs (e.g. 6 GPUs).
 - **Long context**: keeps prefill and decode speed stable at very long contexts, and reduces the VRAM used by compute buffers.
 - **Speculative decoding**: a complete DFlash2 speculative decoding pipeline, with optimized sampling and per-round overhead for higher decode speed.
-- **Compute kernels**: some SM70 compute kernels are ported from 1Cat-vLLM and adapted to the Q8_0 format, combined with operator fusion.
+- **Compute kernels**: attention, matrix multiplication and other compute kernels for SM70, adapted to the Q8_0 and Q4 formats, combined with operator fusion.
 - **Platform adaptation**: adapted to the NVLink interconnect and the NUMA memory architecture of the IBM AC922.
 - **Concurrent requests**: with multiple requests, decode gets priority and the time taken by prompt processing is limited; the decode batch, speculative decoding and VRAM reservation for multiple requests are all optimized by the number of requests.
 - **Multimodal**: the vision module (mmproj) can run on GPU to process images, PDFs and videos.
