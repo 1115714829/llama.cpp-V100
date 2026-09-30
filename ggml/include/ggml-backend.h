@@ -420,6 +420,7 @@ extern "C" {
         int64_t  ne[16*GGML_BACKEND_META_MAX_DEVICES];
         uint32_t nr[16];
         uint32_t n_segments;
+        // for derived tensors off is the start of this device's data in the global coordinates of this tensor
         int64_t  off[16*GGML_BACKEND_META_MAX_DEVICES];
         bool     has_off;
     };
