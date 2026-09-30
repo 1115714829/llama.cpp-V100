@@ -156,6 +156,9 @@ constexpr int kGroupedVerifyScoreStride  = 68; // BlockN + 4 f32, keeps the WMMA
 constexpr int kGroupedVerifyProbStride   = 72; // BlockN + 8 half, keeps the WMMA A loads conflict free
 constexpr int kGroupedVerifyKVQ8RowBytes = 272; // 8 q8_0 blocks of 34 B
 constexpr int kGroupedVerifyKVQ4RowBytes = 144; // 8 q4_0 blocks of 18 B
+// The dequantize always reads five u32 per q8_0 half block. For the last half block of the last
+// row the 5th load starts at the end of the staging buffer, so keep 16 B of slack behind it.
+constexpr int kGroupedVerifyStageTail    = 16;
 constexpr int kGroupedVerifyThreads      = 512;
 constexpr int kGroupedVerifyWarps        = kGroupedVerifyThreads / WARP_SIZE;
 constexpr int kGroupedVerifyQKWarps      = (kGroupedVerifyRows / 16) * (kGroupedVerifyBlockN / 16);
@@ -190,9 +193,10 @@ struct GroupedVerifyTraits {
 //   kv       64 * 264 * 2 = 33792 B  one K or V tile panel
 //   scores   48 *  68 * 4 = 13056 B
 //   probs    48 *  72 * 2 =  6912 B
-//   stage    64 * 272     = 17408 B  raw q8_0/q4_0 tile (q4_0 rows use 144 B)
+//   stage    64 * 272 + 16 = 17424 B  raw q8_0/q4_0 tile (q4_0 rows use 144 B) plus the
+//                                      aligned-load tail, see kGroupedVerifyStageTail
 //   rows          3 * 48 * 4 =  576 B
-//   total                  = 97280 B (1024 B under the 96 KiB limit)
+//   total                  = 97280 B (1024 B under the 96 KiB limit, the tail fits in the padding)
 struct alignas(256) GroupedVerifySmem {
     union {
         struct {
@@ -200,7 +204,7 @@ struct alignas(256) GroupedVerifySmem {
             alignas(16) __half  kv[kGroupedVerifyBlockN * kGroupedVerifyKVStride];
             alignas(16) float   scores[kGroupedVerifyRows * kGroupedVerifyScoreStride];
             alignas(16) __half  probs[kGroupedVerifyRows * kGroupedVerifyProbStride];
-            alignas(16) uint8_t kv_stage[kGroupedVerifyBlockN * kGroupedVerifyKVQ8RowBytes];
+            alignas(16) uint8_t kv_stage[kGroupedVerifyBlockN * kGroupedVerifyKVQ8RowBytes + kGroupedVerifyStageTail];
         } compute;
         alignas(16) float output[kGroupedVerifyRows * kGroupedVerifyHeadDim];
     } storage;
@@ -328,13 +332,19 @@ __device__ __forceinline__ void flash_attn_sm70_grouped_store_kv(
 
 // Dequantize a staged quantized tile into the half panel. No-op for fp16, which is stored there directly.
 // Only the staging rows of this warp are read back, see kGroupedVerifyStageRowsPerWarp.
+// A q8_0 item covers half a block (16 values, two uint4 panel writes). Its code bytes start at
+// base + 2 + h with h in {0, 16}: they are 2 B aligned for even blocks and 4 B aligned for odd
+// ones. Instead of branching on the block parity, always load five aligned u32 from
+// a = (base + 2 + h) & ~3 and funnel-shift each neighbor pair, so both parities of a warp run
+// the same instructions. The 5th load passes the end of the last row and reads the 16 B tail
+// of kv_stage, see GroupedVerifySmem.
 template <ggml_type type_KV>
 __device__ __forceinline__ void flash_attn_sm70_grouped_dequant_kv(
         __half * shared_kv, const uint8_t * kv_stage) {
     if constexpr (type_KV == GGML_TYPE_F16) {
         return;
     }
-    constexpr int kColsPerItem = 8;
+    constexpr int kColsPerItem = type_KV == GGML_TYPE_Q8_0 ? 16 : 8;
     constexpr int kGroupsPerRow = kGroupedVerifyHeadDim / kColsPerItem;
     constexpr int kItemsPerWarp = kGroupedVerifyStageRowsPerWarp * kGroupsPerRow;
     constexpr int kBlockBytes   = type_KV == GGML_TYPE_Q4_0 ? 18 : 34;
@@ -351,7 +361,7 @@ __device__ __forceinline__ void flash_attn_sm70_grouped_dequant_kv(
         const int base = row * kRowBytes + blk * kBlockBytes;
         const __half d = *reinterpret_cast<const __half *>(kv_stage + base);
         const __half2 d2 = __half2half2(d);
-        uint4 out;
+        __half * out_ptr = reinterpret_cast<__half *>(shared_kv + row * kGroupedVerifyKVStride) + c;
         if constexpr (type_KV == GGML_TYPE_Q4_0) {
             // 8 columns = 8 values of one nibble half; codes are 8 consecutive bytes.
             // The 18 B block makes qs only 2 B aligned, so assemble each u32 code word
@@ -362,20 +372,36 @@ __device__ __forceinline__ void flash_attn_sm70_grouped_dequant_kv(
             const uint32_t w1 = (uint32_t) *reinterpret_cast<const uint16_t *>(codes + 4)
                               | (uint32_t) *reinterpret_cast<const uint16_t *>(codes + 6) << 16;
             const bool hi_half = (c % 32) >= 16;
+            uint4 out;
             out.x = grouped_verify_half2_uint(grouped_verify_q4_pair_half2(w0,      hi_half, d2));
             out.y = grouped_verify_half2_uint(grouped_verify_q4_pair_half2(w0 >> 16, hi_half, d2));
             out.z = grouped_verify_half2_uint(grouped_verify_q4_pair_half2(w1,      hi_half, d2));
             out.w = grouped_verify_half2_uint(grouped_verify_q4_pair_half2(w1 >> 16, hi_half, d2));
+            *reinterpret_cast<uint4 *>(out_ptr) = out;
         } else {
-            // 8 columns = 16 B, and base + 2 + (c % 32) is even, so use u16 loads and one uint4 store.
-            const uint16_t * packed = reinterpret_cast<const uint16_t *>(kv_stage + base + 2 + (c % 32));
-            out.x = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(packed[0], d2));
-            out.y = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(packed[1], d2));
-            out.z = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(packed[2], d2));
-            out.w = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(packed[3], d2));
+            // 16 columns = 16 code bytes, see the alignment note above.
+            const int h  = c & 16;
+            const int p  = base + 2 + h;
+            const int a  = p & ~3;
+            const int sh = (p & 3) * 8;
+            const uint32_t * u = reinterpret_cast<const uint32_t *>(kv_stage + a);
+            const uint32_t w0 = __funnelshift_r(u[0], u[1], sh);
+            const uint32_t w1 = __funnelshift_r(u[1], u[2], sh);
+            const uint32_t w2 = __funnelshift_r(u[2], u[3], sh);
+            const uint32_t w3 = __funnelshift_r(u[3], u[4], sh);
+            uint4 out0;
+            out0.x = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(w0,      d2));
+            out0.y = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(w0 >> 16, d2));
+            out0.z = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(w1,      d2));
+            out0.w = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(w1 >> 16, d2));
+            uint4 out1;
+            out1.x = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(w2,      d2));
+            out1.y = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(w2 >> 16, d2));
+            out1.z = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(w3,      d2));
+            out1.w = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(w3 >> 16, d2));
+            *reinterpret_cast<uint4 *>(out_ptr)     = out0;
+            *reinterpret_cast<uint4 *>(out_ptr + 8) = out1;
         }
-        __half * out_ptr = reinterpret_cast<__half *>(shared_kv + row * kGroupedVerifyKVStride) + c;
-        *reinterpret_cast<uint4 *>(out_ptr) = out;
     }
 }
 
