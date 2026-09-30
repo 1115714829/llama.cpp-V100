@@ -47,11 +47,10 @@ bool ggml_cuda_flash_attn_ext_sm70_grouped_supported(const ggml_tensor * dst, in
         return false;
     }
     // op_params[5]: 0 = uniform GQA (the original behaviour), > 0 = the local Q head boundary
-    // of the 3-card attention split, < 0 = marker not filled in yet by the split backend.
+    // of the 3-card attention split, < 0 = the global node of that split, whose per-device
+    // copies get their boundary from the split backend: its global shape is checked as uniform
+    // GQA so that the scheduler keeps it on this device (the computed copies are never < 0).
     const int32_t q_head_boundary = ggml_get_op_params_i32(dst, 5);
-    if (q_head_boundary < 0) {
-        return false;
-    }
     if (q_head_boundary > 0) {
         // Non-uniform GQA: two local KV heads, the first g0 local query heads use KV head 0.
         if (K->ne[2] != 2) {
@@ -206,6 +205,8 @@ void ggml_cuda_flash_attn_ext_sm70_grouped(ggml_backend_cuda_context & ctx, ggml
 
     GGML_ASSERT(ggml_cuda_flash_attn_ext_sm70_grouped_supported(dst, ggml_cuda_info().devices[ggml_cuda_get_device()].cc));
 
+    // a node still marked for the split backend was never given its per-device boundary
+    GGML_ASSERT(ggml_get_op_params_i32(dst, 5) >= 0 && "q head boundary not filled in by the split backend");
     const bool nonuniform = ggml_get_op_params_i32(dst, 5) > 0;
     if (Q->ne[1] <= 8) {
         if (nonuniform) {
