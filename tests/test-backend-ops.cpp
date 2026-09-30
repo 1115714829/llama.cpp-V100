@@ -10886,6 +10886,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_multi({3072, 256, 256}, n_tokens, 5120));
     }
 
+    // multiple repacked Q4_K matmuls sharing one input, M <= 16 only. The N columns follow the
+    // per-card qkv/z and q/k/v shapes of the 4-card (2560/1536, 3072/256/256) and 2-card
+    // (5120/3072, 6144/512/512) tensor splits; all weights use K = 5120 so they share one src1.
+    for (int64_t n_tokens : {1, 8, 16}) {
+        test_cases.emplace_back(new test_mul_mat_multi({2560, 1536}, n_tokens, 5120, GGML_TYPE_Q4_K));
+        test_cases.emplace_back(new test_mul_mat_multi({3072, 256, 256}, n_tokens, 5120, GGML_TYPE_Q4_K));
+        test_cases.emplace_back(new test_mul_mat_multi({5120, 3072}, n_tokens, 5120, GGML_TYPE_Q4_K));
+        test_cases.emplace_back(new test_mul_mat_multi({6144, 512, 512}, n_tokens, 5120, GGML_TYPE_Q4_K));
+    }
+
     // the same matmuls with a large M: one shared input conversion across cuBLAS calls
     for (int64_t n_tokens : {64, 512}) {
         test_cases.emplace_back(new test_mul_mat_multi({2560, 1536, 12, 12}, n_tokens, 5120));

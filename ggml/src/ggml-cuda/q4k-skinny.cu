@@ -523,8 +523,6 @@ __global__ void __launch_bounds__(64 * SplitK) q4k_skinny_gated_kernel(
 #endif
 }
 
-#undef Q4K_SKINNY_MMA_8N8K4
-
 // Split-K 16 for the long K weights, 8 for the smallest ones (k = 256 has only 8 sub-blocks
 // per tile). can_repack guarantees k % 256 == 0, so one of the two always divides the
 // sub-block count. The long K weights use two accumulator chains, as in the Q8_0 path. No
@@ -675,6 +673,279 @@ bool ggml_cuda_q4k_skinny_mul_mat_gated(ggml_backend_cuda_context & ctx, const g
     const int count = (int) (n * m);
     q4k_skinny_swiglu_kernel<<<(count + 255) / 256, 256, 0, ctx.stream()>>>(gate, up.get(), count);
     CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+// ---- multiple projections of one input in one launch ----
+
+// One segment is a repacked Q4_K weight plus its output tile range. first_tile is the
+// running sum of n / 32 over the previous segments, so a CTA finds its segment from
+// blockIdx.x with a short scan.
+struct q4k_skinny_multi_seg {
+    const uint8_t * codes;
+    const uint8_t * meta;
+    int             n;
+    float *         dst;
+    int             first_tile;
+};
+
+// Passed by value.
+struct q4k_skinny_multi_params {
+    q4k_skinny_multi_seg seg[4];
+    int n_seg;
+    int n_main_tiles;
+    const half * input;
+    int k;
+    int m;
+};
+
+// Same execution as q4k_skinny_kernel, but each CTA picks its segment from blockIdx.x and
+// writes to that segment's dst with its own row length. Every weight is a repacked Q4_K
+// tensor, so there is no narrow-row dot path like in the Q8_0 multi kernel.
+template <ggml_type T, int SplitK, int NAcc, bool M1Only = false, int RowTiles = 1>
+__global__ void q4k_skinny_multi_kernel(const q4k_skinny_multi_params p) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    using codec = qskinny_codec<T>;
+    static_assert(RowTiles == 1 || RowTiles == 2,
+                  "Q4_K skinny multi supports one or two 8-row tiles");
+    static_assert(!M1Only || RowTiles == 1,
+                  "Q4_K skinny multi M=1 specialization uses one row tile");
+    __shared__ float partials[SplitK][M1Only ? 32 : RowTiles * 256];
+
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+
+    int seg = 0;
+    while (seg + 1 < p.n_seg && (int) blockIdx.x >= p.seg[seg + 1].first_tile) {
+        ++seg;
+    }
+    const int n = p.seg[seg].n;
+    const int k = p.k;
+    const int m = p.m;
+    const int tile = (int) blockIdx.x - p.seg[seg].first_tile;
+    const uint8_t * codes = p.seg[seg].codes;
+    const half * input = p.input;
+    float * output = p.seg[seg].dst;
+
+    const int quadpair = (lane >> 2) & 3;
+    const int row = (lane & 3) + ((lane & 16) ? 4 : 0);
+    const int groups_k16 = k >> 4;
+    // one iteration per 32-value sub-block; SplitK divides the sub-block count, the meta is
+    // reloaded whenever the 256-value super-block index changes
+    const int sub_blocks = k >> 5;
+    const int sub_blocks_per_warp = sub_blocks / SplitK;
+    const int sub_block_begin = warp * sub_blocks_per_warp;
+    const typename codec::record_t * code_ptr = reinterpret_cast<const typename codec::record_t *>(codes) +
+                                                (size_t) tile * groups_k16 * 32 + lane;
+    const uint4 * meta_ptr = reinterpret_cast<const uint4 *>(p.seg[seg].meta) + tile * 32 + lane;
+
+    float accum[RowTiles][NAcc][8];
+#pragma unroll
+    for (int row_tile = 0; row_tile < RowTiles; ++row_tile) {
+#pragma unroll
+        for (int chain = 0; chain < NAcc; ++chain) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                accum[row_tile][chain][i] = 0.0f;
+            }
+        }
+    }
+    int loaded_meta_kb = -1;
+    uint4 meta = make_uint4(0, 0, 0, 0);
+
+#pragma unroll 2
+    for (int sub_block = sub_block_begin; sub_block < sub_block_begin + sub_blocks_per_warp; ++sub_block) {
+        const int kb = sub_block >> 3;
+        if (kb != loaded_meta_kb) {
+            // one 16-byte meta per 256 values; shared by the 8 sub-blocks that follow
+            meta = __ldcs(meta_ptr + (size_t) kb * n);
+            loaded_meta_kb = kb;
+        }
+
+        const int group = sub_block << 1;
+        const typename codec::record_t records[2] = {
+            __ldcs(code_ptr + (size_t) (group + 0) * 32),
+            __ldcs(code_ptr + (size_t) (group + 1) * 32),
+        };
+        half2 weights[codec::values_per_sub_block / 2];
+        codec::decode(records, meta, sub_block & 7, weights);
+
+        const unsigned * b = reinterpret_cast<const unsigned *>(weights);
+#pragma unroll
+        for (int row_tile = 0; row_tile < RowTiles; ++row_tile) {
+            uint4 input01 = make_uint4(0, 0, 0, 0);
+            uint4 input23 = make_uint4(0, 0, 0, 0);
+            uint4 input45 = make_uint4(0, 0, 0, 0);
+            uint4 input67 = make_uint4(0, 0, 0, 0);
+            const int input_row_idx = row_tile * 8 + row;
+            if (input_row_idx < m) {
+                const half * input_row = input + (size_t) input_row_idx * k;
+                input01 = *reinterpret_cast<const uint4 *>(input_row + group * 16);
+                input23 = *reinterpret_cast<const uint4 *>(input_row + group * 16 + 8);
+                input45 = *reinterpret_cast<const uint4 *>(input_row + group * 16 + 16);
+                input67 = *reinterpret_cast<const uint4 *>(input_row + group * 16 + 24);
+            }
+
+            const unsigned * a0 = reinterpret_cast<const unsigned *>(&input01);
+            const unsigned * a1 = reinterpret_cast<const unsigned *>(&input23);
+            const unsigned * a2 = reinterpret_cast<const unsigned *>(&input45);
+            const unsigned * a3 = reinterpret_cast<const unsigned *>(&input67);
+            Q4K_SKINNY_MMA_8N8K4(accum[row_tile][0], a0[0], a0[1], b[0], b[1]);
+            Q4K_SKINNY_MMA_8N8K4(accum[row_tile][1 % NAcc], a0[2], a0[3], b[2], b[3]);
+            Q4K_SKINNY_MMA_8N8K4(accum[row_tile][2 % NAcc], a1[0], a1[1], b[4], b[5]);
+            Q4K_SKINNY_MMA_8N8K4(accum[row_tile][3 % NAcc], a1[2], a1[3], b[6], b[7]);
+            Q4K_SKINNY_MMA_8N8K4(accum[row_tile][0], a2[0], a2[1], b[8], b[9]);
+            Q4K_SKINNY_MMA_8N8K4(accum[row_tile][1 % NAcc], a2[2], a2[3], b[10], b[11]);
+            Q4K_SKINNY_MMA_8N8K4(accum[row_tile][2 % NAcc], a3[0], a3[1], b[12], b[13]);
+            Q4K_SKINNY_MMA_8N8K4(accum[row_tile][3 % NAcc], a3[2], a3[3], b[14], b[15]);
+        }
+    }
+
+#pragma unroll
+    for (int row_tile = 0; row_tile < RowTiles; ++row_tile) {
+#pragma unroll
+        for (int chain = 1; chain < NAcc; ++chain) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                accum[row_tile][0][i] += accum[row_tile][chain][i];
+            }
+        }
+    }
+
+    if constexpr (M1Only) {
+        if ((lane & 17) == 0) {
+#pragma unroll
+            for (int pair = 0; pair < 2; ++pair) {
+#pragma unroll
+                for (int offset = 0; offset < 2; ++offset) {
+                    const int i = pair * 4 + offset;
+                    const int output_col =
+                        offset | (((lane >> 1) & 1) << 1) | (pair << 2);
+                    partials[warp][quadpair * 8 + output_col] = accum[0][0][i];
+                }
+            }
+        }
+    } else {
+#pragma unroll
+        for (int row_tile = 0; row_tile < RowTiles; ++row_tile) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int output_row =
+                    row_tile * 8 + (i & 2) + ((lane & 16) ? 4 : 0) + (lane & 1);
+                const int output_col =
+                    (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+                partials[warp][output_row * 32 + quadpair * 8 + output_col] =
+                    accum[row_tile][0][i];
+            }
+        }
+    }
+    __syncthreads();
+
+    // fixed reduction order over the split-K warps keeps the result reproducible
+    constexpr int kOutputElements = M1Only ? 32 : RowTiles * 256;
+    for (int element = threadIdx.x; element < kOutputElements;
+         element += blockDim.x) {
+        float value = 0.0f;
+#pragma unroll
+        for (int k_warp = 0; k_warp < SplitK; ++k_warp) {
+            value += partials[k_warp][element];
+        }
+        if constexpr (M1Only) {
+            output[tile * 32 + element] = value;
+        } else {
+            const int output_row = element >> 5;
+            const int output_col = element & 31;
+            if (output_row < m) {
+                output[(size_t) output_row * n + tile * 32 + output_col] = value;
+            }
+        }
+    }
+#else
+    NO_DEVICE_CODE;
+    GGML_UNUSED(p);
+#endif
+}
+
+#undef Q4K_SKINNY_MMA_8N8K4
+
+template <ggml_type T, int SplitK, int NAcc, bool M1Only, int RowTiles>
+static void q4k_skinny_multi_launch(const q4k_skinny_multi_params & p, cudaStream_t stream) {
+    // one CTA per 32-row tile of every segment
+    q4k_skinny_multi_kernel<T, SplitK, NAcc, M1Only, RowTiles><<<p.n_main_tiles, 32 * SplitK, 0, stream>>>(p);
+}
+
+#define Q4K_SKINNY_MULTI_LAUNCH(NAcc, M1Only, RowTiles)                                             \
+    do {                                                                                            \
+        switch (config.split_k) {                                                                   \
+            case 16: q4k_skinny_multi_launch<GGML_TYPE_Q4_K, 16, NAcc, M1Only, RowTiles>(p,         \
+                         stream); break;                                                            \
+            default: q4k_skinny_multi_launch<GGML_TYPE_Q4_K, 8, NAcc, M1Only, RowTiles>(p,          \
+                         stream); break;                                                            \
+        }                                                                                           \
+    } while (0)
+
+static void q4k_skinny_multi_mul_mat_launch(const q4k_skinny_multi_params & p, cudaStream_t stream) {
+    // same split-K and accumulator chains as q4k_skinny_mul_mat_launch, so every segment gets
+    // the same result as a single-weight launch
+    const q4k_skinny_config config = q4k_skinny_config_for(p.k);
+    if (config.n_acc == 2) {
+        if (p.m == 1) { Q4K_SKINNY_MULTI_LAUNCH(2, true, 1); } else if (p.m <= 8) { Q4K_SKINNY_MULTI_LAUNCH(2, false, 1); }
+        else { Q4K_SKINNY_MULTI_LAUNCH(2, false, 2); }
+    } else {
+        if (p.m == 1) { Q4K_SKINNY_MULTI_LAUNCH(1, true, 1); } else if (p.m <= 8) { Q4K_SKINNY_MULTI_LAUNCH(1, false, 1); }
+        else { Q4K_SKINNY_MULTI_LAUNCH(1, false, 2); }
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+#undef Q4K_SKINNY_MULTI_LAUNCH
+
+bool ggml_cuda_q4k_skinny_mul_mat_multi(ggml_backend_cuda_context & ctx,
+                                        const ggml_tensor * const src0s[4], ggml_tensor * const dsts[4],
+                                        int n_nodes, const ggml_tensor * src1) {
+    if (n_nodes < 2 || n_nodes > 4) {
+        return false;
+    }
+    const int64_t k = src0s[0]->ne[0];
+    const int64_t m = src1->ne[1];
+    if (src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) ||
+            src1->ne[2] != 1 || src1->ne[3] != 1 || m < 1 || m > 16 ||
+            k % 256 != 0) {
+        return false;
+    }
+
+    q4k_skinny_multi_params p = {};
+    p.k = (int) k;
+    p.m = (int) m;
+    for (int i = 0; i < n_nodes; ++i) {
+        const ggml_tensor * w = src0s[i];
+        ggml_tensor * dst = dsts[i];
+        const int64_t n = w->ne[1];
+        if (!ggml_cuda_q4k_skinny_is_repacked(w) || w->view_src != nullptr || w->op != GGML_OP_NONE ||
+                !ggml_is_contiguous(w) || w->ne[0] != k || w->ne[2] != 1 || w->ne[3] != 1 ||
+                dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
+                dst->ne[0] != n || dst->ne[1] != m || dst->ne[2] != 1 || dst->ne[3] != 1) {
+            return false;
+        }
+        q4k_skinny_multi_seg & seg = p.seg[p.n_seg++];
+        seg.codes = (const uint8_t *) w->data;
+        seg.meta = seg.codes + n * k / 2;
+        seg.n = (int) n;
+        seg.dst = (float *) dst->data;
+    }
+
+    for (int s = 0; s < p.n_seg; ++s) {
+        p.seg[s].first_tile = p.n_main_tiles;
+        p.n_main_tiles += p.seg[s].n / 32;
+    }
+
+    ggml_cuda_pool_alloc<half> input(ctx.pool(), m * k);
+    const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
+    GGML_ASSERT(to_fp16 != nullptr);
+    to_fp16(src1->data, input.get(), m * k, ctx.stream());
+    p.input = input.get();
+
+    q4k_skinny_multi_mul_mat_launch(p, ctx.stream());
     return true;
 }
 
@@ -867,6 +1138,17 @@ bool ggml_cuda_q4k_skinny_mul_mat_gated(ggml_backend_cuda_context & ctx, const g
     GGML_UNUSED(up_w);
     GGML_UNUSED(src1);
     GGML_UNUSED(dst);
+    return false;
+}
+
+bool ggml_cuda_q4k_skinny_mul_mat_multi(ggml_backend_cuda_context & ctx,
+                                        const ggml_tensor * const src0s[4], ggml_tensor * const dsts[4],
+                                        int n_nodes, const ggml_tensor * src1) {
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(src0s);
+    GGML_UNUSED(dsts);
+    GGML_UNUSED(n_nodes);
+    GGML_UNUSED(src1);
     return false;
 }
 

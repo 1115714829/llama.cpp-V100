@@ -4596,10 +4596,11 @@ static int ggml_cuda_try_ssm_conv_rollback_fusion(ggml_backend_cuda_context * cu
     return pos - i;
 }
 
-// Collects up to four MUL_MAT nodes starting at node_idx that share one src1 and read only
-// weights the q8 skinny multi-weight kernel can handle: repacked weights, or narrow row-major
-// Q8_0 weights (N is not a multiple of 32) that the kernel dot path reads directly. Above
-// M = 16 the M=32 kernel replaces the multi-weight kernel, so every weight must be repacked;
+// Collects up to four MUL_MAT nodes starting at node_idx that share one src1 and belong to
+// one multi-weight group: repacked Q4_K weights, repacked Q8_0 weights, or narrow row-major
+// Q8_0 weights (N is not a multiple of 32) that the Q8_0 dot path reads directly. The first
+// weight fixes the group type; a weight of the other type cuts the group short. Above M = 16
+// the M=32 kernel replaces the Q8_0 multi-weight kernel, so every weight must be repacked;
 // groups with a narrow weight fall through to the large-M fusion below.
 static int ggml_cuda_match_mul_mat_multi(const ggml_cgraph * cgraph, int node_idx,
                                          const ggml_tensor * src0s[4], ggml_tensor * dsts[4]) {
@@ -4616,6 +4617,7 @@ static int ggml_cuda_match_mul_mat_multi(const ggml_cgraph * cgraph, int node_id
     if (k % 32 != 0) {
         return 0;
     }
+    const bool q4k_group = ggml_cuda_q4k_skinny_is_repacked(first->src[0]);
     int n = 0;
     while (n < 4 && node_idx + n < cgraph->n_nodes) {
         ggml_tensor * node = cgraph->nodes[node_idx + n];
@@ -4624,14 +4626,16 @@ static int ggml_cuda_match_mul_mat_multi(const ggml_cgraph * cgraph, int node_id
             break;
         }
         const ggml_tensor * w = node->src[0];
-        // a repacked Q4_K weight has no multi-weight kernel, do not fuse its group
-        if (ggml_cuda_q4k_skinny_is_repacked(w)) {
+        // a repacked Q4_K group takes only repacked Q4_K weights (narrow rows and Q8_0 have no
+        // Q4_K multi-weight kernel); any other group stops at the first repacked Q4_K weight
+        const bool repacked_q4k = ggml_cuda_q4k_skinny_is_repacked(w);
+        if (repacked_q4k != q4k_group) {
             break;
         }
         const bool repacked = ggml_cuda_q8_skinny_is_repacked(w);
         const bool narrow = w->type == GGML_TYPE_Q8_0 && w->view_src == nullptr && w->op == GGML_OP_NONE &&
                             w->ne[1] % 32 != 0;
-        if (w->ne[0] != k || (!repacked && (!narrow || src1->ne[1] > 16))) {
+        if (w->ne[0] != k || (!q4k_group && !repacked && (!narrow || src1->ne[1] > 16))) {
             break;
         }
         if (node->type != GGML_TYPE_F32 || !ggml_is_contiguous(node)) {
@@ -5376,9 +5380,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             // the fusion memory ranges cover all of them
             ggml_op ops[4] = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT };
             int out_nodes[4] = { i, i + 1, i + 2, i + 3 };
+            const bool q4k_group = ggml_cuda_q4k_skinny_is_repacked(multi_src0[0]);
             if (ggml_can_fuse_subgraph(cgraph, i, n_multi, ops, out_nodes, n_multi) &&
                     ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_multi, out_nodes, n_multi) &&
-                    ggml_cuda_q8_skinny_mul_mat_multi(*cuda_ctx, multi_src0, multi_dst, n_multi, node->src[1])) {
+                    (q4k_group
+                         ? ggml_cuda_q4k_skinny_mul_mat_multi(*cuda_ctx, multi_src0, multi_dst, n_multi, node->src[1])
+                         : ggml_cuda_q8_skinny_mul_mat_multi(*cuda_ctx, multi_src0, multi_dst, n_multi, node->src[1]))) {
                 return n_multi - 1;
             }
         }

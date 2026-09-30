@@ -35,5 +35,10 @@ bool ggml_cuda_q4k_skinny_mul_mat(ggml_backend_cuda_context & ctx, const ggml_te
 // on the regular path.
 bool ggml_cuda_q4k_skinny_mul_mat_gated(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_w, const ggml_tensor * up_w, const ggml_tensor * src1, ggml_tensor * dst);
 
+// Runs 2 to 4 MUL_MAT nodes that share one src1 with a single input conversion and a single
+// kernel launch. Every src0 must be a repacked Q4_K weight with the same K. Returns false if
+// any node does not fit, the caller then runs them all on the regular path.
+bool ggml_cuda_q4k_skinny_mul_mat_multi(ggml_backend_cuda_context & ctx, const ggml_tensor * const src0s[4], ggml_tensor * const dsts[4], int n_nodes, const ggml_tensor * src1);
+
 // Expands repacked weights to dense F16 [N][K], for M > 16.
 void ggml_cuda_q4k_skinny_to_f16(const ggml_tensor * src0, half * dst, cudaStream_t stream);
