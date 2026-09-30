@@ -10864,6 +10864,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 32,  1, 256, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 32, 17, 256, {1, 1}, {1, 1}));
 
+    // Q4_K skinny gated pair: both matmuls and the SWIGLU in one kernel on sm_70 for M <= 8,
+    // two single-projection kernels plus the elementwise SWIGLU for M = 9..16
+    for (int64_t n_tokens : {1, 8, 16}) {
+        for (int64_t n_out : {4352, 8704}) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, n_tokens, n_out, 5120,
+                false, 1, 1, false, false, true, false, {1, 1}));
+        }
+    }
+
     // Q8_0 skinny gated pair: both matmuls and the SWIGLU in one kernel on sm_70, M > 16 as two
     // M=32 kernels plus the elementwise SWIGLU
     for (int64_t n_tokens : {1, 8, 16, 24, 32, 48, 64}) {

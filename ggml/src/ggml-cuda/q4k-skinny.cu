@@ -373,6 +373,156 @@ __global__ void q4k_skinny_kernel(
 #endif
 }
 
+// ---- gated pair: gate and up projected in one kernel (same warp split as q8_skinny_gated_kernel) ----
+
+// gate and up are two separate weights: projection p (0 = gate, 1 = up) reads its own codes
+// and meta for the tile at blockIdx.x and the epilogue applies silu(gate) * up. A single
+// 8-row tile is used because at split-K 16 the two partials arrays would need 64 KiB of
+// shared memory; m = 9..16 runs as two single-projection launches plus a SwiGLU pass instead.
+// The two projections double the block to 64*SplitK threads, so __launch_bounds__ caps the
+// register count and the split-16 launch (1024 threads) stays valid. Split-K and the
+// accumulator chains match q4k_skinny_kernel, so both projections of an m <= 8 result are
+// bit-identical to two separate q4k_skinny_kernel launches; only the trailing silu rounds
+// differently from the regular GLU node (__expf here, expf there).
+template <ggml_type T, int SplitK, int NAcc, bool M1Only = false>
+__global__ void __launch_bounds__(64 * SplitK) q4k_skinny_gated_kernel(
+    const uint8_t * __restrict__ gate_codes, const uint8_t * __restrict__ up_codes,
+    const half * __restrict__ input, float * __restrict__ output, int n, int k, int m) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    using codec = qskinny_codec<T>;
+    __shared__ float partials[2][SplitK][M1Only ? 32 : 256];
+
+    const int lane = threadIdx.x & 31;
+    const int warp_in_block = threadIdx.x >> 5;
+    const int projection = warp_in_block / SplitK;
+    const int warp = warp_in_block - projection * SplitK;
+    const int tile = blockIdx.x;
+    const int quadpair = (lane >> 2) & 3;
+    const int row = (lane & 3) + ((lane & 16) ? 4 : 0);
+    const int groups_k16 = k >> 4;
+    const int sub_blocks = k >> 5;
+    const int sub_blocks_per_warp = sub_blocks / SplitK;
+    const int sub_block_begin = warp * sub_blocks_per_warp;
+    const uint8_t * codes = projection ? up_codes : gate_codes;
+    const typename codec::record_t * code_ptr = reinterpret_cast<const typename codec::record_t *>(codes) +
+                                                (size_t) tile * groups_k16 * 32 + lane;
+    const uint4 * meta_ptr = reinterpret_cast<const uint4 *>(codes + (size_t) n * k / 2) +
+                             tile * 32 + lane;
+
+    float accum[NAcc][8];
+#pragma unroll
+    for (int chain = 0; chain < NAcc; ++chain) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            accum[chain][i] = 0.0f;
+        }
+    }
+    int loaded_meta_kb = -1;
+    uint4 meta = make_uint4(0, 0, 0, 0);
+
+#pragma unroll 2
+    for (int sub_block = sub_block_begin; sub_block < sub_block_begin + sub_blocks_per_warp; ++sub_block) {
+        const int kb = sub_block >> 3;
+        if (kb != loaded_meta_kb) {
+            meta = __ldcs(meta_ptr + (size_t) kb * n);
+            loaded_meta_kb = kb;
+        }
+
+        const int group = sub_block << 1;
+        const typename codec::record_t records[2] = {
+            __ldcs(code_ptr + (size_t) (group + 0) * 32),
+            __ldcs(code_ptr + (size_t) (group + 1) * 32),
+        };
+        half2 weights[codec::values_per_sub_block / 2];
+        codec::decode(records, meta, sub_block & 7, weights);
+
+        const unsigned * b = reinterpret_cast<const unsigned *>(weights);
+        uint4 input01 = make_uint4(0, 0, 0, 0);
+        uint4 input23 = make_uint4(0, 0, 0, 0);
+        uint4 input45 = make_uint4(0, 0, 0, 0);
+        uint4 input67 = make_uint4(0, 0, 0, 0);
+        if (row < m) {
+            const half * input_row = input + (size_t) row * k;
+            input01 = *reinterpret_cast<const uint4 *>(input_row + group * 16);
+            input23 = *reinterpret_cast<const uint4 *>(input_row + group * 16 + 8);
+            input45 = *reinterpret_cast<const uint4 *>(input_row + group * 16 + 16);
+            input67 = *reinterpret_cast<const uint4 *>(input_row + group * 16 + 24);
+        }
+
+        const unsigned * a0 = reinterpret_cast<const unsigned *>(&input01);
+        const unsigned * a1 = reinterpret_cast<const unsigned *>(&input23);
+        const unsigned * a2 = reinterpret_cast<const unsigned *>(&input45);
+        const unsigned * a3 = reinterpret_cast<const unsigned *>(&input67);
+        Q4K_SKINNY_MMA_8N8K4(accum[0], a0[0], a0[1], b[0], b[1]);
+        Q4K_SKINNY_MMA_8N8K4(accum[1 % NAcc], a0[2], a0[3], b[2], b[3]);
+        Q4K_SKINNY_MMA_8N8K4(accum[2 % NAcc], a1[0], a1[1], b[4], b[5]);
+        Q4K_SKINNY_MMA_8N8K4(accum[3 % NAcc], a1[2], a1[3], b[6], b[7]);
+        Q4K_SKINNY_MMA_8N8K4(accum[0], a2[0], a2[1], b[8], b[9]);
+        Q4K_SKINNY_MMA_8N8K4(accum[1 % NAcc], a2[2], a2[3], b[10], b[11]);
+        Q4K_SKINNY_MMA_8N8K4(accum[2 % NAcc], a3[0], a3[1], b[12], b[13]);
+        Q4K_SKINNY_MMA_8N8K4(accum[3 % NAcc], a3[2], a3[3], b[14], b[15]);
+    }
+
+#pragma unroll
+    for (int chain = 1; chain < NAcc; ++chain) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            accum[0][i] += accum[chain][i];
+        }
+    }
+
+    if constexpr (M1Only) {
+        if ((lane & 17) == 0) {
+#pragma unroll
+            for (int pair = 0; pair < 2; ++pair) {
+#pragma unroll
+                for (int offset = 0; offset < 2; ++offset) {
+                    const int i = pair * 4 + offset;
+                    const int output_col =
+                        offset | (((lane >> 1) & 1) << 1) | (pair << 2);
+                    partials[projection][warp][quadpair * 8 + output_col] = accum[0][i];
+                }
+            }
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int output_row =
+                (i & 2) + ((lane & 16) ? 4 : 0) + (lane & 1);
+            const int output_col =
+                (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+            partials[projection][warp][output_row * 32 + quadpair * 8 + output_col] =
+                accum[0][i];
+        }
+    }
+    __syncthreads();
+
+    constexpr int kOutputElements = M1Only ? 32 : 256;
+    for (int element = threadIdx.x; element < kOutputElements; element += blockDim.x) {
+        float gate = 0.0f;
+        float up = 0.0f;
+#pragma unroll
+        for (int k_warp = 0; k_warp < SplitK; ++k_warp) {
+            gate += partials[0][k_warp][element];
+            up += partials[1][k_warp][element];
+        }
+        const float silu = gate / (1.0f + __expf(-gate));
+        if constexpr (M1Only) {
+            output[tile * 32 + element] = silu * up;
+        } else {
+            const int output_row = element >> 5;
+            const int output_col = element & 31;
+            if (output_row < m) {
+                output[(size_t) output_row * n + tile * 32 + output_col] = silu * up;
+            }
+        }
+    }
+#else
+    NO_DEVICE_CODE;
+    GGML_UNUSED_VARS(gate_codes, up_codes, input, output, n, k, m);
+#endif
+}
+
 #undef Q4K_SKINNY_MMA_8N8K4
 
 // Split-K 16 for the long K weights, 8 for the smallest ones (k = 256 has only 8 sub-blocks
@@ -420,6 +570,47 @@ static void q4k_skinny_mul_mat_launch(const uint8_t * codes, const half * input,
 
 #undef Q4K_SKINNY_LAUNCH
 
+template <int SplitK, int NAcc, bool M1Only>
+static void q4k_skinny_gated_launch(const uint8_t * gate_codes, const uint8_t * up_codes,
+                                    const half * input, float * output,
+                                    int n, int k, int m, cudaStream_t stream) {
+    q4k_skinny_gated_kernel<GGML_TYPE_Q4_K, SplitK, NAcc, M1Only>
+        <<<n / 32, 32 * 2 * SplitK, 0, stream>>>(gate_codes, up_codes, input, output, n, k, m);
+}
+
+#define Q4K_SKINNY_GATED_LAUNCH(NAcc, M1Only)                                          \
+    do {                                                                               \
+        switch (config.split_k) {                                                      \
+            case 16: q4k_skinny_gated_launch<16, NAcc, M1Only>(gate_codes, up_codes,   \
+                         input, output, n, k, m, stream); break;                       \
+            default: q4k_skinny_gated_launch<8, NAcc, M1Only>(gate_codes, up_codes,    \
+                         input, output, n, k, m, stream); break;                       \
+        }                                                                              \
+    } while (0)
+
+static void q4k_skinny_gated_mul_mat_launch(const uint8_t * gate_codes, const uint8_t * up_codes,
+                                            const half * input, float * output,
+                                            int n, int k, int m, cudaStream_t stream) {
+    const q4k_skinny_config config = q4k_skinny_config_for(k);
+    if (config.n_acc == 2) {
+        if (m == 1) { Q4K_SKINNY_GATED_LAUNCH(2, true); } else { Q4K_SKINNY_GATED_LAUNCH(2, false); }
+    } else {
+        if (m == 1) { Q4K_SKINNY_GATED_LAUNCH(1, true); } else { Q4K_SKINNY_GATED_LAUNCH(1, false); }
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+#undef Q4K_SKINNY_GATED_LAUNCH
+
+// Same epilogue as q4k_skinny_gated_kernel, applied after both projections of an M > 8 run.
+__global__ void q4k_skinny_swiglu_kernel(float * __restrict__ gate, const float * __restrict__ up,
+                                         int count) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < count; i += gridDim.x * blockDim.x) {
+        const float g = gate[i];
+        gate[i] = g / (1.0f + __expf(-g)) * up[i];
+    }
+}
+
 bool ggml_cuda_q4k_skinny_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
                                   const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(ggml_cuda_q4k_skinny_is_repacked(src0));
@@ -439,6 +630,51 @@ bool ggml_cuda_q4k_skinny_mul_mat(ggml_backend_cuda_context & ctx, const ggml_te
 
     q4k_skinny_mul_mat_launch((const uint8_t *) src0->data, input.get(), (float *) dst->data,
                               (int) n, (int) k, (int) m, ctx.stream());
+    return true;
+}
+
+bool ggml_cuda_q4k_skinny_mul_mat_gated(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_w,
+                                        const ggml_tensor * up_w, const ggml_tensor * src1,
+                                        ggml_tensor * dst) {
+    if (!ggml_cuda_q4k_skinny_is_repacked(gate_w) || !ggml_cuda_q4k_skinny_is_repacked(up_w)) {
+        return false;
+    }
+    const int64_t k = gate_w->ne[0];
+    const int64_t n = gate_w->ne[1];
+    const int64_t m = src1->ne[1];
+    if (!ggml_are_same_shape(gate_w, up_w) ||
+            src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst) ||
+            src1->ne[2] != 1 || src1->ne[3] != 1 ||
+            dst->ne[0] != n || dst->ne[1] != m || dst->ne[2] != 1 || dst->ne[3] != 1 ||
+            m < 1 || m > 16 ||
+            k % 256 != 0 || n % 32 != 0) {
+        return false;
+    }
+
+    ggml_cuda_pool_alloc<half> input(ctx.pool(), m * k);
+    const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
+    GGML_ASSERT(to_fp16 != nullptr);
+    to_fp16(src1->data, input.get(), m * k, ctx.stream());
+
+    const uint8_t * gate_data = (const uint8_t *) gate_w->data;
+    const uint8_t * up_data   = (const uint8_t *) up_w->data;
+    if (m <= 8) {
+        q4k_skinny_gated_mul_mat_launch(gate_data, up_data, input.get(), (float *) dst->data,
+                                        (int) n, (int) k, (int) m, ctx.stream());
+        return true;
+    }
+
+    // M = 9..16: the fused kernel would need 64 KiB of split-K partials at split 16; run both
+    // projections with the single-projection kernel and the SwiGLU epilogue instead
+    float * gate = (float *) dst->data;
+    ggml_cuda_pool_alloc<float> up(ctx.pool(), n * m);
+    q4k_skinny_mul_mat_launch(gate_data, input.get(), gate, (int) n, (int) k, (int) m, ctx.stream());
+    q4k_skinny_mul_mat_launch(up_data, input.get(), up.get(), (int) n, (int) k, (int) m, ctx.stream());
+
+    const int count = (int) (n * m);
+    q4k_skinny_swiglu_kernel<<<(count + 255) / 256, 256, 0, ctx.stream()>>>(gate, up.get(), count);
+    CUDA_CHECK(cudaGetLastError());
     return true;
 }
 
@@ -618,6 +854,17 @@ bool ggml_cuda_q4k_skinny_mul_mat(ggml_backend_cuda_context & ctx, const ggml_te
                                   const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_UNUSED(ctx);
     GGML_UNUSED(src0);
+    GGML_UNUSED(src1);
+    GGML_UNUSED(dst);
+    return false;
+}
+
+bool ggml_cuda_q4k_skinny_mul_mat_gated(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_w,
+                                        const ggml_tensor * up_w, const ggml_tensor * src1,
+                                        ggml_tensor * dst) {
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(gate_w);
+    GGML_UNUSED(up_w);
     GGML_UNUSED(src1);
     GGML_UNUSED(dst);
     return false;
