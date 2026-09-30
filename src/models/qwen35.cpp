@@ -306,11 +306,13 @@ static ggml_tensor * build_attn_3card_impl(
         }
     }
 
-    // concatenate in node order so that the result is in the global head order
-    ggml_tensor * cur = ggml_concat(ctx.ctx0, outs[0], outs[1], /*dim=*/ 1);
-    for (int i = 2; i < 6; ++i) {
-        cur = ggml_concat(ctx.ctx0, cur, outs[i], /*dim=*/ 1);
+    // concatenate the two groups of each device first, then the devices: every device runs one
+    // real concatenation plus two that only copy its 8 heads (a flat chain would copy them four times)
+    ggml_tensor * dev[3];
+    for (int d = 0; d < 3; ++d) {
+        dev[d] = ggml_concat(ctx.ctx0, outs[2*d], outs[2*d + 1], /*dim=*/ 1);
     }
+    ggml_tensor * cur = ggml_concat(ctx.ctx0, ggml_concat(ctx.ctx0, dev[0], dev[1], /*dim=*/ 1), dev[2], /*dim=*/ 1);
 
     cur = ggml_reshape_2d(ctx.ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     ggml_build_forward_expand(ctx.gf, cur);
