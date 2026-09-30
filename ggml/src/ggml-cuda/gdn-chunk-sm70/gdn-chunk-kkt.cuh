@@ -16,7 +16,12 @@
 
 namespace gdn_chunk_sm70 {
 
-__global__ void __launch_bounds__(128, 1) tilelang_kkt_solve_kernel_kernel(half_t* __restrict__ a, const float* __restrict__ b, const int* __restrict__ chunk_indices, const int* __restrict__ cu_seqlens, const half_t* __restrict__ k, int num_chunks, int num_tokens, int real_batch_size, int Hv, int Hk) {
+// HV_CT/HK_CT > 0 fix the head counts at compile time (the TP4 shape keeps its constant address
+// arithmetic); 0 takes them from Hv_rt/Hk_rt.
+template <int HV_CT, int HK_CT>
+__global__ void __launch_bounds__(128, 1) tilelang_kkt_solve_kernel_kernel(half_t* __restrict__ a, const float* __restrict__ b, const int* __restrict__ chunk_indices, const int* __restrict__ cu_seqlens, const half_t* __restrict__ k, int num_chunks, int num_tokens, int real_batch_size, int Hv_rt, int Hk_rt) {
+  const int Hv = HV_CT > 0 ? HV_CT : Hv_rt;
+  const int Hk = HK_CT > 0 ? HK_CT : Hk_rt;
   extern __shared__ __align__(1024) uchar buf_dyn_shmem[];
   void* a16i_shared = ((void*)((char*)buf_dyn_shmem + 0));
   void* a32i0_shared = ((void*)((char*)buf_dyn_shmem + 0));
