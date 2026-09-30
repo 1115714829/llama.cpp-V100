@@ -382,6 +382,9 @@ extern "C" {
     //
 
 #define GGML_BACKEND_META_MAX_DEVICES 16
+// maximum number of segments of a split state (the fused QKV layouts use at most 3); the per-segment
+// arrays are copied for every node when a graph is split, so they are kept small
+#define GGML_BACKEND_META_MAX_SEGMENTS 4
 
     enum ggml_backend_meta_split_axis {
         // tensor split by tensor dimensions:
@@ -417,11 +420,11 @@ extern "C" {
         //   - if has_off is true the source offsets in off are used instead of the accumulated lengths of ne,
         //     which allows the slices of different devices to overlap; off has the same shape/units as ne,
         //     nr[s] must be 1 in this case as repeats have no explicit offsets
-        int64_t  ne[16*GGML_BACKEND_META_MAX_DEVICES];
-        uint32_t nr[16];
+        int64_t  ne[GGML_BACKEND_META_MAX_SEGMENTS*GGML_BACKEND_META_MAX_DEVICES];
+        uint32_t nr[GGML_BACKEND_META_MAX_SEGMENTS];
         uint32_t n_segments;
         // for derived tensors off is the start of this device's data in the global coordinates of this tensor
-        int64_t  off[16*GGML_BACKEND_META_MAX_DEVICES];
+        int64_t  off[GGML_BACKEND_META_MAX_SEGMENTS*GGML_BACKEND_META_MAX_DEVICES];
         bool     has_off;
     };
 

@@ -969,6 +969,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
             return split_state;
         }
+        GGML_ASSERT(segments.size() <= GGML_BACKEND_META_MAX_SEGMENTS);
         for (size_t is = 0; is < segments.size(); is++) {
             const int64_t  ne_s = segments[is].first;
             const uint32_t nr_s = segments[is].second;
