@@ -1577,8 +1577,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                     ne_info += std::to_string(ss.ne[j]) + "x" + std::to_string(ss.nr[0]);
                 }
             }
-            GGML_LOG_DEBUG("SPLIT_STATE: {%s} -> %s[%s, %s, {%s}]\n", srcs_info.c_str(), tensor->name, ggml_op_name(tensor->op),
-                ggml_backend_meta_split_axis_name(ret.axis), ne_info.c_str());
+            std::string local_info;
+            for (size_t j = 0; j < it->second.local_offs.size(); j++) {
+                local_info += (j > 0 ? ", " : " local {") + std::to_string(it->second.local_offs[j]);
+            }
+            if (!local_info.empty()) {
+                local_info += "}";
+            }
+            GGML_LOG_DEBUG("SPLIT_STATE: {%s} -> %s[%s, %s, {%s}]%s\n", srcs_info.c_str(), tensor->name, ggml_op_name(tensor->op),
+                ggml_backend_meta_split_axis_name(ret.axis), ne_info.c_str(), local_info.c_str());
         }
     } else {
         ret = it->second.split_state;
