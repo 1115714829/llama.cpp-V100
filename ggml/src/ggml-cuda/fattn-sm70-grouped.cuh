@@ -359,9 +359,6 @@ __device__ __forceinline__ void flash_attn_sm70_grouped_dequant_kv(
     constexpr int kColsPerItem = 8;
     constexpr int kGroupsPerRow = kGroupedVerifyHeadDim / kColsPerItem;
     constexpr int kItemsPerWarp = kGroupedVerifyStageRowsPerWarp * kGroupsPerRow;
-    constexpr int kBlockBytes   = type_KV == GGML_TYPE_Q4_0 ? 18 : 34;
-    constexpr int kRowBytes     = type_KV == GGML_TYPE_Q4_0 ? kGroupedVerifyKVQ4RowBytes
-                                                            : kGroupedVerifyKVQ8RowBytes;
     const int warp_id  = threadIdx.x / WARP_SIZE;
     const int lane_id  = threadIdx.x % WARP_SIZE;
     const int row_base = warp_id * kGroupedVerifyStageRowsPerWarp;
@@ -372,7 +369,8 @@ __device__ __forceinline__ void flash_attn_sm70_grouped_dequant_kv(
         const int blk = c / 32;
         uint4 out;
         if constexpr (type_KV == GGML_TYPE_Q4_0) {
-            const int base = row * kRowBytes + blk * kBlockBytes;
+            // raw q4_0 blocks: 18 B each, kGroupedVerifyKVQ4RowBytes per row
+            const int base = row * kGroupedVerifyKVQ4RowBytes + blk * 18;
             const __half d = *reinterpret_cast<const __half *>(kv_stage + base);
             const __half2 d2 = __half2half2(d);
             // 8 columns = 8 values of one nibble half; codes are 8 consecutive bytes.
