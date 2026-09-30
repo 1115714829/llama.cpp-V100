@@ -687,8 +687,14 @@ static ggml_backend_meta_split_state ggml_backend_meta_map_has_off_state(
             if (ie > is) {
                 GGML_ASSERT(!found); // at most one segment per device may intersect the window
                 found = true;
-                ret.off[j] = to_tensor_units(is - w0);
-                ret.ne[j]  = to_tensor_units(ie - is);
+                if (is_view) {
+                    // views share the axis units of the source, no conversion is needed
+                    ret.off[j] = is - w0;
+                    ret.ne[j]  = ie - is;
+                } else {
+                    ret.off[j] = to_tensor_units(is - w0);
+                    ret.ne[j]  = to_tensor_units(ie - is);
+                }
                 local_offs[j] = ((is - off_s) + ne_before) * src->nb[B];
             }
             ne_before += ne_s;
@@ -1528,7 +1534,10 @@ static size_t ggml_backend_meta_get_split_state_local_offs(const struct ggml_ten
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
     const auto it = buf_ctx->split_state_cache.find(std::make_pair(tensor, true));
     GGML_ASSERT(it != buf_ctx->split_state_cache.end());
-    GGML_ASSERT(j < it->second.local_offs.size());
+    if (j >= it->second.local_offs.size()) {
+        // ops that view a whole tensor (e.g. SET_ROWS) carry no derived per-device offsets
+        return tensor->view_offs;
+    }
     return it->second.local_offs[j];
 }
 
@@ -1554,6 +1563,14 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         nb[k] = tensor->nb[k];
     }
 
+    // For views of a tensor with explicit offsets the view data is a slice of the source's per-device
+    // simple tensor, so the per-device strides must follow the source layout.
+    const bool view_src_is_meta = tensor->view_src != nullptr && ggml_backend_buffer_is_meta(tensor->view_src->buffer);
+    ggml_backend_meta_split_state split_state_view_src = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1, {0}, false};
+    if (view_src_is_meta && split_dim >= 0 && split_dim < GGML_MAX_DIMS) {
+        split_state_view_src = ggml_backend_meta_get_split_state(tensor->view_src, /*assume_sync =*/ true);
+    }
+
     std::vector<ggml_tensor *> simple_tensors;
     simple_tensors.reserve(n_simple_bufs);
     for (size_t j = 0; j < n_simple_bufs; j++) {
@@ -1567,9 +1584,35 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
             for (size_t s = 0; s < split_state.n_segments; s++) {
                 ne[split_dim] += split_state.ne[s*n_simple_bufs + j] * split_state.nr[s];
             }
+            const ggml_tensor * view_src_simple = nullptr;
+            if (split_state_view_src.has_off) {
+                view_src_simple = ggml_backend_meta_buffer_simple_tensor(tensor->view_src, j);
+                if (view_src_simple == nullptr) {
+                    GGML_ABORT("fatal error: %s: view source %s has no simple tensor on device %zu\n",
+                        tensor->name, tensor->view_src->name, j);
+                }
+            }
             for (int i = 0; i < GGML_MAX_DIMS; i++) {
                 if (tensor->nb[i] > tensor->nb[split_dim]) {
-                    nb[i] = tensor->nb[i] * ne[split_dim]/tensor->ne[split_dim];
+                    if (view_src_simple != nullptr) {
+                        // The view is a slice of the source's simple tensor: find the source dim the
+                        // stride was created from and scale by its simple/global ratio on this device.
+                        int dim_src = -1;
+                        for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                            if (tensor->view_src->nb[d] == tensor->nb[i]) {
+                                dim_src = d;
+                                break;
+                            }
+                        }
+                        if (dim_src < 0) {
+                            GGML_ABORT("fatal error: %s: no source dimension matches nb[%d] = %zu\n",
+                                tensor->name, i, tensor->nb[i]);
+                        }
+                        GGML_ASSERT((tensor->nb[i] * view_src_simple->nb[dim_src]) % tensor->view_src->nb[dim_src] == 0);
+                        nb[i] = tensor->nb[i] * view_src_simple->nb[dim_src] / tensor->view_src->nb[dim_src];
+                    } else {
+                        nb[i] = tensor->nb[i] * ne[split_dim]/tensor->ne[split_dim];
+                    }
                 }
             }
         }
@@ -1588,8 +1631,6 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         if (t_ij->view_src != nullptr && ggml_backend_buffer_is_meta(t_ij->view_src->buffer)) {
             t_ij->view_src = ggml_backend_meta_buffer_simple_tensor(tensor->view_src, j);
             if (split_dim >= 0 && split_dim < GGML_MAX_DIMS) {
-                const ggml_backend_meta_split_state split_state_view_src =
-                        ggml_backend_meta_get_split_state(tensor->view_src, /*assume_sync =*/ true);
                 if (split_state_view_src.has_off) {
                     // with explicit offsets the view data sits at its per-device local byte offset;
                     // interior offsets (e.g. the gate half of a fused q+gate head) are not rescaled
