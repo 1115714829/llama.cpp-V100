@@ -10,7 +10,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <random>
-#include <unordered_set>
 #include <vector>
 
 // tests for the speculative rejection core: the draft token is sampled from q and
@@ -138,8 +137,10 @@ static void test_multi_step() {
 }
 
 static std::vector<float> softmax(const llama_token_data * data, size_t n) {
-    float max_l = -INFINITY;
-    for (size_t i = 0; i < n; ++i) {
+    assert(n > 0);
+
+    float max_l = data[0].logit;
+    for (size_t i = 1; i < n; ++i) {
         max_l = std::max(max_l, data[i].logit);
     }
 
