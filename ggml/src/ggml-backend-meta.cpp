@@ -1138,8 +1138,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         GGML_ASSERT(tensor->src[3] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 
         if (src_ss[0].has_off) {
-            // Q is split into overlapping head windows: the output follows the Q window state
-            GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1);
+            // Q is split into head windows (heads on axis 2 of the permuted Q, as in the path below):
+            // the output, heads on axis 1, follows the Q window state
+            GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2);
             ggml_backend_meta_split_state ret = src_ss[0];
             ret.axis = GGML_BACKEND_SPLIT_AXIS_1;
             return ret;
