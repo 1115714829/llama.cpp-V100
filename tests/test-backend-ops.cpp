@@ -8670,6 +8670,92 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// GGML_OP_FLASH_ATTN_EXT with Q/K/V as head-window views of the per-device tensors used by the
+// multi-GPU attention split: Q is a window of g heads out of 8, K/V are single-head windows out
+// of 2 KV heads. The token strides stay those of the full tensors, so the row stride of the
+// window is larger than its width and the kernel must honor per-row strides (not the extent).
+struct test_flash_attn_ext_window : public test_case {
+    const int64_t g;   // number of Q heads in the window
+    const int64_t h0;  // first Q head of the window
+    const int64_t kvh; // KV head the window reads
+    const int64_t n_q; // number of query tokens
+    const int64_t n_kv; // KV length
+
+    const ggml_type type_KV;
+    const bool range_mask; // false: dense f16 mask, true: I32 range mask
+
+    std::string vars() override {
+        return VARS_TO_STR7(g, h0, kvh, n_q, n_kv, type_KV, range_mask);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        // Q*K^T and P*V, per head
+        return 2 * g * n_q * (256 + 256) * n_kv;
+    }
+
+    test_flash_attn_ext_window(int64_t g = 6, int64_t h0 = 0, int64_t kvh = 0, int64_t n_q = 8, int64_t n_kv = 2048,
+            ggml_type type_KV = GGML_TYPE_Q8_0, bool range_mask = false)
+        : g(g), h0(h0), kvh(kvh), n_q(n_q), n_kv(n_kv), type_KV(type_KV), range_mask(range_mask) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q_full = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 8, n_q);
+        ggml_set_name(q_full, "q_full");
+
+        ggml_tensor * q = ggml_view_3d(ctx, q_full, 256, g, n_q, q_full->nb[1], q_full->nb[2], h0*q_full->nb[1]);
+        q = ggml_permute(ctx, q, 0, 2, 1, 3);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * k_cache = ggml_new_tensor_3d(ctx, type_KV, 256, 2, n_kv);
+        ggml_set_name(k_cache, "k_cache");
+
+        ggml_tensor * k = ggml_view_3d(ctx, k_cache, 256, 1, n_kv, k_cache->nb[1], k_cache->nb[2], kvh*k_cache->nb[1]);
+        k = ggml_permute(ctx, k, 0, 2, 1, 3);
+        ggml_set_name(k, "k");
+
+        ggml_tensor * v_cache = ggml_new_tensor_3d(ctx, type_KV, 256, 2, n_kv);
+        ggml_set_name(v_cache, "v_cache");
+
+        ggml_tensor * v = ggml_view_3d(ctx, v_cache, 256, 1, n_kv, v_cache->nb[1], v_cache->nb[2], kvh*v_cache->nb[1]);
+        v = ggml_permute(ctx, v, 0, 2, 1, 3);
+        ggml_set_name(v, "v");
+
+        ggml_tensor * m = range_mask ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, n_q)
+                                     : ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, n_q);
+        ggml_set_name(m, "m");
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/16.0f, 0.0f, 0.0f);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") == 0) {
+                if (range_mask) {
+                    init_tensor_kq_range(t, n_kv, n_q == n_kv ? 1 : 2);
+                } else if (n_q == n_kv) {
+                    init_tensor_kq_mask_causal(t);
+                } else {
+                    init_tensor_kq_mask(t);
+                }
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    bool grad_precise() override {
+        return true;
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -12082,6 +12168,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 4096,  8, true,  true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {2, 1}, 1024, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {2, 1}, 1024,  4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    // head-window views of the multi-GPU attention split: Q is a window of g heads out of 8
+    // (with the token stride of the full tensor), K/V are single-head windows out of 2 KV heads
+    for (const std::array<int64_t, 3> & w : {
+            std::array<int64_t, 3>{6, 0, 0},
+            std::array<int64_t, 3>{2, 6, 1},
+            std::array<int64_t, 3>{4, 0, 0},
+            std::array<int64_t, 3>{4, 4, 1},
+            std::array<int64_t, 3>{2, 0, 0},
+            std::array<int64_t, 3>{6, 2, 1},
+    }) {
+        for (int64_t n_q : { 8, 2048 }) {
+            for (ggml_type type_KV : { GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {
+                for (bool range_mask : { false, true }) {
+                    test_cases.emplace_back(new test_flash_attn_ext_window(
+                            w[0], w[1], w[2], n_q, 2048, type_KV, range_mask));
+                }
+            }
+        }
+    }
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
