@@ -152,7 +152,7 @@ constexpr int kGroupedVerifyRows         = 48;
 constexpr int kGroupedVerifyBlockN       = 64;
 constexpr int kGroupedVerifyQStride      = 264; // half per row, 528 B, 16 B aligned
 constexpr int kGroupedVerifyKVStride     = 264;
-constexpr int kGroupedVerifyScoreStride  = 64;
+constexpr int kGroupedVerifyScoreStride  = 68; // BlockN + 4 f32, keeps the WMMA stores out of the same banks
 constexpr int kGroupedVerifyProbStride   = 72; // BlockN + 8 half, keeps the WMMA A loads conflict free
 constexpr int kGroupedVerifyKVQ8RowBytes = 272; // 8 q8_0 blocks of 34 B
 constexpr int kGroupedVerifyKVQ4RowBytes = 144; // 8 q4_0 blocks of 18 B
@@ -188,11 +188,11 @@ struct GroupedVerifyTraits {
 // Shared memory budget (Volta allows 96 KiB per block with opt-in):
 //   q        48 * 264 * 2 = 25344 B
 //   kv       64 * 264 * 2 = 33792 B  one K or V tile panel
-//   scores   48 *  64 * 4 = 12288 B
+//   scores   48 *  68 * 4 = 13056 B
 //   probs    48 *  72 * 2 =  6912 B
 //   stage    64 * 272     = 17408 B  raw q8_0/q4_0 tile (q4_0 rows use 144 B)
 //   rows          3 * 48 * 4 =  576 B
-//   total                  = 96512 B
+//   total                  = 97280 B (1024 B under the 96 KiB limit)
 struct alignas(256) GroupedVerifySmem {
     union {
         struct {
@@ -437,11 +437,31 @@ struct GroupedVerifyMaskPair {
     bool  visible[2];
 };
 
+// [lo, hi) interval of a range mask row. It stays the same for every KV tile.
+struct GroupedVerifyMaskRange {
+    int lo;
+    int hi;
+};
+
+__device__ __forceinline__ GroupedVerifyMaskRange grouped_verify_load_mask_range(
+        const char * __restrict__ mask, const int64_t seq_mask_off, const int64_t nb31,
+        const int token_idx, const int n_q) {
+    GroupedVerifyMaskRange range = {0, 0}; // an empty interval hides every column
+    if (token_idx < n_q) {
+        const int32_t * r = reinterpret_cast<const int32_t *>(mask + seq_mask_off + nb31 * token_idx);
+        range.lo = r[0];
+        range.hi = r[1];
+    }
+    return range;
+}
+
 // Load the mask pair of one row. The result feeds the softmax after QK, so the global
 // latency of this load overlaps the tensor core work. mask == nullptr makes every
-// column below n_kv visible. mask_is_range makes the row an [lo, hi) pair instead.
+// column below n_kv visible. mask_is_range makes the row an [lo, hi) pair instead, which
+// the caller preloads into range once per kernel.
 __device__ __forceinline__ GroupedVerifyMaskPair grouped_verify_load_mask_pair(
-        const char * __restrict__ mask, const int64_t seq_mask_off, const int64_t nb31,
+        const char * __restrict__ mask, const GroupedVerifyMaskRange range,
+        const int64_t seq_mask_off, const int64_t nb31,
         const int token_idx, const int n_q, const int kv_idx, const int n_kv,
         const bool mask_is_range) {
     GroupedVerifyMaskPair pair;
@@ -458,11 +478,8 @@ __device__ __forceinline__ GroupedVerifyMaskPair grouped_verify_load_mask_pair(
         return pair;
     }
     if (mask_is_range) {
-        const int32_t * r = reinterpret_cast<const int32_t *>(mask + seq_mask_off + nb31 * token_idx);
-        const int lo = r[0];
-        const int hi = r[1];
-        pair.visible[0] = kv_idx >= lo && kv_idx < hi;
-        pair.visible[1] = kv_idx + 1 < n_kv && kv_idx + 1 >= lo && kv_idx + 1 < hi;
+        pair.visible[0] = kv_idx >= range.lo && kv_idx < range.hi;
+        pair.visible[1] = kv_idx + 1 < n_kv && kv_idx + 1 >= range.lo && kv_idx + 1 < range.hi;
         return pair;
     }
     const __half * mask_row = reinterpret_cast<const __half *>(mask + seq_mask_off + nb31 * token_idx);
@@ -478,36 +495,74 @@ __device__ __forceinline__ GroupedVerifyMaskPair grouped_verify_load_mask_pair(
 // Online softmax for one BlockN tile. Warp w owns rows w, w+16, w+32 and each lane the
 // two adjacent columns (2*lane, 2*lane+1). FP32 max and sum, half probabilities, exactly
 // like the original per-row update; only the reduction order changed with the tile width.
+// The three rows run in lockstep so every reduction step issues three independent
+// shuffles, which hides the shuffle latency that would stall a single row.
 __device__ __forceinline__ void grouped_verify_softmax_tile(
         const float * __restrict__ shared_scores, __half * __restrict__ shared_probs,
         float * __restrict__ row_max, float * __restrict__ row_sum, float * __restrict__ row_scale,
         const GroupedVerifyMaskPair * __restrict__ row_mask, const int warp_id, const int lane_id) {
     const int col = kGroupedVerifyColsPerLane * lane_id;
+    float score0[kGroupedVerifyRowsPerWarp];
+    float score1[kGroupedVerifyRowsPerWarp];
+    float tile_max[kGroupedVerifyRowsPerWarp];
+    float old_max[kGroupedVerifyRowsPerWarp];
 #pragma unroll
     for (int i = 0; i < kGroupedVerifyRowsPerWarp; ++i) {
         const int row = warp_id + i * kGroupedVerifyWarps;
         const float2 score_pair = *reinterpret_cast<const float2 *>(
             shared_scores + row * kGroupedVerifyScoreStride + col);
-        const float score0 = row_mask[i].visible[0] ? score_pair.x + row_mask[i].value[0] : kXQANegInf;
-        const float score1 = row_mask[i].visible[1] ? score_pair.y + row_mask[i].value[1] : kXQANegInf;
-        const float tile_max = __shfl_sync(0xffffffffu, warp_reduce_max(fmaxf(score0, score1)), 0);
-        const float old_max = row_max[row];
-        const float new_max = fmaxf(old_max, tile_max);
-        const float probability0 = row_mask[i].visible[0] ? __expf(fmaxf(score0 - new_max, -80.0f)) : 0.0f;
-        const float probability1 = row_mask[i].visible[1] ? __expf(fmaxf(score1 - new_max, -80.0f)) : 0.0f;
-        const float tile_sum = __shfl_sync(0xffffffffu, warp_reduce_sum(probability0 + probability1), 0);
-        const float exp_diff = tile_sum > 0.0f ? __expf(fmaxf(old_max - new_max, -80.0f)) : 1.0f;
+        score0[i]  = row_mask[i].visible[0] ? score_pair.x + row_mask[i].value[0] : kXQANegInf;
+        score1[i]  = row_mask[i].visible[1] ? score_pair.y + row_mask[i].value[1] : kXQANegInf;
+        tile_max[i] = fmaxf(score0[i], score1[i]);
+        old_max[i]  = row_max[row];
+    }
+#pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+#pragma unroll
+        for (int i = 0; i < kGroupedVerifyRowsPerWarp; ++i) {
+            tile_max[i] = fmaxf(tile_max[i], __shfl_down_sync(0xffffffffu, tile_max[i], offset));
+        }
+    }
+    float new_max[kGroupedVerifyRowsPerWarp];
+    float tile_sum[kGroupedVerifyRowsPerWarp];
+    float probability0[kGroupedVerifyRowsPerWarp];
+    float probability1[kGroupedVerifyRowsPerWarp];
+#pragma unroll
+    for (int i = 0; i < kGroupedVerifyRowsPerWarp; ++i) {
+        tile_max[i] = __shfl_sync(0xffffffffu, tile_max[i], 0);
+        new_max[i]  = fmaxf(old_max[i], tile_max[i]);
+        probability0[i] = row_mask[i].visible[0] ? __expf(fmaxf(score0[i] - new_max[i], -80.0f)) : 0.0f;
+        probability1[i] = row_mask[i].visible[1] ? __expf(fmaxf(score1[i] - new_max[i], -80.0f)) : 0.0f;
+        tile_sum[i] = probability0[i] + probability1[i];
+    }
+#pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+#pragma unroll
+        for (int i = 0; i < kGroupedVerifyRowsPerWarp; ++i) {
+            tile_sum[i] += __shfl_down_sync(0xffffffffu, tile_sum[i], offset);
+        }
+    }
+    float exp_diff[kGroupedVerifyRowsPerWarp];
+#pragma unroll
+    for (int i = 0; i < kGroupedVerifyRowsPerWarp; ++i) {
+        const int row = warp_id + i * kGroupedVerifyWarps;
+        tile_sum[i] = __shfl_sync(0xffffffffu, tile_sum[i], 0);
+        exp_diff[i] = tile_sum[i] > 0.0f ? __expf(fmaxf(old_max[i] - new_max[i], -80.0f)) : 1.0f;
         *reinterpret_cast<__half2 *>(shared_probs + row * kGroupedVerifyProbStride + col) =
-            __floats2half2_rn(probability0, probability1);
-        // Finish every lane's shared-state reads before lane 0 overwrites the
-        // online maximum. Shuffle synchronization does not order memory.
-        __syncwarp();
-        if (lane_id == 0) {
-            if (tile_sum > 0.0f) {
-                row_sum[row] = row_sum[row] * exp_diff + tile_sum;
-                row_max[row] = new_max;
+            __floats2half2_rn(probability0[i], probability1[i]);
+    }
+    // Finish every lane's shared-state reads before lane 0 overwrites the
+    // online maximum. Shuffle synchronization does not order memory.
+    __syncwarp();
+    if (lane_id == 0) {
+#pragma unroll
+        for (int i = 0; i < kGroupedVerifyRowsPerWarp; ++i) {
+            const int row = warp_id + i * kGroupedVerifyWarps;
+            if (tile_sum[i] > 0.0f) {
+                row_sum[row] = row_sum[row] * exp_diff[i] + tile_sum[i];
+                row_max[row] = new_max[i];
             }
-            row_scale[row] = exp_diff;
+            row_scale[row] = exp_diff[i];
         }
     }
 }
@@ -641,6 +696,17 @@ static __global__ void flash_attn_ext_sm70_grouped(
             v_regs, V, nb21, nb22, nb23, seq, kv_head, split_start, n_kv);
     }
 
+    // A range mask row has a fixed [lo, hi) interval, so load it once instead of on every
+    // tile. The tile loop then only compares against these registers.
+    GroupedVerifyMaskRange row_range[kGroupedVerifyRowsPerWarp] = {};
+    if (mask_is_range) {
+#pragma unroll
+        for (int i = 0; i < kGroupedVerifyRowsPerWarp; ++i) {
+            const int row = warp_id + i * kGroupedVerifyWarps;
+            row_range[i] = grouped_verify_load_mask_range(mask, seq_mask_off, nb31, row / kHeadsPerCta, n_q);
+        }
+    }
+
     for (int tile_start = split_start; tile_start < split_end; tile_start += kGroupedVerifyBlockN) {
         const bool has_next = tile_start + kGroupedVerifyBlockN < split_end;
 
@@ -670,14 +736,14 @@ static __global__ void flash_attn_ext_sm70_grouped(
             }
         }
 
-        // The mask does not depend on the panel, so load it before QK to hide the
-        // global latency behind the tensor core work.
+        // The dense mask does not depend on the panel, so load it before QK to hide the
+        // global latency behind the tensor core work. The range mask is already in registers.
         GroupedVerifyMaskPair row_mask[kGroupedVerifyRowsPerWarp];
 #pragma unroll
         for (int i = 0; i < kGroupedVerifyRowsPerWarp; ++i) {
             const int row = warp_id + i * kGroupedVerifyWarps;
             row_mask[i] = grouped_verify_load_mask_pair(
-                mask, seq_mask_off, nb31, row / kHeadsPerCta, n_q,
+                mask, row_range[i], seq_mask_off, nb31, row / kHeadsPerCta, n_q,
                 tile_start + kGroupedVerifyColsPerLane * lane_id, n_kv,
                 mask_is_range != 0);
         }
