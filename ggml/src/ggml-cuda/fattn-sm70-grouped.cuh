@@ -711,15 +711,27 @@ static __global__ void flash_attn_ext_sm70_grouped(
         ggml_sm70_wmma::fill_fragment(output_fragments[fragment_idx], 0.0f);
     }
 
-    // Tile i+1 is fetched into registers while tile i is computed. The staging rows of
-    // this warp are private, so a block wide fence is only needed around the panel.
-    GroupedVerifyKVRegs<type_K> k_regs;
-    GroupedVerifyKVRegs<type_V> v_regs;
+    // Two tiles stay in flight: while tile i is computed, the loads of tiles i+1 and i+2
+    // are still in flight. The two register groups hold kVecsPerThread uint4 per K and V
+    // each, twice the prefetch footprint of a single group. The tile loop is unrolled by
+    // hand so that both groups stay in named registers and never fall back to local
+    // memory. The staging rows of this warp are private, so a block wide fence is only
+    // needed around the panel.
+    GroupedVerifyKVRegs<type_K> k_regs_a;
+    GroupedVerifyKVRegs<type_V> v_regs_a;
+    GroupedVerifyKVRegs<type_K> k_regs_b;
+    GroupedVerifyKVRegs<type_V> v_regs_b;
     if (split_start < split_end) {
         flash_attn_sm70_grouped_prefetch_kv<type_K>(
-            k_regs, K, nb11, nb12, nb13, seq, kv_head, split_start, n_kv);
+            k_regs_a, K, nb11, nb12, nb13, seq, kv_head, split_start, n_kv);
         flash_attn_sm70_grouped_prefetch_kv<type_V>(
-            v_regs, V, nb21, nb22, nb23, seq, kv_head, split_start, n_kv);
+            v_regs_a, V, nb21, nb22, nb23, seq, kv_head, split_start, n_kv);
+    }
+    if (split_start + kGroupedVerifyBlockN < split_end) {
+        flash_attn_sm70_grouped_prefetch_kv<type_K>(
+            k_regs_b, K, nb11, nb12, nb13, seq, kv_head, split_start + kGroupedVerifyBlockN, n_kv);
+        flash_attn_sm70_grouped_prefetch_kv<type_V>(
+            v_regs_b, V, nb21, nb22, nb23, seq, kv_head, split_start + kGroupedVerifyBlockN, n_kv);
     }
 
     // A range mask row has a fixed [lo, hi) interval, so load it once instead of on every
@@ -733,32 +745,34 @@ static __global__ void flash_attn_ext_sm70_grouped(
         }
     }
 
-    for (int tile_start = split_start; tile_start < split_end; tile_start += kGroupedVerifyBlockN) {
-        const bool has_next = tile_start + kGroupedVerifyBlockN < split_end;
+    for (int tile_start = split_start; tile_start < split_end; tile_start += 2 * kGroupedVerifyBlockN) {
+        // Even tile: group a. Both prefetches go two tiles ahead into the group that was
+        // just consumed.
+        const bool has_next2 = tile_start + 2 * kGroupedVerifyBlockN < split_end;
 
         if constexpr (type_K == GGML_TYPE_F16) {
             __syncthreads(); // the previous P x V must be done reading the panel
-            flash_attn_sm70_grouped_store_kv<type_K>(shared_kv, kv_stage, k_regs);
+            flash_attn_sm70_grouped_store_kv<type_K>(shared_kv, kv_stage, k_regs_a);
             __syncthreads();
         } else {
-            flash_attn_sm70_grouped_store_kv<type_K>(shared_kv, kv_stage, k_regs);
+            flash_attn_sm70_grouped_store_kv<type_K>(shared_kv, kv_stage, k_regs_a);
             __syncthreads(); // the previous P x V must be done reading the panel
             flash_attn_sm70_grouped_dequant_kv<type_K>(shared_kv, kv_stage);
             __syncthreads();
         }
 
-        if (has_next) {
+        if (has_next2) {
             flash_attn_sm70_grouped_prefetch_kv<type_K>(
-                k_regs, K, nb11, nb12, nb13, seq, kv_head, tile_start + kGroupedVerifyBlockN, n_kv);
+                k_regs_a, K, nb11, nb12, nb13, seq, kv_head, tile_start + 2 * kGroupedVerifyBlockN, n_kv);
         }
         if constexpr (type_V != GGML_TYPE_F16) {
             // The staging buffer is free again once the K dequantize is done. For a
             // quantized V the raw tile waits there until the K panel dies after QK.
             // The next V tile starts loading right away so its latency hides behind QK.
-            flash_attn_sm70_grouped_store_kv<type_V>(shared_kv, kv_stage, v_regs);
-            if (has_next) {
+            flash_attn_sm70_grouped_store_kv<type_V>(shared_kv, kv_stage, v_regs_a);
+            if (has_next2) {
                 flash_attn_sm70_grouped_prefetch_kv<type_V>(
-                    v_regs, V, nb21, nb22, nb23, seq, kv_head, tile_start + kGroupedVerifyBlockN, n_kv);
+                    v_regs_a, V, nb21, nb22, nb23, seq, kv_head, tile_start + 2 * kGroupedVerifyBlockN, n_kv);
             }
         }
 
@@ -780,10 +794,10 @@ static __global__ void flash_attn_ext_sm70_grouped(
         if constexpr (type_V == GGML_TYPE_F16) {
             // The panel is free now; fp16 V goes straight into it. The next V tile
             // starts loading right away so its latency hides behind softmax and P x V.
-            flash_attn_sm70_grouped_store_kv<type_V>(shared_kv, kv_stage, v_regs);
-            if (has_next) {
+            flash_attn_sm70_grouped_store_kv<type_V>(shared_kv, kv_stage, v_regs_a);
+            if (has_next2) {
                 flash_attn_sm70_grouped_prefetch_kv<type_V>(
-                    v_regs, V, nb21, nb22, nb23, seq, kv_head, tile_start + kGroupedVerifyBlockN, n_kv);
+                    v_regs_a, V, nb21, nb22, nb23, seq, kv_head, tile_start + 2 * kGroupedVerifyBlockN, n_kv);
             }
         }
 
@@ -821,6 +835,100 @@ static __global__ void flash_attn_ext_sm70_grouped(
                     kGroupedVerifyProbStride);
                 ggml_sm70_wmma::mma_sync(
                     output_fragments[m_tile], probability_fragment, value_fragment, output_fragments[m_tile]);
+            }
+        }
+
+        // Odd tile: group b. It is skipped when the split ends on the even tile.
+        if (tile_start + kGroupedVerifyBlockN < split_end) {
+            const int tile_start_b = tile_start + kGroupedVerifyBlockN;
+            const bool has_next2_b = tile_start_b + 2 * kGroupedVerifyBlockN < split_end;
+
+            if constexpr (type_K == GGML_TYPE_F16) {
+                __syncthreads(); // the previous P x V must be done reading the panel
+                flash_attn_sm70_grouped_store_kv<type_K>(shared_kv, kv_stage, k_regs_b);
+                __syncthreads();
+            } else {
+                flash_attn_sm70_grouped_store_kv<type_K>(shared_kv, kv_stage, k_regs_b);
+                __syncthreads(); // the previous P x V must be done reading the panel
+                flash_attn_sm70_grouped_dequant_kv<type_K>(shared_kv, kv_stage);
+                __syncthreads();
+            }
+
+            if (has_next2_b) {
+                flash_attn_sm70_grouped_prefetch_kv<type_K>(
+                    k_regs_b, K, nb11, nb12, nb13, seq, kv_head, tile_start_b + 2 * kGroupedVerifyBlockN, n_kv);
+            }
+            if constexpr (type_V != GGML_TYPE_F16) {
+                // The staging buffer is free again once the K dequantize is done. For a
+                // quantized V the raw tile waits there until the K panel dies after QK.
+                // The next V tile starts loading right away so its latency hides behind QK.
+                flash_attn_sm70_grouped_store_kv<type_V>(shared_kv, kv_stage, v_regs_b);
+                if (has_next2_b) {
+                    flash_attn_sm70_grouped_prefetch_kv<type_V>(
+                        v_regs_b, V, nb21, nb22, nb23, seq, kv_head, tile_start_b + 2 * kGroupedVerifyBlockN, n_kv);
+                }
+            }
+
+            // The dense mask does not depend on the panel, so load it before QK to hide the
+            // global latency behind the tensor core work. The range mask is already in registers.
+            GroupedVerifyMaskPair row_mask_b[kGroupedVerifyRowsPerWarp];
+#pragma unroll
+            for (int i = 0; i < kGroupedVerifyRowsPerWarp; ++i) {
+                const int row = warp_id + i * kGroupedVerifyWarps;
+                row_mask_b[i] = grouped_verify_load_mask_pair(
+                    mask, row_range[i], seq_mask_off, nb31, row / kHeadsPerCta, n_q,
+                    tile_start_b + kGroupedVerifyColsPerLane * lane_id, n_kv,
+                    mask_is_range != 0);
+            }
+
+            grouped_verify_qk(shared_q, shared_kv, shared_scores, scale);
+            __syncthreads(); // scores are ready and QK is done with the panel
+
+            if constexpr (type_V == GGML_TYPE_F16) {
+                // The panel is free now; fp16 V goes straight into it. The next V tile
+                // starts loading right away so its latency hides behind softmax and P x V.
+                flash_attn_sm70_grouped_store_kv<type_V>(shared_kv, kv_stage, v_regs_b);
+                if (has_next2_b) {
+                    flash_attn_sm70_grouped_prefetch_kv<type_V>(
+                        v_regs_b, V, nb21, nb22, nb23, seq, kv_head, tile_start_b + 2 * kGroupedVerifyBlockN, n_kv);
+                }
+            }
+
+            grouped_verify_softmax_tile(
+                shared_scores, shared_probs, smem.row_max, smem.row_sum, smem.row_scale, row_mask_b, warp_id, lane_id);
+            if constexpr (type_V != GGML_TYPE_F16) {
+                flash_attn_sm70_grouped_dequant_kv<type_V>(shared_kv, kv_stage);
+            }
+            // row_scale is written by every warp and read by every warp below, so the
+            // rescale of the accumulators must wait for this barrier.
+            __syncthreads(); // probs, row_scale and the V panel are ready for P x V
+
+#pragma unroll
+            for (int fragment_idx = 0; fragment_idx < kGroupedVerifyOutputTilesPerWarp; ++fragment_idx) {
+                grouped_verify_scale_output_fragment(output_fragments[fragment_idx], smem.row_scale, fragment_idx * 16);
+            }
+
+            // One warp per V column tile, all three M tiles share the same B fragment:
+            // 4 B loads + 12 A loads per warp instead of 4 + 4 + 4 loads per M tile.
+#pragma unroll
+            for (int k_offset = 0; k_offset < kGroupedVerifyBlockN; k_offset += 16) {
+                ggml_sm70_wmma::fragment<ggml_sm70_wmma::matrix_b, 16, 16, 16, half, ggml_sm70_wmma::row_major>
+                    value_fragment;
+                ggml_sm70_wmma::load_matrix_sync(
+                    value_fragment,
+                    shared_kv + k_offset * kGroupedVerifyKVStride + warp_id * 16,
+                    kGroupedVerifyKVStride);
+#pragma unroll
+                for (int m_tile = 0; m_tile < kGroupedVerifyOutputTilesPerWarp; ++m_tile) {
+                    ggml_sm70_wmma::fragment<ggml_sm70_wmma::matrix_a, 16, 16, 16, half, ggml_sm70_wmma::row_major>
+                        probability_fragment;
+                    ggml_sm70_wmma::load_matrix_sync(
+                        probability_fragment,
+                        shared_probs + m_tile * 16 * kGroupedVerifyProbStride + k_offset,
+                        kGroupedVerifyProbStride);
+                    ggml_sm70_wmma::mma_sync(
+                        output_fragments[m_tile], probability_fragment, value_fragment, output_fragments[m_tile]);
+                }
             }
         }
     }
