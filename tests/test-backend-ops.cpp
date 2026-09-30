@@ -8756,6 +8756,73 @@ struct test_flash_attn_ext_window : public test_case {
     }
 };
 
+// GGML_OP_FLASH_ATTN_EXT with the non-uniform GQA mapping of the 3-card attention split: Q holds
+// the 8 local query heads and K/V hold the 2 local KV heads. Query head h reads KV head 0 when
+// h < g0 and KV head 1 otherwise. The sm70 grouped kernel and the CPU reference apply the same
+// mapping, so the standard CPU comparison covers it.
+struct test_flash_attn_ext_nonuniform : public test_case {
+    const int64_t g0;   // first local query head that reads KV head 1
+    const int64_t n_q;  // number of query tokens
+    const int64_t n_kv; // KV length
+
+    const ggml_type type_KV;
+
+    std::string vars() override {
+        return VARS_TO_STR4(g0, n_q, n_kv, type_KV);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        // Q*K^T and P*V, per head
+        return 2 * 8 * n_q * (256 + 256) * n_kv;
+    }
+
+    test_flash_attn_ext_nonuniform(int64_t g0 = 6, int64_t n_q = 8, int64_t n_kv = 1025, ggml_type type_KV = GGML_TYPE_F16)
+        : g0(g0), n_q(n_q), n_kv(n_kv), type_KV(type_KV) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 8, n_q);
+        q = ggml_permute(ctx, q, 0, 2, 1, 3);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * k = ggml_new_tensor_3d(ctx, type_KV, 256, 2, n_kv);
+        k = ggml_permute(ctx, k, 0, 2, 1, 3);
+        ggml_set_name(k, "k");
+
+        ggml_tensor * v = ggml_new_tensor_3d(ctx, type_KV, 256, 2, n_kv);
+        v = ggml_permute(ctx, v, 0, 2, 1, 3);
+        ggml_set_name(v, "v");
+
+        ggml_tensor * m = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, n_q);
+        ggml_set_name(m, "m");
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/16.0f, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_q_head_boundary(out, (int32_t) g0);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") == 0) {
+                init_tensor_kq_mask(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    bool grad_precise() override {
+        return true;
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -12184,6 +12251,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 for (bool range_mask : { false, true }) {
                     test_cases.emplace_back(new test_flash_attn_ext_window(
                             w[0], w[1], w[2], n_q, 2048, type_KV, range_mask));
+                }
+            }
+        }
+    }
+
+    // non-uniform GQA head mapping of the 3-card attention split: local Q head h reads KV head 0
+    // when h < g0, matching the 6+2/4+4/2+6 windows of the three devices
+    for (int g0 : { 6, 4, 2 }) {
+        for (int n_q : { 2, 8, 16 }) {
+            for (int n_kv : { 1025, 4096 }) {
+                for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext_nonuniform(g0, n_q, n_kv, type_KV));
                 }
             }
         }

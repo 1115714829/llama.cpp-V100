@@ -1717,6 +1717,32 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         }
         t_ij->flags = tensor->flags;
         memcpy(t_ij->op_params, tensor->op_params, sizeof(tensor->op_params));
+        if (tensor->op == GGML_OP_FLASH_ATTN_EXT && ggml_get_op_params_i32(tensor, 5) < 0) {
+            // 3-card attention split: derive the per-device Q head boundary from the Q/K head windows
+            const ggml_tensor * q_src = tensor->src[0];
+            const ggml_tensor * k_src = tensor->src[1];
+            GGML_ASSERT(q_src != nullptr && k_src != nullptr);
+
+            const ggml_backend_meta_split_state q_ss = ggml_backend_meta_get_split_state(stc, q_src, /*assume_sync =*/ true);
+            const ggml_backend_meta_split_state k_ss = ggml_backend_meta_get_split_state(stc, k_src, /*assume_sync =*/ true);
+            GGML_ASSERT(q_ss.has_off && k_ss.has_off);
+            GGML_ASSERT(q_ss.axis == GGML_BACKEND_SPLIT_AXIS_2 && k_ss.axis == GGML_BACKEND_SPLIT_AXIS_2);
+            GGML_ASSERT(q_ss.n_segments == 1 && k_ss.n_segments == 1 && q_ss.nr[0] == 1 && k_ss.nr[0] == 1);
+
+            const int64_t n_gqa = q_src->ne[2] / k_src->ne[2];
+            const int64_t q0    = q_ss.off[j];
+            const int64_t kv0   = k_ss.off[j];
+
+            int64_t g0 = (kv0 + 1)*n_gqa - q0;
+            if (g0 < 0 || g0 >= q_ss.ne[j]) {
+                // the device uses a single KV head, uniform GQA selects the same one
+                g0 = 0;
+            } else {
+                // both groups must be non-empty and fit the HEADS=6 slot layout
+                GGML_ASSERT(g0 <= 6 && q_ss.ne[j] - g0 <= 6);
+            }
+            ggml_set_op_params_i32(t_ij, 5, (int32_t) g0);
+        }
         ggml_set_name(t_ij, tensor->name);
         t_ij->buffer = simple_buf;
         t_ij->view_src = tensor->view_src;

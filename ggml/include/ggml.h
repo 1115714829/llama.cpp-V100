@@ -2510,6 +2510,18 @@ extern "C" {
             struct ggml_tensor * a,
             int32_t              n_kv_max);
 
+    // Per-device query head boundary of the 3-card attention split.
+    // -1: the boundary is filled in by the split backend
+    //  0: uniform GQA (default, all backends behave as before)
+    // >0: query heads [0, g0) use KV head 0 and query heads [g0, n_head) use KV head 1
+    //     (valid only when K has 2 heads, honored by the sm70 grouped kernel)
+    GGML_API void ggml_flash_attn_ext_set_q_head_boundary(
+            struct ggml_tensor * a,
+            int32_t              boundary);
+
+    GGML_API int32_t ggml_flash_attn_ext_get_q_head_boundary(
+            const struct ggml_tensor * a);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
