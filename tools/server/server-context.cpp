@@ -38,6 +38,9 @@
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// number of newest context checkpoints that are always kept, see checkpoint_evict_victim()
+constexpr int CHECKPOINT_KEEP_NEWEST = 8;
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
@@ -2335,38 +2338,71 @@ private:
         return true;
     }
 
+    // bucket index used by the checkpoint retention policy: floor(log2(n_tokens)), with n_tokens == 0 in bucket 0
+    static int checkpoint_bucket(int64_t n_tokens) {
+        int b = 0;
+        while (n_tokens > 1) {
+            n_tokens >>= 1;
+            ++b;
+        }
+        return b;
+    }
+
+    // pick the checkpoint to erase when the list is over the limit:
+    //   1. the oldest one that is not protected
+    //   2. else, the older member of the smallest bucket that has two protected members
+    //   3. else, the oldest one
+    // protected: the CHECKPOINT_KEEP_NEWEST newest checkpoints, plus the oldest and the newest checkpoint of each bucket
+    // the list is sorted by n_tokens in ascending order
+    static std::list<common_prompt_checkpoint>::iterator checkpoint_evict_victim(std::list<common_prompt_checkpoint> & checkpoints) {
+        std::set<const common_prompt_checkpoint *> keep;
+
+        {
+            auto it = checkpoints.rbegin();
+            for (int i = 0; i < CHECKPOINT_KEEP_NEWEST && it != checkpoints.rend(); ++i, ++it) {
+                keep.insert(&*it);
+            }
+        }
+
+        int b_max = 0;
+        for (const auto & ckpt : checkpoints) {
+            b_max = std::max(b_max, checkpoint_bucket(ckpt.n_tokens));
+        }
+
+        std::vector<std::list<common_prompt_checkpoint>::iterator> bucket_first(b_max + 1, checkpoints.end());
+        std::vector<std::list<common_prompt_checkpoint>::iterator> bucket_last (b_max + 1, checkpoints.end());
+        for (auto it = checkpoints.begin(); it != checkpoints.end(); ++it) {
+            const int b = checkpoint_bucket(it->n_tokens);
+            if (bucket_first[b] == checkpoints.end()) {
+                bucket_first[b] = it;
+            }
+            bucket_last[b] = it;
+        }
+        for (int b = 0; b <= b_max; ++b) {
+            if (bucket_first[b] != checkpoints.end()) {
+                keep.insert(&*bucket_first[b]);
+                keep.insert(&*bucket_last[b]);
+            }
+        }
+
+        for (auto it = checkpoints.begin(); it != checkpoints.end(); ++it) {
+            if (keep.find(&*it) == keep.end()) {
+                return it;
+            }
+        }
+
+        for (int b = 0; b <= b_max; ++b) {
+            if (bucket_first[b] != checkpoints.end() && bucket_first[b] != bucket_last[b]) {
+                return bucket_first[b];
+            }
+        }
+
+        return checkpoints.begin();
+    }
+
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
-
-        // evict checkpoints within min-step of a previous checkpoint, unless they were
-        // created by the current task
-        // only when the list is full, otherwise short prompts keep just the oldest checkpoint
-        int64_t last = -1;
-        for (auto it = slot.prompt.checkpoints.begin();
-                slot.prompt.checkpoints.size() + 1 >= (size_t) params_base.n_ctx_checkpoints &&
-                it != slot.prompt.checkpoints.end(); ) {
-            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
-                SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                        it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
-
-                it = slot.prompt.checkpoints.erase(it);
-                continue;
-            }
-
-            last = it->n_tokens;
-            ++it;
-        }
-
-        while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
-            // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
-
-            SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
-
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
-        }
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
         {
@@ -2379,6 +2415,17 @@ private:
                     ++it;
                 }
             }
+        }
+
+        // make room for the new checkpoint, if needed
+        while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints &&
+                !slot.prompt.checkpoints.empty()) {
+            const auto it = checkpoint_evict_victim(slot.prompt.checkpoints);
+
+            SLT_WRN(slot, "erasing old context checkpoint (bucket = %d, pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                    checkpoint_bucket(it->n_tokens), it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
+
+            slot.prompt.checkpoints.erase(it);
         }
 
         auto & cur = slot.prompt.checkpoints.emplace_back();
