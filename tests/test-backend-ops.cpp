@@ -11788,6 +11788,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
     // mixed K/V quantization pairs of the grouped kernel, one side q4_0
     for (const std::array<ggml_type, 2> & type_KV : {
             std::array<ggml_type, 2>{GGML_TYPE_Q4_0, GGML_TYPE_Q8_0},
@@ -11797,6 +11798,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }) {
         for (int nb : { 2, 16 }) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1025, nb, true, false, 0, 0, GGML_PREC_F32, type_KV[0], type_KV[1]));
+        }
+    }
+
+    // grouped verify with GQA 2 and 4: the head groups round up, so the padding slots of a
+    // partial group must not load Q and must not write output
+    for (int gqa : { 2, 4 }) {
+        for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+            for (int nb : { 8, 16 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {gqa, 1}, 1025, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+            }
         }
     }
 
@@ -11902,6 +11913,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 for (int range : { 1, 2 }) {
                     test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 0, false, range));
                 }
+            }
+        }
+    }
+
+    // grouped GQA 2 and 4 with range masks
+    for (int gqa : { 2, 4 }) {
+        for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+            for (int nb : { 8, 16 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {gqa, 1}, 1025, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, false, 0, false, 1));
             }
         }
     }

@@ -147,7 +147,6 @@ VOLTA_WMMA_MMA_F32(16, 16, 16, row, row)
 // query heads, split over the KV context and merged with flash_attn_combine_results.
 constexpr float kXQANegInf = -1.0e30f;
 
-constexpr int kGroupedVerifyHeads        = 6;
 constexpr int kGroupedVerifyHeadDim      = 256;
 constexpr int kGroupedVerifyRows         = 48;
 constexpr int kGroupedVerifyBlockN       = 64;
@@ -177,11 +176,12 @@ static_assert(kGroupedVerifyWarps == kGroupedVerifyHeadDim / 16, "one warp per V
 static_assert(kGroupedVerifyOutputTilesPerWarp == kGroupedVerifyRows / 16, "one accumulator per M tile");
 static_assert(kGroupedVerifyBlockN % kGroupedVerifyWarps == 0, "staging rows must divide evenly");
 
-template <int MAX_QUERY_TOKENS>
+template <int MAX_QUERY_TOKENS, int HEADS>
 struct GroupedVerifyTraits {
     static_assert(MAX_QUERY_TOKENS == 8 || MAX_QUERY_TOKENS == 16, "grouped verify supports 8 and 16 query tokens");
+    static_assert(HEADS == 2 || HEADS == 4 || HEADS == 6, "grouped verify supports GQA 2, 4 and 6");
     static constexpr int kHeadsPerCta = kGroupedVerifyRows / MAX_QUERY_TOKENS;
-    static constexpr int kHeadGroups  = kGroupedVerifyHeads / kHeadsPerCta;
+    static constexpr int kHeadGroups  = (HEADS + kHeadsPerCta - 1) / kHeadsPerCta;
     static_assert(MAX_QUERY_TOKENS * kHeadsPerCta == kGroupedVerifyRows, "the CTA must keep 48 rows");
 };
 
@@ -521,7 +521,7 @@ __device__ __forceinline__ void grouped_verify_softmax_tile(
 
 #endif // VOLTA_MMA_AVAILABLE
 
-template <int MAX_QUERY_TOKENS, ggml_type type_K, ggml_type type_V>
+template <int MAX_QUERY_TOKENS, int HEADS, ggml_type type_K, ggml_type type_V>
 __launch_bounds__(kGroupedVerifyThreads, 1)
 static __global__ void flash_attn_ext_sm70_grouped(
         const char * Q_ptr,
@@ -550,7 +550,7 @@ static __global__ void flash_attn_ext_sm70_grouped(
     float       * GGML_CUDA_RESTRICT dst_partial = dst_partial_ptr;
     float2      * GGML_CUDA_RESTRICT dst_meta    = dst_meta_ptr;
 
-    using Traits = GroupedVerifyTraits<MAX_QUERY_TOKENS>;
+    using Traits = GroupedVerifyTraits<MAX_QUERY_TOKENS, HEADS>;
     constexpr int kHeadsPerCta = Traits::kHeadsPerCta;
     constexpr int kHeadGroups  = Traits::kHeadGroups;
 
@@ -595,13 +595,21 @@ static __global__ void flash_attn_ext_sm70_grouped(
     uint8_t * kv_stage     = smem.storage.compute.kv_stage;
 
     // Q is F32 [256, n_q, n_heads, n_seq], one shared row per (token, head).
+    // When the head count does not fill the CTA the padding slots of the last group
+    // hold zero instead of reading past the Q heads; their output is skipped below.
     for (int idx = tid; idx < kGroupedVerifyRows * kGroupedVerifyHeadDim; idx += kGroupedVerifyThreads) {
         const int row        = idx / kGroupedVerifyHeadDim;
         const int d          = idx % kGroupedVerifyHeadDim;
         const int token_idx  = row / kHeadsPerCta;
         const int local_head = row % kHeadsPerCta;
-        const int head = kv_head * kGroupedVerifyHeads + head_group * kHeadsPerCta + local_head;
+        const int head = kv_head * HEADS + head_group * kHeadsPerCta + local_head;
         __half * dst = shared_q + row * kGroupedVerifyQStride + d;
+        if constexpr (HEADS % kHeadsPerCta != 0) {
+            if (head_group * kHeadsPerCta + local_head >= HEADS) {
+                *dst = __float2half_rn(0.0f);
+                continue;
+            }
+        }
         if (token_idx < n_q) {
             const float val = *(const float *) (Q + token_idx*nb01 + head*nb02 + int64_t(seq)*nb03 + d*sizeof(float));
             *dst = __float2half_rn(val);
@@ -759,7 +767,12 @@ static __global__ void flash_attn_ext_sm70_grouped(
         if (token_idx >= n_q) {
             continue;
         }
-        const int head = kv_head * kGroupedVerifyHeads + head_group * kHeadsPerCta + local_head;
+        if constexpr (HEADS % kHeadsPerCta != 0) {
+            if (head_group * kHeadsPerCta + local_head >= HEADS) {
+                continue;
+            }
+        }
+        const int head = kv_head * HEADS + head_group * kHeadsPerCta + local_head;
         const int64_t j = (int64_t(seq) * n_q + token_idx) * n_heads + head;
         // Unnormalized numerator, normalized by flash_attn_combine_results.
         dst_partial[(j * n_splits + split_id) * kGroupedVerifyHeadDim + d] = shared_output[idx];
@@ -767,8 +780,12 @@ static __global__ void flash_attn_ext_sm70_grouped(
     if (tid < kGroupedVerifyRows) {
         const int token_idx  = tid / kHeadsPerCta;
         const int local_head = tid % kHeadsPerCta;
-        if (token_idx < n_q) {
-            const int head = kv_head * kGroupedVerifyHeads + head_group * kHeadsPerCta + local_head;
+        bool head_filled = true;
+        if constexpr (HEADS % kHeadsPerCta != 0) {
+            head_filled = head_group * kHeadsPerCta + local_head < HEADS;
+        }
+        if (token_idx < n_q && head_filled) {
+            const int head = kv_head * HEADS + head_group * kHeadsPerCta + local_head;
             const int64_t j = (int64_t(seq) * n_q + token_idx) * n_heads + head;
             const float sum = smem.row_sum[tid];
             dst_meta[j * n_splits + split_id] = make_float2(sum > 0.0f ? smem.row_max[tid] : kXQANegInf, sum);
