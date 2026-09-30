@@ -3169,8 +3169,10 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
 
     // multi-segment and PARTIAL layouts are staged on the host (PARTIAL scales the values into a temporary buffer),
-    // so they cannot be copied asynchronously: wait for the queued work of all ranks, then copy synchronously
-    if (split_state.n_segments != 1 || split_state.nr[0] != 1 || split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+    // and slices at explicit offsets may overlap, so none of them can be spliced as consecutive chunks:
+    // wait for the queued work of all ranks, then copy synchronously
+    if (split_state.has_off || split_state.n_segments != 1 || split_state.nr[0] != 1 ||
+            split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
         ggml_backend_synchronize(backend);
         ggml_backend_meta_buffer_set_tensor(tensor->buffer, tensor, data, offset, size);
         return;
