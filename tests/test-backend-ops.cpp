@@ -11842,6 +11842,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 0, false, 2));
     }
 
+    // windowed KV mirror (K/V wider than one 64K-row window): a range mask that
+    // (a) stays inside the first window, (b) crosses window borders or (c) spans
+    // a non-multiple of the window size must match the reference
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 131072, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, false, 3));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 131072,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, false, 2));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 163840, 256, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}, true, false, 0, false, 1));
+
     // range masks that stop at half of the KV view (the split-d conversion must
     // follow the bounds, not the view width)
     for (int kv : { 4096, 32768 }) {

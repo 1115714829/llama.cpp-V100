@@ -696,6 +696,24 @@ void sm70_d256_splitd_dense_kernel(
     // still load a valid first tile to keep the gmem addresses in range; use
     // n_block_min (always < visible_n_blocks) for that degenerate case.
     const int n_block_first = n_block_max >= n_block_min ? n_block_max : n_block_min;
+    if constexpr (Partial) {
+        // Empty window: the K/V tile at n_block_first may lie outside the
+        // window mirror, so no tile is loaded. Rows get max -inf and sum 0;
+        // O is not written: the merge kernel skips -inf windows without
+        // reading it, and window 0 (written straight into the accumulator)
+        // always contains block 0, so it is never empty here.
+        if (n_block_max < n_block_min) {
+            for (int qr = tid; qr < kBlockM; qr += blockDim.x) {
+                const int query_row = query_row_base + qr;
+                const int64_t row_offset =
+                    (static_cast<int64_t>(batch) * query_len + query_row)
+                        * heads_q + head_q;
+                partial_max[row_offset] = -INFINITY;
+                partial_sum[row_offset] = 0.0f;
+            }
+            return;
+        }
+    }
 
     const int64_t k_batch_offset = static_cast<int64_t>(batch)
         * k_outer_stride;
@@ -1150,8 +1168,18 @@ void sm70_d256_window_merge_kernel(
         return;
     }
 
+    if (p_max[row] == -INFINITY) {
+        return;  // empty window, accumulator unchanged
+    }
+
     const int64_t element = row * Sm70D256SplitDTraitsT<64>::kHeadDim + d;
-    if (first) {
+    // An accumulator that has seen no KV row yet (its window 0 was empty for
+    // this row, so its O was never written) takes the window as is. Every
+    // thread reads acc_max before any thread writes it, so the branch is
+    // uniform across the CTA.
+    const bool acc_empty = acc_max[row] == -INFINITY;
+    __syncthreads();
+    if (first || acc_empty) {
         acc_max[row] = p_max[row];
         acc_sum[row] = p_sum[row];
         acc_out[element] = p_out[element];
@@ -1198,7 +1226,8 @@ void sm70_d256_window_finalize_kernel(
     const float sum = acc_sum[row];
     const float inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
     const int64_t element = row * Sm70D256SplitDTraitsT<64>::kHeadDim + d;
-    out[element] = acc_out[element] * inv_sum;
+    // a row that saw no KV row may have an unwritten accumulator: write 0
+    out[element] = sum > 0.0f ? acc_out[element] * inv_sum : 0.0f;
 }
 
 }  // namespace FLASH_NAMESPACE
