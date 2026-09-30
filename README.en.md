@@ -2,18 +2,19 @@
 
 [简体中文](README.md) | **English**
 
-A modified version of llama.cpp for the NVIDIA V100 (SM70). Current version **1.0.4**; see [CHANGELOG.md](CHANGELOG.md) for the changes in each release.
+A modified version of llama.cpp for the NVIDIA V100 (SM70). Current version **1.0.5**; see [CHANGELOG.md](CHANGELOG.md) for the changes in each release.
 
 ---
 
-## What's new in 1.0.4
+## What's new in 1.0.5
 
-1.0.4 supports concurrent requests (`-np 2`, `-np 4`); single-request speed is essentially the same as 1.0.3.
+1.0.5 supports 2 to 6 GPUs, with measured data for both the Q8 and Q4 configurations at each GPU count; single-request and concurrent speed is the same as 1.0.4 (the floor check is yet to be filled in).
 
-- **Decode is no longer held back by other requests**: added `--prefill-pace` (default 30). While a request is decoding, prompt processing of other requests takes at most 30% of the time. On 4 GPUs with two concurrent requests of about 115K tokens each: the request that starts decoding first goes from 11.4 to 70.2 tok/s, and the TTFT of the other goes from 133.0 s down to 122.6 s.
-- **Concurrent requests decode faster together**: the decode batch limit grows with the number of requests (8 tokens per request, up to 64); the Q8_0 small-batch matrix multiplication kernel now supports 17-64 rows; with multiple requests the DFlash2 draft injection is fused into one pass and done entirely in VRAM.
-- **Concurrent requests use less VRAM**: with multiple requests the compute buffers are also reserved only for the attention ranges actually used. On 4 GPUs with `-c 262144 -np 2`, startup VRAM per GPU drops from 14031 MiB to 13513 MiB; 4 GPUs with `-np 4` (64K per request) used to fail at startup for lack of VRAM and now runs; 6 GPUs with `-c 524288 -np 2` (256K per request) now runs.
-- **Single request**: speed and VRAM are essentially the same as 1.0.3 (prefill of long prompts is about 0.2% slower, see the known issue in [CHANGELOG.md](CHANGELOG.md)). In long prompts, the scattered 17-64 token batches now use the new kernel, so the compute order differs and the output may differ slightly from 1.0.3, with unchanged perplexity.
+- **Q4 configuration**: target model UD-Q4_K_M, KV cache q4_0. The SM70 attention kernels (prefill and speculative verification) support the q4_0 KV cache; long-context prefill is as fast as with a q8_0 KV cache, and the KV cache uses half the VRAM. This part comes from a PR by the external contributor ATIVX928, see "Contributors".
+- **2-6 GPU adaptation table**: for each GPU count and each configuration, single-request and two-request concurrent measurements at the highest context that can start; the data is in "GPU counts and quantization" under "Test data". With the Q4 configuration, 2 GPUs can run 262144 context, and 3 GPUs with Q4 can run 524288.
+- **Fix**: on 2 GPUs, internal (copy-engine) all-reduce took the BF16 path under exact reduction (this only affects the case where `GGML_CUDA_ALLREDUCE=internal` is set).
+- **1.0.4 known issue closed**: alternating measurements in the same time window (1.0.3 and 1.0.4 measured back to back, 4 rounds each), the gap in 200K prefill on 4 GPUs is only 0.07-0.13%, within measurement error, not a regression.
+- The output of the Q8 configuration on 4 and 6 GPUs is word-for-word identical to 1.0.4, with unchanged speed and VRAM.
 
 ---
 
@@ -57,7 +58,7 @@ Test environment:
 - Model: Qwen3.8-27B, Q8_0 GGUF; speculative decoding uses the DFlash2 draft model (F16), drafts 7 tokens per round.
 - Launch parameters: see the corresponding configuration in the "Launch parameters" section.
 - Except for "Concurrent requests" and "Multimodal", every case is measured on a freshly started server; the cases in those two sections are measured sequentially in the same server.
-- Unless noted otherwise, all data was measured on 1.0.4 (2026-09-29 to 30).
+- The "GPU counts and quantization" section was measured on 1.0.5 (2026-09-30); the other sections were measured on 1.0.4 (2026-09-29 to 30), and on those configurations 1.0.5 produces word-for-word identical output to 1.0.4 with unchanged speed.
 - The decode speed for real content varies with the acceptance rate; some tables also give the time per speculative round.
 
 ### 4 GPUs, 262144 context
@@ -159,6 +160,49 @@ Notes:
 - A larger `--prefill-pace` makes later requests reach TTFT faster but slows down the request that is decoding; setting it to 0 or 100 means no throttling (the same as 1.0.3). For short prompts like 16K, the default 30 delays the second request's TTFT by a few seconds (16.7 -> 22.7 s in the table above).
 - For a single long-context request (e.g. one agent using the full 256K), `-np 1` is still recommended; with multiple requests each request's context is a fraction of the total context.
 
+### GPU counts and quantization
+
+Measured on 1.0.5. Two configurations:
+- **Q8**: target model Q8_0, KV cache q8_0 (`-ctk q8_0 -ctv q8_0`);
+- **Q4**: target model UD-Q4_K_M, KV cache q4_0 (`-ctk q4_0 -ctv q4_0`).
+
+The draft model is DFlash2 F16 by default; for 2 GPUs with Q4 to run 262144, use DFlash2 Q4_K_M instead (with the F16 draft the maximum is 131072). GPU indices: 2 GPUs 0, 1; 3 GPUs 0, 1, 2; 4 GPUs 0, 1, 3, 4; 5 GPUs 0-4; 6 GPUs 0-5. Each combination was tried downward from 524288, and the tables below give the highest context that can start; 524288 needs YaRN (see "Launch parameters").
+
+**Single request** (real code 16K input, 1024 output tokens; synthetic input is 80% of the context, 512 output tokens):
+
+| GPUs | Config | Context | real 16K: prefill / decode / time per speculative round | synthetic long input: tokens / TTFT / prefill / decode | Peak VRAM per GPU |
+|---|---|---:|---|---|---:|
+| 2 | Q4 (draft Q4_K_M) | 262144 | 1633 / 63.2 tok/s / 39.1 ms | 209715 / 212 s / 988 / 152.5 tok/s | 14.1 GB |
+| 2 | Q4 (draft F16) | 131072 | 1633 / 69.5 tok/s / 39.8 ms | 104857 / 82 s / 1286 / 173.9 tok/s | 13.7 GB |
+| 3 | Q8 | 131072 | 2288 / 98.5 tok/s / 28.1 ms | 104857 / 63 s / 1678 / 232.4 tok/s | 14.8 GB |
+| 3 | Q4 | 524288 | 2134 / 74.7 tok/s / 33.5 ms | 419430 / 546 s / 768 / 130.7 tok/s | 14.2 GB |
+| 4 | Q8 | 262144 | 2545 / 111.0 tok/s / 22.0 ms | 209715 / 128 s / 1640 / 277.9 tok/s | 13.3 GB |
+| 4 | Q4 | 524288 | 2445 / 99.6 tok/s / 28.4 ms | 419430 / 381 s / 1102 / 189.9 tok/s | 11.6 GB |
+| 5 | Q8 | 524288 | 2439 / 126.3 tok/s / 22.2 ms | 419430 / 379 s / 1107 / 221.8 tok/s | 14.2 GB |
+| 5 | Q4 | 524288 | 2395 / 89.2 tok/s / 28.2 ms | 419430 / 377 s / 1112 / 191.2 tok/s | 10.3 GB |
+| 6 | Q8 | 524288 | 2568 / 118.1 tok/s / 20.5 ms | 419430 / 363 s / 1156 / 232.1 tok/s | 12.8 GB |
+| 6 | Q4 | 524288 | 2509 / 85.5 tok/s / 26.9 ms | 419430 / 364 s / 1153 / 196.1 tok/s | 9.5 GB |
+
+- On 2 GPUs use the Q4 configuration: the Q8_0 target model is about 29 GB and does not fit on two 16 GB GPUs.
+- 3 GPUs with Q8 cannot fit 262144 in VRAM (not even with the Q4_K_M draft); the maximum is 131072.
+- Decode with the Q4 configuration is slower than with Q8: Q4_K weights currently go through the generic matrix multiplication path.
+
+**Two concurrent requests** (`-np 2`, context per request = context / 2; a single 16K request and two concurrent requests of 16K each, 1024 output tokens):
+
+| GPUs | Config | Context (per request) | single 16K: TTFT / decode | two concurrent 16K: TTFT | Decode per request | Peak VRAM per GPU |
+|---|---|---:|---|---|---|---:|
+| 2 | Q4 | 131072 (65536) | 10.0 s / 67.2 tok/s | 12.5 s / 37.2 s | 44.6 / 64.7 tok/s | 14.4 GB |
+| 3 | Q8 | 131072 (65536) | 7.3 s / 74.1 tok/s | 9.1 s / 26.4 s | 64.4 / 103.8 tok/s | 15.2 GB |
+| 3 | Q4 | 524288 (262144) | 7.6 s / 82.0 tok/s | 9.5 s / 28.7 s | 57.5 / 62.8 tok/s | 14.7 GB |
+| 4 | Q8 | 262144 (131072) | 6.5 s / 117.0 tok/s | 8.2 s / 23.9 s | 70.6 / 89.6 tok/s | 13.7 GB |
+| 4 | Q4 | 524288 (262144) | 6.7 s / 78.9 tok/s | 8.5 s / 24.5 s | 69.4 / 87.9 tok/s | 12.0 GB |
+| 5 | Q8 | 524288 (262144) | 6.7 s / 109.2 tok/s | 8.6 s / 22.8 s | 84.2 / 121.5 tok/s | 14.5 GB |
+| 5 | Q4 | 524288 (262144) | 6.8 s / 76.5 tok/s | 8.4 s / 26.4 s | 61.4 / 98.2 tok/s | 10.6 GB |
+| 6 | Q8 | 524288 (262144) | 6.4 s / 117.7 tok/s | 8.0 s / 23.1 s | 73.7 / 121.4 tok/s | 13.0 GB |
+| 6 | Q4 | 524288 (262144) | 6.5 s / 81.9 tok/s | 8.0 s / 24.8 s | 66.1 / 78.7 tok/s | 9.7 GB |
+
+Decode for real content varies a lot with the acceptance rate (single measurement); to compare engine speed, look at "time per speculative round" in the single-request table.
+
 ### Multimodal (image / PDF / video)
 
 6 GPUs, 524288 context (YaRN), vision module (mmproj) on GPU, thinking mode, measured sequentially in the same server:
@@ -202,6 +246,8 @@ The tests use the files below; the vision module is only needed for images and v
 |---|---|---|---|
 | target model | `Qwen3.8-27B-Q8_0.gguf` (about 29 GB) | [unsloth/Qwen3.8-27B-GGUF](https://modelscope.cn/models/unsloth/Qwen3.8-27B-GGUF) | [unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) |
 | draft model (DFlash2) | `Qwen3.8-27B-DFlash2-BF16.gguf` (about 3.9 GB), convert to F16 after download | [z-lab/Qwen3.8-27B-DFlash2-GGUF](https://modelscope.cn/models/z-lab/Qwen3.8-27B-DFlash2-GGUF) | [z-lab/Qwen3.8-27B-DFlash2-GGUF](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF) |
+| target model (Q4 configuration) | `Qwen3.8-27B-UD-Q4_K_M.gguf` (about 16.5 GB) | [unsloth/Qwen3.8-27B-GGUF](https://modelscope.cn/models/unsloth/Qwen3.8-27B-GGUF) | [unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) |
+| draft model (when VRAM is tight) | `Qwen3.8-27B-DFlash2-Q4_K_M.gguf` (about 1.1 GB), use directly | [z-lab/Qwen3.8-27B-DFlash2-GGUF](https://modelscope.cn/models/z-lab/Qwen3.8-27B-DFlash2-GGUF) | [z-lab/Qwen3.8-27B-DFlash2-GGUF](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF) |
 | vision module (optional) | `mmproj-F16.gguf` (about 0.9 GB) | [unsloth/Qwen3.8-27B-GGUF](https://modelscope.cn/models/unsloth/Qwen3.8-27B-GGUF) | [unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) |
 
 The target model can be used directly after download. The draft model is officially released only as BF16, Q8_0, and Q4_K_M GGUF; the tests use F16 (the V100 has no BF16 hardware support), which requires a one-time conversion with the `llama-quantize` built from this project.
@@ -333,6 +379,26 @@ CUDA_VISIBLE_DEVICES=0,1,3,4 numactl --membind=0,8 ./build/bin/llama-server \
 
 Multimodal requests use the OpenAI-compatible `/v1/chat/completions`: images via `image_url`, videos via `input_video` (or `video_url`); videos are sampled at 4 frames per second by default. For PDF, the client renders each page into an image and sends it (about 600 tokens per page at 80 dpi).
 
+### Other GPU counts and Q4 configuration
+
+Change these parts of the commands above:
+- GPU count: `CUDA_VISIBLE_DEVICES` and `--tensor-split` (one 1 for each GPU);
+- Q4 configuration: `-m ./models/Qwen3.8-27B-UD-Q4_K_M.gguf`, `-ctk q4_0 -ctv q4_0`;
+- context: pick from the "GPU counts and quantization" table; for 524288 add the three YaRN parameters;
+- 2 GPUs with Q4 at 262144: `--model-draft ./models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf`.
+
+For example, 2 GPUs with Q4, 262144 context:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 numactl --membind=0,8 ./build/bin/llama-server \
+  -m ./models/Qwen3.8-27B-UD-Q4_K_M.gguf -ngl 999 \
+  --split-mode tensor --tensor-split 1,1 \
+  -c 262144 -np 1 -fa on -ctk q4_0 -ctv q4_0 -b 2048 -ub 2048 \
+  --model-draft ./models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf \
+  --spec-type draft-dflash --spec-draft-n-max 7 \
+  --host 127.0.0.1 --port 8080 --metrics
+```
+
 ### Parameter description
 
 | Parameter | Description |
@@ -343,7 +409,7 @@ Multimodal requests use the OpenAI-compatible `/v1/chat/completions`: images via
 | `-np` | number of concurrent requests; context per request = `-c` divided by the number of requests |
 | `--prefill-pace` | with multiple requests, the maximum percentage of time prompt processing of other requests may take while a request is decoding (0-100, default 30; 0 or 100 means no throttling) |
 | `-fa on` | Flash Attention (required by the SM70 attention kernels) |
-| `-ctk q8_0 -ctv q8_0` | 8-bit KV cache |
+| `-ctk q8_0 -ctv q8_0` | 8-bit KV cache; `-ctk q4_0 -ctv q4_0` is 4-bit, using half the VRAM |
 | `-b 2048 -ub 2048` | batch size; the test data uses 2048 unless noted otherwise |
 | `--model-draft ...`, `--spec-type draft-dflash`, `--spec-draft-n-max 7` | DFlash2 speculative decoding, drafts 7 tokens per round |
 | `--rope-scaling yarn --rope-scale 2 --yarn-orig-ctx 262144` | use YaRN to extend the context to 524288 (the model's native length is 262144) |
@@ -360,9 +426,10 @@ Sampling: when `top_k ≤ 64` and only top-k, top-p, min-p, and temperature are 
 
 ## Next steps
 
-- **Multi-GPU splitting**: Qwen3.8 has 4 attention KV heads, so with 6-GPU tensor parallelism 2 GPUs have no attention heads in each attention layer, and prefill on 6 GPUs is about as fast as on 4 GPUs (the same at 16K input, about 3% faster at 200K input). Future work will improve splitting for such uneven cases and inter-GPU communication during prefill to raise prefill speed on 6 GPUs.
-- **Concurrent requests**: 1.0.4 fixed the problem of decode being held back by prompt processing with multiple requests, but the total throughput of concurrent requests is still about the same as processing them one after another (prompt processing is queued, and requests share the GPU while decoding). Future work will improve the time per round when multiple requests decode at the same time, and prefix cache reuse between concurrent requests.
-- **More quantization formats**: support Q4 quantization (Q4_K_M model weights and a q4_0 KV cache), so that configurations with less VRAM (for example 2 or 3 GPUs) can also run long contexts; and add a small-batch matrix multiplication kernel for Q4_K weights to raise decode speed with Q4.
+- **Multi-GPU splitting**: Qwen3.8 has 4 attention KV heads; on 3 GPUs the attention heads are split 6/6/12 (one GPU has twice the attention computation of the other two), and on 5 or 6 GPUs 1-2 GPUs have no attention heads in each attention layer. Future work will let adjacent GPUs share KV heads so that the attention computation is balanced across the GPUs.
+- **GDN prefill**: GDN layer prefill on 2, 3, 5, 6 GPUs currently does not use the chunked algorithm. Future work will make chunked prefill support any number of heads per GPU.
+- **Decode speed with Q4**: add a small-batch matrix multiplication kernel for Q4_K weights.
+- **Concurrent requests**: the total throughput of concurrent requests is still about the same as processing them one after another. Future work will improve the time per round when multiple requests decode at the same time, and prefix cache reuse between concurrent requests.
 
 ---
 
@@ -378,8 +445,9 @@ Scan the QR code below to add the author on WeChat and join the discussion group
 
 - **Repository author**: initiated the project, provided the hardware and test environment, set the goals and trade-offs, participated in testing.
 - **Claude** (Anthropic, Claude Opus 5.5, via Claude Code): solution design, measurement and analysis, compilation, testing and stress testing on the server, code review, commits and documentation.
-- **DeepSeek V4.1 Flash**: since the evening of 2026-09-26, took on most of the code implementation, as well as source research, design drafts, and diagnostic scripts, about 140 tasks.
-- **Xiaomi MiMo v2.6-pro**: code research and the first implementation at the start of the project (2026-09-26), about 26 tasks.
+- **DeepSeek V4.1 Flash**: since the evening of 2026-09-26, took on most of the code implementation, as well as source research, design drafts, and diagnostic scripts, about 170 tasks.
+- **Xiaomi MiMo v2.6-pro**: code research and the first implementation at the start of the project (2026-09-26), as well as later in-depth research and solution design, about 33 tasks.
+- **[ATIVX928](https://github.com/ATIVX928)** (external contributor): SM70 attention kernel support for the q4_0 KV cache, 2-GPU internal all-reduce fix ([PR #1](https://github.com/1115714829/llama.cpp-v100/pull/1), merged in 1.0.5).
 
 Thanks to all the projects and participants above.
 
