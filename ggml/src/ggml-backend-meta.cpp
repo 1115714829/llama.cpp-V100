@@ -682,7 +682,12 @@ static ggml_backend_meta_split_state ggml_backend_meta_map_has_off_state(
 
     // scale a source offset/length to the units of the tensor split axis
     auto to_tensor_units = [&](int64_t x) -> int64_t {
-        GGML_ASSERT((x * scale_num) % scale_den == 0);
+        if ((x * scale_num) % scale_den != 0) {
+            GGML_LOG_ERROR("%s: %s [%s] from %s [%s]: axis %d from source axis %d, %lld * %lld / %lld is not whole\n",
+                __func__, tensor->name, ggml_op_name(tensor->op), src->name, ggml_op_name(src->op), A, B,
+                (long long) x, (long long) scale_num, (long long) scale_den);
+            GGML_ABORT("split state of a tensor derived from explicit offsets does not map to whole units");
+        }
         return x * scale_num / scale_den;
     };
 
