@@ -67,19 +67,36 @@ __global__ void sm70_d256_stage_q_kernel(
 // O staging [batch][row][heads_q][D] f32 -> dst, the llama.cpp FA output
 // (D, heads_q, q_len, batch) f32 with its real nb strides. grid = (q_len,
 // batch*heads_q), block = 128 threads (one float2 each). Only real rows are
-// written, so the Q pad rows never reach dst.
+// written, so the Q pad rows never reach dst. Normalize applies the windowed
+// row normalization here instead of the removed finalize pass:
+// out = sum > 0 ? acc * (1/sum) : 0, the same expression and order the
+// finalize kernel used. acc_sum holds one sum per staging row.
+template <bool Normalize = false>
 __global__ void sm70_d256_scatter_kernel(
         const float2 * __restrict__ src, float2 * __restrict__ dst,
+        const float * __restrict__ acc_sum,
         const int heads_q, const int q_pad,
         const int64_t dst_row, const int64_t dst_head, const int64_t dst_batch) {
     const int r  = blockIdx.x;
     const int bh = blockIdx.y;
     const int b = bh / heads_q;
     const int head_q = bh % heads_q;
-    const float2 v = src[threadIdx.x
+    float2 v = src[threadIdx.x
         + (int64_t) b * q_pad * heads_q * (SM70_D256_D/2)
         + (int64_t) r * heads_q * (SM70_D256_D/2)
         + (int64_t) head_q * (SM70_D256_D/2)];
+    if constexpr (Normalize) {
+        const int64_t row = (int64_t) b * q_pad * heads_q
+            + (int64_t) r * heads_q + head_q;
+        const float sum = acc_sum[row];
+        const float inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
+        if (sum > 0.0f) {
+            v.x *= inv_sum;
+            v.y *= inv_sum;
+        } else {
+            v = make_float2(0.0f, 0.0f);
+        }
+    }
     dst[threadIdx.x
         + (int64_t) r * dst_row
         + (int64_t) head_q * dst_head
@@ -794,16 +811,15 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
                 stream);
 
             if (w > 0) {
-                FLASH_NAMESPACE::sm70_d256_window_merge_kernel<<<(unsigned) scratch.rows, 256, 0, stream>>>(
+                const unsigned n_merge = (unsigned) ((scratch.rows
+                    + FLASH_NAMESPACE::kWindowMergeRowsPerCta - 1)
+                    / FLASH_NAMESPACE::kWindowMergeRowsPerCta);
+                FLASH_NAMESPACE::sm70_d256_window_merge_kernel<<<n_merge, 256, 0, stream>>>(
                     Os, acc_max, acc_sum, p_out, p_max, p_sum,
                     (int64_t) scratch.rows, false, scale * float(M_LOG2E));
                 CUDA_CHECK(cudaGetLastError());
             }
         }
-
-        FLASH_NAMESPACE::sm70_d256_window_finalize_kernel<<<(unsigned) scratch.rows, 256, 0, stream>>>(
-            Os, acc_sum, Os, (int64_t) scratch.rows);
-        CUDA_CHECK(cudaGetLastError());
     } else {
         // A range mask bounds the rows the dense kernel reads, so a quantized K/V mirror
         // only needs [0, *kv_limit) rows. Everything else keeps the full mirror.
@@ -928,12 +944,24 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
     // are its token/head/batch strides in float2 units.
     {
         const dim3 grid(q_len, batch * heads_q);
-        sm70_d256_scatter_kernel<<<grid, SM70_D256_D/2, 0, stream>>>(
-            (const float2 *) Os, (float2 *) dst->data,
-            heads_q, q_pad,
-            dst->nb[2] / sizeof(float2),
-            dst->nb[1] / sizeof(float2),
-            dst->nb[3] / sizeof(float2));
+        if (scratch.windowed) {
+            // The windowed path normalizes the accumulator here, in place of
+            // the separate finalize pass.
+            sm70_d256_scatter_kernel<true><<<grid, SM70_D256_D/2, 0, stream>>>(
+                (const float2 *) Os, (float2 *) dst->data,
+                (const float *) (base + scratch.acc_sum_offset),
+                heads_q, q_pad,
+                dst->nb[2] / sizeof(float2),
+                dst->nb[1] / sizeof(float2),
+                dst->nb[3] / sizeof(float2));
+        } else {
+            sm70_d256_scatter_kernel<false><<<grid, SM70_D256_D/2, 0, stream>>>(
+                (const float2 *) Os, (float2 *) dst->data, nullptr,
+                heads_q, q_pad,
+                dst->nb[2] / sizeof(float2),
+                dst->nb[1] / sizeof(float2),
+                dst->nb[3] / sizeof(float2));
+        }
         CUDA_CHECK(cudaGetLastError());
     }
 }

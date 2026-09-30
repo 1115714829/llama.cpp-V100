@@ -544,8 +544,9 @@ __device__ __forceinline__ void splitd_apply_range_mask(
 // split 0 with gridDim.y = batch and a plain [row][D] partial buffer
 // (row = (batch*query_len + query_row)*heads_q + head_q). The caller launches
 // one kernel per KV block window and merges the windows afterwards with
-// sm70_d256_window_merge_kernel + sm70_d256_window_finalize_kernel. A row that
-// sees no KV block in the window writes max -inf, sum 0 and O 0.
+// sm70_d256_window_merge_kernel; the output scatter applies the row
+// normalization. A row that sees no KV block in the window writes max -inf,
+// sum 0 and O 0.
 template <typename TraitsT, typename Element, typename ElementOut = Element,
           bool SplitKV3 = false, bool Partial = false>
 __global__ __launch_bounds__(256, 1)
@@ -609,6 +610,42 @@ void sm70_d256_splitd_dense_kernel(
     auto gmem_v_thread = gmem_v_copy.get_thread_slice(tid);
     typename Traits::GmemKTiledCopy gmem_k_copy;
     auto gmem_k_thread = gmem_k_copy.get_thread_slice(tid);
+
+    // A windowed Partial CTA can get an empty window (no visible KV block in
+    // [win_block_lo, win_block_hi)). Resolve the block range before the Q smem
+    // copy so the empty case returns without staging Q. Rows get max -inf and
+    // sum 0, O is not written: the merge kernel skips -inf rows of p_max
+    // without reading p_out, and a row that no window wrote (sum 0) becomes 0
+    // in the scatter. The range is computed again below for the non-empty
+    // case; the integer result is the same.
+    if constexpr (Partial) {
+        const int visible_n_blocks = cute::ceil_div(kv_len, kBlockN);
+        int n_visited_blocks = visible_n_blocks;
+        if (mask_bounds != nullptr) {
+            const int2 b = mask_bounds[(int64_t) batch * gridDim.x + blockIdx.x];
+            n_visited_blocks = cute::ceil_div(b.y, kBlockN);
+            if (n_visited_blocks > visible_n_blocks) {
+                n_visited_blocks = visible_n_blocks;
+            }
+        }
+        int block_min = win_block_lo > 0 ? win_block_lo : 0;
+        int block_max = n_visited_blocks - 1;
+        if (block_max > win_block_hi - 1) {
+            block_max = win_block_hi - 1;
+        }
+        if (block_max < block_min) {
+            for (int qr = tid; qr < kBlockM; qr += blockDim.x) {
+                const int query_row = query_row_base + qr;
+                const int64_t row_offset =
+                    (static_cast<int64_t>(batch) * query_len + query_row)
+                        * heads_q + head_q;
+                partial_max[row_offset] = -INFINITY;
+                partial_sum[row_offset] = 0.0f;
+            }
+            return;
+        }
+    }
+
     {
         const int64_t q_batch_offset = static_cast<int64_t>(batch)
             * q_batch_stride;
@@ -696,24 +733,6 @@ void sm70_d256_splitd_dense_kernel(
     // still load a valid first tile to keep the gmem addresses in range; use
     // n_block_min (always < visible_n_blocks) for that degenerate case.
     const int n_block_first = n_block_max >= n_block_min ? n_block_max : n_block_min;
-    if constexpr (Partial) {
-        // Empty window: the K/V tile at n_block_first may lie outside the
-        // window mirror, so no tile is loaded. Rows get max -inf and sum 0;
-        // O is not written: the merge kernel skips -inf windows without
-        // reading it, and window 0 (written straight into the accumulator)
-        // always contains block 0, so it is never empty here.
-        if (n_block_max < n_block_min) {
-            for (int qr = tid; qr < kBlockM; qr += blockDim.x) {
-                const int query_row = query_row_base + qr;
-                const int64_t row_offset =
-                    (static_cast<int64_t>(batch) * query_len + query_row)
-                        * heads_q + head_q;
-                partial_max[row_offset] = -INFINITY;
-                partial_sum[row_offset] = 0.0f;
-            }
-            return;
-        }
-    }
 
     const int64_t k_batch_offset = static_cast<int64_t>(batch)
         * k_outer_stride;
@@ -1003,8 +1022,7 @@ void sm70_d256_splitd_dense_kernel(
     } else if constexpr (Partial) {
         // Window partial output: same stores as SplitKV3 at split 0 (no
         // gridDim.y / 3) and a plain [row][D] slice per window. An empty
-        // window (n_block_max < n_block_min) skips the KV loop, so the row
-        // values below are the -inf/0/0 initialization.
+        // window returned early, so every row here saw a KV block.
         if ((lane & 0x0e) == 0) {
 #pragma unroll
             for (int slot = 0; slot < Traits::kQkRowsPerThread; ++slot) {
@@ -1148,9 +1166,12 @@ void sm70_d256_splitkv3_merge_kernel(
 // online-softmax merge: m = max(ma, mp) and each side is scaled by
 // exp2((max - m) * softmax_scale_log2), the same exponent base and factor as
 // sm70_d256_splitkv3_merge_kernel. Both sides -inf (no KV row in either) keeps
-// max -inf, sum 0, O 0 so later merges and the finalize stay empty. One CTA per
-// row, 256 threads cover D=256; the caller launches it once per window with
-// p_* pointing at the window's [row][D] partial slice.
+// max -inf, sum 0, O 0 so later merges and the scatter stay empty. One CTA
+// covers kWindowMergeRowsPerCta rows, 256 threads cover D=256 per row; an
+// empty window row reads p_max only. The caller launches it once per window
+// with p_* pointing at the window's [row][D] partial slice.
+constexpr int kWindowMergeRowsPerCta = 8;
+
 __global__ __launch_bounds__(256, 1)
 void sm70_d256_window_merge_kernel(
         float *__restrict__ acc_out,
@@ -1162,72 +1183,51 @@ void sm70_d256_window_merge_kernel(
         int64_t rows,
         bool first,
         float softmax_scale_log2) {
-    const int64_t row = blockIdx.x;
     const int d = threadIdx.x;
-    if (row >= rows) {
-        return;
-    }
-
-    if (p_max[row] == -INFINITY) {
-        return;  // empty window, accumulator unchanged
-    }
-
-    const int64_t element = row * Sm70D256SplitDTraitsT<64>::kHeadDim + d;
-    // An accumulator that has seen no KV row yet (its window 0 was empty for
-    // this row, so its O was never written) takes the window as is. Every
-    // thread reads acc_max before any thread writes it, so the branch is
-    // uniform across the CTA.
-    const bool acc_empty = acc_max[row] == -INFINITY;
-    __syncthreads();
-    if (first || acc_empty) {
-        acc_max[row] = p_max[row];
-        acc_sum[row] = p_sum[row];
-        acc_out[element] = p_out[element];
-        return;
-    }
-
     __shared__ float merge[2];
-    if (d == 0) {
-        const float max_a = acc_max[row];
-        const float max_p = p_max[row];
-        const float m = fmaxf(max_a, max_p);
-        if (m == -INFINITY) {
-            acc_max[row] = -INFINITY;
-            acc_sum[row] = 0.0f;
-            merge[0] = 0.0f;
-            merge[1] = 0.0f;
-        } else {
-            merge[0] = exp2f((max_a - m) * softmax_scale_log2);
-            merge[1] = exp2f((max_p - m) * softmax_scale_log2);
-            acc_max[row] = m;
-            acc_sum[row] = acc_sum[row] * merge[0] + p_sum[row] * merge[1];
+    for (int i = 0; i < kWindowMergeRowsPerCta; ++i) {
+        const int64_t row = (int64_t) blockIdx.x * kWindowMergeRowsPerCta + i;
+        if (row >= rows) {
+            return;
         }
-    }
-    __syncthreads();
-    acc_out[element] = acc_out[element] * merge[0] + p_out[element] * merge[1];
-}
 
-// Window finalize: out = acc_out / acc_sum, with 0 for rows that saw no KV
-// block. The output index is the same one the non-Partial dense kernel uses:
-// ((batch*query_len + query_row)*heads_q + head_q)*kHeadDim + d, i.e. the
-// [row][D] row-major layout of the partial buffers. One CTA per row, 256
-// threads cover D=256.
-__global__ __launch_bounds__(256, 1)
-void sm70_d256_window_finalize_kernel(
-        const float *__restrict__ acc_out,
-        const float *__restrict__ acc_sum,
-        float *__restrict__ out,
-        int64_t rows) {
-    const int64_t row = blockIdx.x;
-    const int d = threadIdx.x;
-    if (row >= rows) {
-        return;
+        if (p_max[row] == -INFINITY) {
+            continue;  // empty window, accumulator unchanged
+        }
+
+        const int64_t element = row * Sm70D256SplitDTraitsT<64>::kHeadDim + d;
+        // An accumulator that has seen no KV row yet (its window 0 was empty
+        // for this row, so its O was never written) takes the window as is.
+        // Every thread reads acc_max before any thread writes it, so the
+        // branch is uniform across the row's threads.
+        const bool acc_empty = acc_max[row] == -INFINITY;
+        __syncthreads();
+        if (first || acc_empty) {
+            acc_max[row] = p_max[row];
+            acc_sum[row] = p_sum[row];
+            acc_out[element] = p_out[element];
+            continue;
+        }
+
+        if (d == 0) {
+            const float max_a = acc_max[row];
+            const float max_p = p_max[row];
+            const float m = fmaxf(max_a, max_p);
+            if (m == -INFINITY) {
+                acc_max[row] = -INFINITY;
+                acc_sum[row] = 0.0f;
+                merge[0] = 0.0f;
+                merge[1] = 0.0f;
+            } else {
+                merge[0] = exp2f((max_a - m) * softmax_scale_log2);
+                merge[1] = exp2f((max_p - m) * softmax_scale_log2);
+                acc_max[row] = m;
+                acc_sum[row] = acc_sum[row] * merge[0] + p_sum[row] * merge[1];
+            }
+        }
+        __syncthreads();
+        acc_out[element] = acc_out[element] * merge[0] + p_out[element] * merge[1];
     }
-    const float sum = acc_sum[row];
-    const float inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
-    const int64_t element = row * Sm70D256SplitDTraitsT<64>::kHeadDim + d;
-    // a row that saw no KV row may have an unwritten accumulator: write 0
-    out[element] = sum > 0.0f ? acc_out[element] * inv_sum : 0.0f;
 }
 
 }  // namespace FLASH_NAMESPACE
