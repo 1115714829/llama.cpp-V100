@@ -744,6 +744,36 @@ static bool common_sampler_name_is(const char * name, const char * base) {
     return strcmp(name, base) == 0;
 }
 
+// the device top-k output of the verification selects its candidates per vocab shard; larger rows
+// lose the benefit of the sparse rejection, so only the first buckets of llama_set_logits_topk
+// (64, 128, 256, ...) are admitted
+static const int32_t COMMON_SPARSE_K_MAX = 256;
+
+// number of candidates the penalties sampler of the chain adds: the whole penalty window is
+// reserved, since the sampler lowers the logits of at most penalty_last_n distinct tokens; the
+// count must not depend on the current window state because llama_set_logits_topk is set once per
+// request while the window keeps sliding. -1 if the sampler can raise a logit (a repeat penalty
+// with a factor != 1 or a negative presence/frequency penalty)
+static int32_t common_sampler_sparse_n_penalized(const struct common_sampler * gsmpl) {
+    struct llama_sampler * chain = gsmpl->chain;
+    const int32_t n = llama_sampler_chain_n(chain);
+    for (int32_t i = 0; i < n; ++i) {
+        const char * name = llama_sampler_name(llama_sampler_chain_get(chain, i));
+        if (name[0] == '?' || !common_sampler_name_is(name, "penalties")) {
+            continue;
+        }
+        if (gsmpl->params.penalty_repeat  != 1.0f ||
+            gsmpl->params.penalty_present <  0.0f ||
+            gsmpl->params.penalty_freq    <  0.0f ||
+            gsmpl->params.penalty_last_n  <= 0) {
+            return -1;
+        }
+        return gsmpl->params.penalty_last_n;
+    }
+
+    return 0;
+}
+
 bool common_sampler_can_sparse_reject(const struct common_sampler * gsmpl) {
     if (!gsmpl) {
         return false;
@@ -786,15 +816,19 @@ bool common_sampler_can_sparse_reject(const struct common_sampler * gsmpl) {
         return false;
     }
 
-    // before top-k only no-op samplers and a logit bias that only bans tokens (e.g. ignore_eos) are
-    // allowed; the sparse rows then hold top_k + n_logit_bans candidates, so that the banned ones
-    // can drop out when the chain is replayed over them
+    // before top-k only no-op samplers, a logit bias that only bans tokens (e.g. ignore_eos) and
+    // penalties that only lower the logits of the tokens they have seen are allowed; the sparse
+    // rows then hold top_k + n_bans + n_penalized candidates, so that the banned and penalized
+    // ones can drop out when the chain is replayed over them
     for (int32_t i = 0; i < i_top_k; ++i) {
         const char * name = llama_sampler_name(llama_sampler_chain_get(chain, i));
         if (name[0] == '?') {
             continue;
         }
         if (common_sampler_name_is(name, "logit-bias") && gsmpl->n_logit_bans >= 0) {
+            continue;
+        }
+        if (common_sampler_name_is(name, "penalties")) {
             continue;
         }
         return false;
@@ -816,6 +850,16 @@ bool common_sampler_can_sparse_reject(const struct common_sampler * gsmpl) {
         return false;
     }
 
+    const int32_t n_penalized = common_sampler_sparse_n_penalized(gsmpl);
+    if (n_penalized < 0) {
+        return false;
+    }
+
+    const int64_t k = (int64_t) gsmpl->params.top_k + gsmpl->n_logit_bans + n_penalized;
+    if (k > COMMON_SPARSE_K_MAX) {
+        return false;
+    }
+
     return true;
 }
 
@@ -824,7 +868,10 @@ int32_t common_sampler_sparse_k(const struct common_sampler * gsmpl) {
         return 0;
     }
 
-    return gsmpl->params.top_k + gsmpl->n_logit_bans;
+    const int32_t n_penalized = common_sampler_sparse_n_penalized(gsmpl);
+    GGML_ASSERT(n_penalized >= 0);
+
+    return gsmpl->params.top_k + gsmpl->n_logit_bans + n_penalized;
 }
 
 static float common_sampler_sparse_get(const std::vector<llama_token> & ids, const std::vector<float> & probs, llama_token id) {

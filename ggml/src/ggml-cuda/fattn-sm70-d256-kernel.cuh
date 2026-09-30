@@ -538,8 +538,16 @@ __device__ __forceinline__ void splitd_apply_range_mask(
 //
 // SplitKV3: 3-way KV split for long-prefix prefill. Not selected by the
 // llama.cpp launcher yet; the dense and merge code paths are kept.
+//
+// Partial: windowed mode for a fixed-size KV mirror. Like SplitKV3 the kernel
+// writes only the per-row raw max/sum and the unnormalized numerator, but at
+// split 0 with gridDim.y = batch and a plain [row][D] partial buffer
+// (row = (batch*query_len + query_row)*heads_q + head_q). The caller launches
+// one kernel per KV block window and merges the windows afterwards with
+// sm70_d256_window_merge_kernel + sm70_d256_window_finalize_kernel. A row that
+// sees no KV block in the window writes max -inf, sum 0 and O 0.
 template <typename TraitsT, typename Element, typename ElementOut = Element,
-          bool SplitKV3 = false>
+          bool SplitKV3 = false, bool Partial = false>
 __global__ __launch_bounds__(256, 1)
 void sm70_d256_splitd_dense_kernel(
     const Element *__restrict__ q,
@@ -569,7 +577,10 @@ void sm70_d256_splitd_dense_kernel(
     float mask_scale,
     float *__restrict__ partial_out,
     float *__restrict__ partial_max,
-    float *__restrict__ partial_sum) {
+    float *__restrict__ partial_sum,
+    int win_block_lo,
+    int win_block_hi) {
+    static_assert(!(SplitKV3 && Partial), "SplitKV3 and Partial are mutually exclusive");
     using Traits = TraitsT;
     constexpr int kBlockM = Traits::kBlockM;
     constexpr int kBlockN = Traits::kBlockN;
@@ -674,6 +685,13 @@ void sm70_d256_splitd_dense_kernel(
         n_block_min = visible_n_blocks * split / 3;
         n_block_max = visible_n_blocks * (split + 1) / 3 - 1;
     }
+    // Restrict the walk to the caller's KV block window [win_block_lo, win_block_hi).
+    // The windowed path passes the window bounds; every other call passes 0 and
+    // INT_MAX, for which both clamps are no-ops and the walk is bit-identical to
+    // the unwindowed one. The K/V pointers already map the window's rows, so no
+    // index below changes.
+    n_block_min = n_block_min > win_block_lo ? n_block_min : win_block_lo;
+    n_block_max = n_block_max < win_block_hi - 1 ? n_block_max : win_block_hi - 1;
     // SplitKV3 guard: an empty split segment (n_block_max < n_block_min) must
     // still load a valid first tile to keep the gmem addresses in range; use
     // n_block_min (always < visible_n_blocks) for that degenerate case.
@@ -964,6 +982,49 @@ void sm70_d256_splitd_dense_kernel(
                 partial_out[partial_row * Traits::kHeadDim + d] = acc_o(i);
             }
         }
+    } else if constexpr (Partial) {
+        // Window partial output: same stores as SplitKV3 at split 0 (no
+        // gridDim.y / 3) and a plain [row][D] slice per window. An empty
+        // window (n_block_max < n_block_min) skips the KV loop, so the row
+        // values below are the -inf/0/0 initialization.
+        if ((lane & 0x0e) == 0) {
+#pragma unroll
+            for (int slot = 0; slot < Traits::kQkRowsPerThread; ++slot) {
+                const int row = FLASH_NAMESPACE::sm70_row_slot<
+                    Traits::kQkWarpRows>(slot, lane);
+                const int query_row = query_row_base
+                    + group_row_base + n_warp * Traits::kQkWarpRows + row;
+                const int64_t row_offset =
+                    (static_cast<int64_t>(batch) * query_len + query_row)
+                        * heads_q
+                    + head_q;
+                partial_max[row_offset] = row_max[slot];
+                partial_sum[row_offset] = row_sum[slot];
+            }
+        }
+
+#pragma unroll
+        for (int d_local = 0; d_local < Traits::kOwnedDChunks; ++d_local) {
+            auto acc_o = make_tensor(
+                make_rmem_ptr(&o_storage[d_local][0]), OLayout{});
+            auto cO = make_identity_tensor(
+                Shape<Int<Traits::kGroupRows>, Int<kDChunk>>{});
+            auto tOcO = pv_mma_thread.partition_C(cO);
+#pragma unroll
+            for (int i = 0; i < size(acc_o); ++i) {
+                const int row = get<0>(tOcO(i));
+                const int col = get<1>(tOcO(i));
+                const int query_row = query_row_base + group_row_base + row;
+                const int64_t row_offset =
+                    (static_cast<int64_t>(batch) * query_len + query_row)
+                        * heads_q
+                    + head_q;
+                const int d =
+                    (n_warp * Traits::kOwnedDChunks + d_local) * kDChunk
+                    + col;
+                partial_out[row_offset * Traits::kHeadDim + d] = acc_o(i);
+            }
+        }
     } else {
         if ((lane & 0x0e) == 0) {
 #pragma unroll
@@ -1062,6 +1123,82 @@ void sm70_d256_splitkv3_merge_kernel(
          + partial_out[split_stride + element] * merge[1])
         + partial_out[element] * merge[0];
     out[element] = numerator * merge[3];
+}
+
+// Window merge: folds one window's partials p_* into the running accumulator
+// acc_* (first = true copies the first window into the accumulator). Two-way
+// online-softmax merge: m = max(ma, mp) and each side is scaled by
+// exp2((max - m) * softmax_scale_log2), the same exponent base and factor as
+// sm70_d256_splitkv3_merge_kernel. Both sides -inf (no KV row in either) keeps
+// max -inf, sum 0, O 0 so later merges and the finalize stay empty. One CTA per
+// row, 256 threads cover D=256; the caller launches it once per window with
+// p_* pointing at the window's [row][D] partial slice.
+__global__ __launch_bounds__(256, 1)
+void sm70_d256_window_merge_kernel(
+        float *__restrict__ acc_out,
+        float *__restrict__ acc_max,
+        float *__restrict__ acc_sum,
+        const float *__restrict__ p_out,
+        const float *__restrict__ p_max,
+        const float *__restrict__ p_sum,
+        int64_t rows,
+        bool first,
+        float softmax_scale_log2) {
+    const int64_t row = blockIdx.x;
+    const int d = threadIdx.x;
+    if (row >= rows) {
+        return;
+    }
+
+    const int64_t element = row * Sm70D256SplitDTraitsT<64>::kHeadDim + d;
+    if (first) {
+        acc_max[row] = p_max[row];
+        acc_sum[row] = p_sum[row];
+        acc_out[element] = p_out[element];
+        return;
+    }
+
+    __shared__ float merge[2];
+    if (d == 0) {
+        const float max_a = acc_max[row];
+        const float max_p = p_max[row];
+        const float m = fmaxf(max_a, max_p);
+        if (m == -INFINITY) {
+            acc_max[row] = -INFINITY;
+            acc_sum[row] = 0.0f;
+            merge[0] = 0.0f;
+            merge[1] = 0.0f;
+        } else {
+            merge[0] = exp2f((max_a - m) * softmax_scale_log2);
+            merge[1] = exp2f((max_p - m) * softmax_scale_log2);
+            acc_max[row] = m;
+            acc_sum[row] = acc_sum[row] * merge[0] + p_sum[row] * merge[1];
+        }
+    }
+    __syncthreads();
+    acc_out[element] = acc_out[element] * merge[0] + p_out[element] * merge[1];
+}
+
+// Window finalize: out = acc_out / acc_sum, with 0 for rows that saw no KV
+// block. The output index is the same one the non-Partial dense kernel uses:
+// ((batch*query_len + query_row)*heads_q + head_q)*kHeadDim + d, i.e. the
+// [row][D] row-major layout of the partial buffers. One CTA per row, 256
+// threads cover D=256.
+__global__ __launch_bounds__(256, 1)
+void sm70_d256_window_finalize_kernel(
+        const float *__restrict__ acc_out,
+        const float *__restrict__ acc_sum,
+        float *__restrict__ out,
+        int64_t rows) {
+    const int64_t row = blockIdx.x;
+    const int d = threadIdx.x;
+    if (row >= rows) {
+        return;
+    }
+    const float sum = acc_sum[row];
+    const float inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
+    const int64_t element = row * Sm70D256SplitDTraitsT<64>::kHeadDim + d;
+    out[element] = acc_out[element] * inv_sum;
 }
 
 }  // namespace FLASH_NAMESPACE

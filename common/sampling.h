@@ -121,11 +121,13 @@ std::vector<llama_token> common_sampler_reject_core(
         void * uniform_data);
 
 // true if the chain of gsmpl can be replayed exactly on a sparse top-k row:
-// T > 0, no sampler that rewrites the full logits, a top_k with 0 < k <= 64
-// after only no-op samplers, and dist as the last sampler
+// T > 0, no sampler that rewrites the full logits (a ban-only logit bias and penalties that only
+// lower the logits of the tokens they have seen are admitted), a top_k with 0 < k <= 64, and dist
+// as the last sampler
 bool common_sampler_can_sparse_reject(const struct common_sampler * gsmpl);
 
-// k of the top_k sampler of the chain of gsmpl, for sparse rejection; 0 if unavailable
+// number of candidates the sparse rows of gsmpl hold: top_k, plus one per banned token (a ban-only
+// logit bias) and per penalty window token (penalties); 0 if unavailable
 int32_t common_sampler_sparse_k(const struct common_sampler * gsmpl);
 
 // rejection sampling variant of common_sampler_sample_and_accept_n:
