@@ -909,8 +909,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         const std::vector<std::pair<int64_t, uint32_t>> segments = get_split_segments(split_state.axis, tc.il);
         const std::vector<int64_t> granularity = get_split_granularity(blck_size, tc.il, segments);
         const bool attn_3card = attn_kv_overlap_3card(hparams, *ud->model, tc.il);
+        const bool is_sep_qkv = attn_3card && (std::regex_match(tensor_name, pattern_q_weight)  || std::regex_match(tensor_name, pattern_q_bias) ||
+                                               std::regex_match(tensor_name, pattern_kv_weight) || std::regex_match(tensor_name, pattern_kv_bias));
         if (attn_3card && (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_qkv_bias) ||
-                std::regex_match(tensor_name, pattern_kv_cache))) {
+                is_sep_qkv || std::regex_match(tensor_name, pattern_kv_cache))) {
             // 3-card attention load balancing: write the per-device slices explicitly,
             // the K/V slices of adjacent devices overlap by one KV head
             const int64_t n_embd_head_k = hparams.n_embd_head_k(tc.il);
@@ -918,6 +920,27 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             const int64_t n_head_d      = hparams.n_head(tc.il) / ud->n_devices;
             const int64_t n_gqa         = hparams.n_gqa(tc.il);
             split_state.has_off = true;
+            if (is_sep_qkv) {
+                // separate Q/K/V tensors: one segment per tensor; Q+gate is interleaved per head,
+                // so each device holds n_head_d whole heads, K/V overlap like the cache
+                const bool is_q = std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_q_bias);
+                const bool is_v = tensor_name.find("attn_v") != std::string::npos;
+                const int64_t n_embd_head = is_v ? n_embd_head_v : n_embd_head_k;
+                split_state.n_segments = 1;
+                split_state.nr[0]      = 1;
+                for (size_t j = 0; j < ud->n_devices; j++) {
+                    if (is_q) {
+                        const int64_t ne_q = 2*n_embd_head_k*n_head_d; // n_head_d heads of Q+gate per device
+                        split_state.ne[j]  = ne_q;
+                        split_state.off[j] = j*ne_q;
+                    } else {
+                        const int64_t kv0_d = j*n_head_d / n_gqa; // global index of the first KV head of this device
+                        split_state.ne[j]  = 2*n_embd_head;
+                        split_state.off[j] = kv0_d*n_embd_head;
+                    }
+                }
+                return split_state;
+            }
             if (std::regex_match(tensor_name, pattern_kv_cache)) {
                 const bool is_v = tensor_name.find("cache_v") != std::string::npos;
                 const int64_t n_embd_head = is_v ? n_embd_head_v : n_embd_head_k;
