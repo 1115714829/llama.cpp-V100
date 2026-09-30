@@ -826,7 +826,17 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (scalar_only && ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
             ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1, {0}, false};
         }
-        GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
+        if (ret.axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN) {
+            for (size_t i = 0; i < GGML_MAX_SRC; i++) {
+                if (tensor->src[i] == nullptr || tensor->src[i] == tensor) {
+                    continue;
+                }
+                GGML_LOG_ERROR("%s: %s [%s] src%zu %s [%s]: axis %s%s\n", __func__, tensor->name, ggml_op_name(tensor->op), i,
+                    tensor->src[i]->name, ggml_op_name(tensor->src[i]->op),
+                    ggml_backend_meta_split_axis_name(src_ss[i].axis), src_ss[i].has_off ? " (explicit offsets)" : "");
+            }
+            GGML_ABORT("no common split state for %s [%s]", tensor->name, ggml_op_name(tensor->op));
+        }
         return ret;
     };
 
