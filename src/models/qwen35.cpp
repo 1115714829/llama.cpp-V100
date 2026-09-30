@@ -1,4 +1,5 @@
 #include "models.h"
+#include "llama-kv-cache.h"
 #include "llama-memory-recurrent.h"
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
@@ -224,6 +225,99 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     ggml_build_forward_expand(gf, cur);
 }
 
+// 3-card attention load balancing: the Q heads of a device form two GQA groups that each map
+// to whole KV heads, so each group runs one flash attention on its local KV heads and the
+// results are concatenated back into the global head order
+static ggml_tensor * build_attn_3card_impl(
+        llm_graph_context &       ctx,
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor *             q_cur,
+        ggml_tensor *             k_cur,
+        ggml_tensor *             v_cur,
+        float                     kq_scale,
+        int                       il) {
+    const int64_t n_embd_head = ctx.hparams.n_embd_head_k(il);
+    GGML_ASSERT(n_embd_head == (int64_t) ctx.hparams.n_embd_head_v(il));
+
+    const auto * mctx_cur = inp->mctx;
+
+    // these nodes are added to the graph together so that they are not reordered
+    // by doing so, the number of splits in the graph is reduced
+    // expand k later to enable rope fusion which directly writes into k-v cache
+    ggml_build_forward_expand(ctx.gf, q_cur);
+    ggml_build_forward_expand(ctx.gf, v_cur);
+    ggml_build_forward_expand(ctx.gf, k_cur);
+
+    // store to KV cache
+    {
+        const auto & k_idxs = inp->get_k_idxs();
+        const auto & v_idxs = inp->get_v_idxs();
+
+        ggml_build_forward_expand(ctx.gf, mctx_cur->cpy_k(ctx.ctx0, k_cur, k_idxs, il));
+        ggml_build_forward_expand(ctx.gf, mctx_cur->cpy_v(ctx.ctx0, v_cur, v_idxs, il));
+    }
+
+    ggml_tensor * kq_mask = inp->get_kq_mask();
+
+    ggml_tensor * k = mctx_cur->get_k(ctx.ctx0, il);
+    ggml_tensor * v = mctx_cur->get_v(ctx.ctx0, il);
+
+    const int64_t n_head   = ctx.hparams.n_head(il);
+    const int64_t n_gqa    = ctx.hparams.n_gqa(il);
+    const int64_t n_head_d = n_head / 3;
+    const int64_t n_stream = k->ne[3];
+
+    // one node per (device, GQA group) pair, the windows are in global head coordinates:
+    // a window is only non-zero on the device that holds its Q heads
+    ggml_tensor * outs[6];
+    for (int64_t d = 0; d < 3; ++d) {
+        const int64_t q0_d  = d*n_head_d;       // global index of the first Q head of this device
+        const int64_t kv0_d = q0_d / n_gqa;     // global index of the first KV head of this device
+        int64_t g0 = n_gqa - q0_d % n_gqa;
+        if (g0 > n_head_d) {
+            g0 = n_head_d;
+        }
+        for (int64_t g = 0; g < 2; ++g) {
+            const int64_t n_h = g == 0 ? g0 : n_head_d - g0;
+            const int64_t h0  = g == 0 ? q0_d : q0_d + g0;
+            const int64_t kvh = kv0_d + g;
+
+            ggml_tensor * q_g = ggml_view_4d(ctx.ctx0, q_cur, n_embd_head, n_h, q_cur->ne[2]/n_stream, n_stream,
+                    q_cur->nb[1], q_cur->nb[2], q_cur->nb[3]/n_stream, h0*q_cur->nb[1]);
+            q_g = ggml_permute(ctx.ctx0, q_g, 0, 2, 1, 3);
+
+            ggml_tensor * k_g = ggml_view_4d(ctx.ctx0, k, n_embd_head, 1, k->ne[2], n_stream,
+                    k->nb[1], k->nb[2], k->nb[3], kvh*k->nb[1]);
+            k_g = ggml_permute(ctx.ctx0, k_g, 0, 2, 1, 3);
+
+            ggml_tensor * v_g = ggml_view_4d(ctx.ctx0, v, n_embd_head, 1, v->ne[2], n_stream,
+                    v->nb[1], v->nb[2], v->nb[3], kvh*v->nb[1]);
+            v_g = ggml_permute(ctx.ctx0, v_g, 0, 2, 1, 3);
+
+            ggml_tensor * out_g = ggml_flash_attn_ext(ctx.ctx0, q_g, k_g, v_g, kq_mask, kq_scale,
+                    ctx.hparams.f_max_alibi_bias,
+                    ctx.hparams.attn_soft_cap ? ctx.hparams.f_attn_logit_softcapping : 0.0f);
+            ctx.res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, out_g, il});
+
+            ggml_flash_attn_ext_set_n_kv_max(out_g, 0);
+            ggml_prec_set_acc(out_g, GGML_PREC_F32);
+
+            outs[2*d + g] = out_g;
+        }
+    }
+
+    // concatenate in node order so that the result is in the global head order
+    ggml_tensor * cur = ggml_concat(ctx.ctx0, outs[0], outs[1], /*dim=*/ 1);
+    for (int i = 2; i < 6; ++i) {
+        cur = ggml_concat(ctx.ctx0, cur, outs[i], /*dim=*/ 1);
+    }
+
+    cur = ggml_reshape_2d(ctx.ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+    ggml_build_forward_expand(ctx.gf, cur);
+
+    return cur;
+}
+
 std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
                 ggml_tensor * input,
                         int   il) {
@@ -321,9 +415,13 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     // Attention computation
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    cur = build_attn(inp,
-                nullptr, nullptr, nullptr,
-                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+    if (attn_kv_overlap_3card(hparams, model, il)) {
+        cur = build_attn_3card(inp, Qcur, Kcur, Vcur, kq_scale, il);
+    } else {
+        cur = build_attn(inp,
+                    nullptr, nullptr, nullptr,
+                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+    }
     cb(cur, "attn_pregate", il);
 
     ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
@@ -336,6 +434,16 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     cb(cur, "attn_output", il);
 
     return cur;
+}
+
+ggml_tensor * llama_model_qwen35::graph::build_attn_3card(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor *             q_cur,
+        ggml_tensor *             k_cur,
+        ggml_tensor *             v_cur,
+        float                     kq_scale,
+        int                       il) {
+    return build_attn_3card_impl(*this, inp, q_cur, k_cur, v_cur, kq_scale, il);
 }
 
 ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
@@ -502,6 +610,16 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_ffn(ggml_tensor * cur, cons
 }
 
 // LLM_GRAPH_TYPE_DECODER_MTP draft head for Qwen3.5/3.6 dense series
+ggml_tensor * llama_model_qwen35::graph_mtp::build_attn_3card(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor *             q_cur,
+        ggml_tensor *             k_cur,
+        ggml_tensor *             v_cur,
+        float                     kq_scale,
+        int                       il) {
+    return build_attn_3card_impl(*this, inp, q_cur, k_cur, v_cur, kq_scale, il);
+}
+
 llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params)
     : llm_graph_context(params) {
     GGML_ASSERT(hparams.n_layer_nextn > 0 && "QWEN35 MTP requires n_layer_nextn > 0");
@@ -613,9 +731,13 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     const float kq_scale = hparams.f_attention_scale == 0.0f
             ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    cur = build_attn(inp_attn,
-            nullptr, nullptr, nullptr,
-            Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+    if (attn_kv_overlap_3card(hparams, model, il)) {
+        cur = build_attn_3card(inp_attn, Qcur, Kcur, Vcur, kq_scale, il);
+    } else {
+        cur = build_attn(inp_attn,
+                nullptr, nullptr, nullptr,
+                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+    }
     cb(cur, "mtp_attn_pregate", il);
 
     cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));

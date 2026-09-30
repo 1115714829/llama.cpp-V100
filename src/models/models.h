@@ -2348,6 +2348,15 @@ struct llama_model_qwen35 : public llama_model_base {
                             int * sections,
                             int   il);
 
+        // 3-card attention load balancing: one flash attention per local GQA group
+        ggml_tensor * build_attn_3card(
+        llm_graph_input_attn_kv * inp,
+                    ggml_tensor * q_cur,
+                    ggml_tensor * k_cur,
+                    ggml_tensor * v_cur,
+                          float   kq_scale,
+                            int   il);
+
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,
                     ggml_tensor * cur,
@@ -2373,6 +2382,15 @@ struct llama_model_qwen35 : public llama_model_base {
 
     struct graph_mtp : public llm_graph_context {
         graph_mtp(const llama_model & model, const llm_graph_params & params);
+    private:
+        // 3-card attention load balancing: one flash attention per local GQA group
+        ggml_tensor * build_attn_3card(
+        llm_graph_input_attn_kv * inp,
+                    ggml_tensor * q_cur,
+                    ggml_tensor * k_cur,
+                    ggml_tensor * v_cur,
+                          float   kq_scale,
+                            int   il);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

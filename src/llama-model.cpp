@@ -372,6 +372,27 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
     return llama_model_create(arch, params);
 }
 
+// 3-card attention load balancing: the Q heads are split evenly, but the KV heads are not,
+// so the KV slices of adjacent devices overlap by one head; for now only Qwen3.5 dense is
+// wired up on the graph side, the other fused Q+gate models keep the old split
+bool attn_kv_overlap_3card(const llama_hparams & hparams, const llama_model & model, uint32_t il) {
+    if (model.arch != LLM_ARCH_QWEN35) {
+        return false;
+    }
+    // only the meta device used for tensor parallelism is split across devices
+    if (model.split_mode() != LLAMA_SPLIT_MODE_TENSOR || model.get_split_state_ud.n_devices != 3) {
+        return false;
+    }
+    const uint32_t n_head    = hparams.n_head(il);
+    const uint32_t n_head_kv = hparams.n_head_kv(il);
+    return model.tensor_split() == nullptr
+        && !hparams.is_recr(il)
+        && n_head % 3 == 0
+        && n_head_kv % 3 != 0
+        && n_head / n_head_kv == hparams.n_gqa(il)
+        && hparams.n_embd_head_k(il) == hparams.n_embd_head_v(il);
+}
+
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
@@ -626,6 +647,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 const int64_t n_embd_gqa  = hparams.n_embd_v_gqa(il);
                 GGML_ASSERT(hparams.n_embd_k_gqa(il) == n_embd_gqa);
                 GGML_ASSERT(tensor->ne[axis] == n_embd + 2*n_embd_gqa);
+                if (attn_kv_overlap_3card(hparams, *ud->model, il)) {
+                    // K and V need separate offsets because their slices overlap between devices
+                    return {{n_embd, 1}, {n_embd_gqa, 1}, {n_embd_gqa, 1}};
+                }
                 return {{n_embd, 1}, {n_embd_gqa, 2}};
             }
 
@@ -747,6 +772,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 if (is_dsv4) {
                     return {hparams.n_head(il) / hparams.dsv4_o_group_count};
                 }
+                if (attn_kv_overlap_3card(hparams, *ud->model, il)) {
+                    // one value per head, so the split must not cross a head boundary
+                    return {1};
+                }
                 return {granularity_head};
             }
 
@@ -774,12 +803,22 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 // TODO: deduplicate condition [TAG_SPLIT_QGATE_QWEN]
                 if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE ||
                         ud->model->arch == LLM_ARCH_QWEN4EXP) {
+                    if (attn_kv_overlap_3card(hparams, *ud->model, il)) {
+                        // one Q+gate head per unit, the per-device slices must not cross a head boundary
+                        GGML_ASSERT(2*hparams.n_embd_head_k(il) % blck_size == 0);
+                        return {2*hparams.n_embd_head_k(il)};
+                    }
                     return {std::lcm(2*n_embd_q, blck_size_perf)};
                 }
                 return {granularity_q};
             }
             if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
                 GGML_ASSERT(segments.size() == 1);
+                if (attn_kv_overlap_3card(hparams, *ud->model, il)) {
+                    // one output column per head, so each device holds whole heads
+                    GGML_ASSERT(hparams.n_embd_head_v(il) % blck_size == 0);
+                    return {hparams.n_embd_head_v(il)};
+                }
                 return {granularity_head * hparams.n_embd_head_v(il)};
             }
             if (std::regex_match(tensor_name, pattern_attn_gate_weight)) {
@@ -807,6 +846,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 // TODO: deduplicate condition [TAG_SPLIT_QGATE_QWEN]
                 if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE ||
                         ud->model->arch == LLM_ARCH_QWEN4EXP) {
+                    if (attn_kv_overlap_3card(hparams, *ud->model, il)) {
+                        GGML_ASSERT(segments.size() == 3);
+                        GGML_ASSERT(2*hparams.n_embd_head_k(il) % blck_size == 0);
+                        return {2*hparams.n_embd_head_k(il), granularity_kv, granularity_v};
+                    }
                     return {std::lcm(2*n_embd_q, blck_size_perf), granularity_kv};
                 }
                 if (segments.size() == 3) {
@@ -860,6 +904,44 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
         const std::vector<std::pair<int64_t, uint32_t>> segments = get_split_segments(split_state.axis, tc.il);
         const std::vector<int64_t> granularity = get_split_granularity(blck_size, tc.il, segments);
+        const bool attn_3card = attn_kv_overlap_3card(hparams, *ud->model, tc.il);
+        if (attn_3card && (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_qkv_bias) ||
+                std::regex_match(tensor_name, pattern_kv_cache))) {
+            // 3-card attention load balancing: write the per-device slices explicitly,
+            // the K/V slices of adjacent devices overlap by one KV head
+            const int64_t n_embd_head_k = hparams.n_embd_head_k(tc.il);
+            const int64_t n_embd_head_v = hparams.n_embd_head_v(tc.il);
+            const int64_t n_head_d      = hparams.n_head(tc.il) / ud->n_devices;
+            const int64_t n_gqa         = hparams.n_gqa(tc.il);
+            split_state.has_off = true;
+            if (std::regex_match(tensor_name, pattern_kv_cache)) {
+                const bool is_v = tensor_name.find("cache_v") != std::string::npos;
+                const int64_t n_embd_head = is_v ? n_embd_head_v : n_embd_head_k;
+                split_state.n_segments = 1;
+                split_state.nr[0]      = 1;
+                for (size_t j = 0; j < ud->n_devices; j++) {
+                    const int64_t kv0_d = j*n_head_d / n_gqa; // global index of the first KV head of this device
+                    split_state.ne[j]  = 2*n_embd_head;
+                    split_state.off[j] = kv0_d*n_embd_head;
+                }
+                return split_state;
+            }
+            const int64_t n_embd       = hparams.n_head(tc.il) * n_embd_head_k * 2;
+            const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(tc.il);
+            split_state.n_segments = 3;
+            split_state.nr[0] = split_state.nr[1] = split_state.nr[2] = 1;
+            for (size_t j = 0; j < ud->n_devices; j++) {
+                const int64_t ne_q       = 2*n_embd_head_k*n_head_d; // Q+gate slice of this device
+                const int64_t kv0_d      = j*n_head_d / n_gqa;       // global index of the first KV head of this device
+                split_state.ne[0*ud->n_devices + j]  = ne_q;
+                split_state.off[0*ud->n_devices + j] = j*ne_q;
+                split_state.ne[1*ud->n_devices + j]  = 2*n_embd_head_k;
+                split_state.off[1*ud->n_devices + j] = n_embd + kv0_d*n_embd_head_k;
+                split_state.ne[2*ud->n_devices + j]  = 2*n_embd_head_v;
+                split_state.off[2*ud->n_devices + j] = n_embd + n_embd_k_gqa + kv0_d*n_embd_head_v;
+            }
+            return split_state;
+        }
         for (size_t is = 0; is < segments.size(); is++) {
             const int64_t  ne_s = segments[is].first;
             const uint32_t nr_s = segments[is].second;
@@ -879,6 +961,16 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             split_state.nr[is] = nr_s;
         }
         split_state.n_segments = segments.size();
+        if (attn_3card && (std::regex_match(tensor_name, pattern_attn_out_weight) || std::regex_match(tensor_name, pattern_attn_sinks))) {
+            // the slices are equal, so record the implicit per-device offsets explicitly:
+            // the output projection must compare equal to the attention output, which carries offsets
+            int64_t off = 0;
+            for (size_t j = 0; j < ud->n_devices; j++) {
+                split_state.off[j] = off;
+                off += split_state.ne[j];
+            }
+            split_state.has_off = true;
+        }
     } else {
         memset(split_state.ne, 0, sizeof(split_state.ne));
         split_state.nr[0] = 1;
