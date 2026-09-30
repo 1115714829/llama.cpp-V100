@@ -3824,16 +3824,24 @@ void llm_graph_context::build_logits_topk() const {
     const int64_t n_vocab = logits->ne[0];
     const int64_t n_rows  = logits->ne[1];
 
-    GGML_ASSERT(n_vocab % n_shards == 0 && n_vocab / n_shards >= k);
-
     // one row per vocab shard: with the vocab split over the devices every device selects the
-    // candidates of its own shard, so no data has to cross the devices
-    ggml_tensor * shards = ggml_reshape_3d(ctx0, logits, n_vocab / n_shards, n_shards, n_rows);
+    // candidates of its own shard, so no data has to cross the devices. uneven shards are padded
+    // to the longest one (the meta backend pads every device slice and makes the pad entries rank
+    // below every logit), so a shard never loses a candidate to the padding of another shard
+    const int64_t n_vocab_shard = n_shards > 1 ? cparams.logits_topk_shard_max : n_vocab;
+
+    GGML_ASSERT(n_vocab_shard >= k && (int64_t) n_shards*n_vocab_shard >= n_vocab);
+
+    if ((int64_t) n_shards*n_vocab_shard > n_vocab) {
+        logits = ggml_pad(ctx0, logits, (int) ((int64_t) n_shards*n_vocab_shard - n_vocab), 0, 0, 0);
+    }
+
+    ggml_tensor * shards = ggml_reshape_3d(ctx0, logits, n_vocab_shard, n_shards, n_rows);
 
     ggml_tensor * ids = ggml_top_k(ctx0, shards, k); // [k, n_shards, n_rows]
     cb(ids, "logits_topk_ids", -1);
 
-    ggml_tensor * vals = ggml_get_rows(ctx0, ggml_reshape_4d(ctx0, shards, 1, n_vocab / n_shards, n_shards, n_rows), ids);
+    ggml_tensor * vals = ggml_get_rows(ctx0, ggml_reshape_4d(ctx0, shards, 1, n_vocab_shard, n_shards, n_rows), ids);
     cb(vals, "logits_topk", -1);
 
     res->t_logits_topk     = vals;

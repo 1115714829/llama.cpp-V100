@@ -1166,20 +1166,35 @@ void llama_context::set_logits_topk(int32_t k) {
         k = (int32_t) std::min<int64_t>(k_graph, n_vocab);
     }
 
-    // the logits are split like the rows of the output projection: with an even split every shard
-    // selects its own candidates, so the selection needs no data from the other devices
-    int32_t n_shards = 1;
+    // the logits are split like the rows of the output projection: every shard selects the
+    // candidates of its own vocab slice, so the selection needs no data from the other devices.
+    // the slices do not have to be equally long (3/6 devices, some output layers of 4-device
+    // models): the graph pads every slice to the longest one, and the host rebases the local ids
+    // with the prefix sums below. a slice shorter than k cannot fill its k candidate slots
+    int32_t n_shards  = 1;
+    int32_t shard_max = (int32_t) n_vocab;
+    int32_t shard_off[LLAMA_MAX_DEVICES] = {0};
     if (k > 0 && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && model.output != nullptr) {
         // the callback takes a non-const userdata but only reads it
         const ggml_backend_meta_split_state ss = llama_meta_device_get_split_state(model.output,
             const_cast<llama_meta_device_get_split_state_userdata *>(&model.get_split_state_ud));
         const size_t n_devs = model.get_split_state_ud.n_devices;
-        bool even = ss.axis == GGML_BACKEND_SPLIT_AXIS_1 && ss.n_segments == 1 && ss.nr[0] == 1 && n_devs > 1 && ss.ne[0] >= k;
-        for (size_t j = 1; even && j < n_devs; ++j) {
-            even = ss.ne[j] == ss.ne[0];
+
+        bool split = ss.axis == GGML_BACKEND_SPLIT_AXIS_1 && ss.n_segments == 1 && ss.nr[0] == 1 &&
+            !ss.has_off && n_devs > 1;
+        int64_t off    = 0;
+        int64_t ne_max = 0;
+        for (size_t j = 0; j < n_devs; ++j) {
+            split = split && ss.ne[j] >= k;
+            shard_off[j] = (int32_t) off;
+            off    += ss.ne[j];
+            ne_max  = std::max(ne_max, ss.ne[j]);
         }
-        if (even) {
-            n_shards = (int32_t) n_devs;
+
+        // the shards must cover the whole vocab, so that the prefix sums give the global ids
+        if (split && off == n_vocab) {
+            n_shards  = (int32_t) n_devs;
+            shard_max = (int32_t) ne_max;
         }
     }
 
@@ -1198,10 +1213,12 @@ void llama_context::set_logits_topk(int32_t k) {
         return;
     }
 
-    LLAMA_LOG_DEBUG("%s: k = %d, n_shards = %d\n", __func__, k, n_shards);
+    LLAMA_LOG_DEBUG("%s: k = %d, n_shards = %d, shard_max = %d\n", __func__, k, n_shards, shard_max);
 
-    cparams.logits_topk        = k;
-    cparams.logits_topk_shards = n_shards;
+    cparams.logits_topk           = k;
+    cparams.logits_topk_shards    = n_shards;
+    cparams.logits_topk_shard_max = shard_max;
+    std::copy(shard_off, shard_off + LLAMA_MAX_DEVICES, cparams.logits_topk_shard_off);
 
     sched_need_reserve = true;
 }
@@ -1224,13 +1241,13 @@ int32_t llama_context::get_logits_topk_ith(int32_t i, const llama_token ** ids, 
         const int64_t j = output_resolve_row(i);
         const int32_t n = k * n_shards;
 
-        // the ids are local to their vocab shard
-        const int32_t n_vocab_shard = model.vocab.n_tokens() / n_shards;
+        // the ids are local to their vocab shard, the prefix sums give its first global id
+        // (an even split degenerates to s*n_vocab_shard, which is what this used to be)
         const int32_t * ids_row = topk_ids.data + j*n;
         topk_ids_row.resize(n);
         for (int32_t s = 0; s < n_shards; ++s) {
             for (int32_t c = 0; c < k; ++c) {
-                topk_ids_row[s*k + c] = ids_row[s*k + c] + s*n_vocab_shard;
+                topk_ids_row[s*k + c] = ids_row[s*k + c] + cparams.logits_topk_shard_off[s];
             }
         }
 

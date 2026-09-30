@@ -623,6 +623,44 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
 
+// A PAD node that evens out an uneven AXIS_0 split (see handle_pad): every backend pads its own
+// slice up to node->ne[0]/n_bufs, so its per-device pad amount differs from the global one.
+static bool ggml_backend_meta_pad_uneven(const struct ggml_tensor * node, const struct ggml_backend_meta_split_state & src_ss) {
+    if (node->op != GGML_OP_PAD || node->type != GGML_TYPE_F32 || node->src[0] == nullptr ||
+            node->src[0]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (src_ss.axis != GGML_BACKEND_SPLIT_AXIS_0 || src_ss.has_off || src_ss.n_segments != 1 || src_ss.nr[0] != 1) {
+        return false;
+    }
+    // the per-device aux graph fills the end of the split axis only
+    const int32_t * pad_params = (const int32_t *) node->op_params;
+    if (pad_params[0] != 0) {
+        return false;
+    }
+    for (int i = 1; i < GGML_MAX_DIMS; i++) {
+        if (pad_params[2*i + 0] != 0 || pad_params[2*i + 1] != 0) {
+            return false;
+        }
+    }
+    if (node->buffer == nullptr || !ggml_backend_buffer_is_meta(node->buffer)) {
+        return false;
+    }
+    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(node->buffer);
+    if (n_bufs < 2 || node->ne[0] % (int64_t) n_bufs != 0) {
+        return false;
+    }
+    const int64_t ne_shard = node->ne[0] / (int64_t) n_bufs;
+    bool uneven = false;
+    for (size_t j = 0; j < n_bufs; j++) {
+        if (src_ss.ne[j] <= 0 || src_ss.ne[j] > ne_shard) {
+            return false;
+        }
+        uneven = uneven || src_ss.ne[j] != src_ss.ne[0];
+    }
+    return uneven;
+}
+
 // Derive the split state of a tensor from a source with explicit offsets: the window of the tensor
 // along the source split axis is intersected with the per-device source slices and scaled to the
 // units of the tensor's split axis. local_offs receives the per-device byte offset of the tensor
@@ -1043,7 +1081,21 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return src_ss[0];
     };
 
+    // set by a handler that already filled the per-device layout itself, the ratio backfill then
+    // has to keep its hands off the state (see handle_pad)
+    bool split_state_fixed = false;
+
     auto handle_pad = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        if (ggml_backend_meta_pad_uneven(tensor, src_ss[0])) {
+            // every backend pads its own slice: the output is an even AXIS_0 split of the padded length
+            const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
+            ggml_backend_meta_split_state ret = {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1, {0}, false};
+            for (size_t j = 0; j < n_bufs; j++) {
+                ret.ne[j] = tensor->ne[0] / (int64_t) n_bufs;
+            }
+            split_state_fixed = true;
+            return ret;
+        }
         if (src_ss[0].axis >= 0 && src_ss[0].axis < GGML_MAX_DIMS) {
             GGML_ASSERT(tensor->op_params[2*src_ss[0].axis + 0] == 0);
             GGML_ASSERT(tensor->op_params[2*src_ss[0].axis + 1] == 0);
@@ -1372,7 +1424,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 split_state = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1, {0}, false};
             } break;
         }
-        if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
+        if (!split_state_fixed && split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
             bool first_src_split_by_axis = true;
             bool has_off_src = false;
             const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
@@ -2252,6 +2304,7 @@ enum ggml_backend_meta_collect_kind {
     GGML_BACKEND_META_COLLECT_ALLREDUCE = 0, // PARTIAL node, summed in place
     GGML_BACKEND_META_COLLECT_TOPK,          // sharded TOP_K, candidates merged across backends
     GGML_BACKEND_META_COLLECT_GETROWS,       // sharded GET_ROWS, rows summed across backends
+    GGML_BACKEND_META_COLLECT_PAD,           // unevenly split PAD, every backend pads its own slice
 };
 
 // output that has to land on [dst] at [offset] instead of into the per-backend scratch buffer
@@ -2287,6 +2340,12 @@ static bool ggml_backend_meta_node_getrows_collective(const struct ggml_tensor *
            ggml_backend_meta_getrows_collective(
                ggml_backend_meta_get_split_state(node->src[0], /*assume_sync =*/ true).axis,
                ggml_backend_meta_get_split_state(node->src[1], /*assume_sync =*/ true).axis, node->type);
+}
+
+static bool ggml_backend_meta_node_pad_uneven(const struct ggml_tensor * node) {
+    return node->op == GGML_OP_PAD && node->src[0] != nullptr && node->src[0]->buffer != nullptr &&
+           ggml_backend_buffer_is_meta(node->src[0]->buffer) &&
+           ggml_backend_meta_pad_uneven(node, ggml_backend_meta_get_split_state(node->src[0], /*assume_sync =*/ true));
 }
 
 // Shapes of one collective: [k] rows over [n_cols] trailing columns. TOP_K additionally stores
@@ -2390,6 +2449,27 @@ static void ggml_backend_meta_build_getrows_local(
     ggml_tensor * out = ggml_get_rows(ctx, ggml_pad(ctx, src, 0, 1, 0, 0), ggml_cast(ctx, sel, GGML_TYPE_I32));
     aux.binds.push_back({out, dst, 0});
     ggml_build_forward_expand(aux.graph, out);
+}
+
+// Per-backend padding of one slice of an uneven AXIS_0 split: the global pad offsets do not apply,
+// fill the whole output with the rank-last marker and copy the source slice over the front.
+static void ggml_backend_meta_build_pad_local(ggml_context * ctx, ggml_tensor * dst, ggml_backend_meta_aux_graph & aux) {
+    aux.graph = ggml_new_graph_custom(ctx, 64, /*grads =*/ false);
+
+    // dummy input: keeps the main graph out of the aux graph, the fill does not read it
+    ggml_tensor * tmpl = ggml_new_tensor_4d(ctx, dst->type, dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
+    ggml_tensor * fill = ggml_fill(ctx, tmpl, GGML_META_COLLECT_PAD_VAL);
+    aux.binds.push_back({fill, dst, 0});
+    ggml_build_forward_expand(aux.graph, fill);
+
+    ggml_tensor * src = dst->src[0];
+    if (src != nullptr && src->ne[0] > 0) {
+        src = ggml_backend_meta_aux_input(ctx, src, aux);
+        ggml_tensor * view = ggml_view_4d(ctx, dst, src->ne[0], src->ne[1], src->ne[2], src->ne[3],
+                dst->nb[1], dst->nb[2], dst->nb[3], 0);
+        ggml_tensor * cpy = ggml_backend_meta_aux_copy(ctx, src, view);
+        ggml_build_forward_expand(aux.graph, cpy);
+    }
 }
 
 // Deterministic merge of the gathered candidates into the global top-k. The rank of a candidate is
@@ -2796,7 +2876,9 @@ struct ggml_backend_meta_launchers {
                         return status;
                     }
                 }
-                if (n_backends > 1) {
+                const bool gather = collect.kind == GGML_BACKEND_META_COLLECT_TOPK ||
+                                    collect.kind == GGML_BACKEND_META_COLLECT_GETROWS;
+                if (gather && n_backends > 1) {
                     if (!allreduce_rank(comm_ctx, j, collect.reduce[j], true) || !barrier()) {
                         return GGML_STATUS_FAILED;
                     }
@@ -3574,7 +3656,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     if (next->view_src != nullptr && next->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(next->view_src->buffer)) {
                         continue;
                     }
-                    if (ggml_backend_meta_node_topk_collective(next) || ggml_backend_meta_node_getrows_collective(next)) {
+                    if (ggml_backend_meta_node_topk_collective(next) || ggml_backend_meta_node_getrows_collective(next) ||
+                            ggml_backend_meta_node_pad_uneven(next)) {
                         // collective boundaries have to stay at subgraph ends
                         return i_delayed;
                     }
@@ -3626,6 +3709,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     collect_kind = GGML_BACKEND_META_COLLECT_TOPK;
                 } else if (ggml_backend_meta_node_getrows_collective(node)) {
                     collect_kind = GGML_BACKEND_META_COLLECT_GETROWS;
+                } else if (ggml_backend_meta_node_pad_uneven(node)) {
+                    collect_kind = GGML_BACKEND_META_COLLECT_PAD;
                 }
                 const bool new_subgraph = i + 1 == cgraph->n_nodes || split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL ||
                                           collect_kind != GGML_BACKEND_META_COLLECT_ALLREDUCE;
@@ -3762,6 +3847,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             if (collect.kind == GGML_BACKEND_META_COLLECT_ALLREDUCE) {
                 for (size_t j = 0; j < n_backends; j++) {
                     collect.reduce[j] = plan.nodes[j][collect.i_node];
+                }
+                continue;
+            }
+            if (collect.kind == GGML_BACKEND_META_COLLECT_PAD) {
+                // the node is computed by the per-backend local graphs only, no data crosses backends
+                for (size_t j = 0; j < n_backends; j++) {
+                    ggml_context * ctx_j = plan.ctx_collect[j].get();
+                    ggml_tensor  * node_j = plan.nodes[j][collect.i_node];
+                    ggml_backend_meta_build_pad_local(ctx_j, node_j, collect.local[j]);
                 }
                 continue;
             }
@@ -4047,13 +4141,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         bool can_capture = try_capture;
         for (size_t i = 0; i < p->n_subgraphs && can_launch && p->full_state != 1; i++) {
             const ggml_backend_meta_collect & collect = p->collects[i];
-            const bool do_reduce = collect.kind != GGML_BACKEND_META_COLLECT_ALLREDUCE
-                ? n_backends > 1
-                : n_backends > 1 && i < p->n_subgraphs - 1;
+            const bool gather = collect.kind == GGML_BACKEND_META_COLLECT_TOPK ||
+                                collect.kind == GGML_BACKEND_META_COLLECT_GETROWS;
+            const bool do_reduce = collect.kind == GGML_BACKEND_META_COLLECT_ALLREDUCE
+                ? n_backends > 1 && i < p->n_subgraphs - 1
+                : gather && n_backends > 1;
             if (!do_reduce) {
                 continue;
             }
-            const bool exact = collect.kind != GGML_BACKEND_META_COLLECT_ALLREDUCE;
+            const bool exact = gather;
             can_launch  = backend_ctx->launchers->can(p->collects[i].reduce.data(), exact);
             can_capture = can_capture && can_launch &&
                 backend_ctx->comm_allreduce_rank_capturable(backend_ctx->comm_ctx, p->collects[i].reduce.data(), exact);
@@ -4090,7 +4186,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     return status;
                 }
             }
-            if (n_backends > 1) {
+            const bool gather = collect.kind == GGML_BACKEND_META_COLLECT_TOPK ||
+                                collect.kind == GGML_BACKEND_META_COLLECT_GETROWS;
+            if (gather && n_backends > 1) {
                 // These all-reduces gather disjoint contributions, e.g. the TOP_K
                 // candidates with their token ids stored as f32 (as f16, ids above
                 // 65504 would become inf), so they must not take a lossy reduction.

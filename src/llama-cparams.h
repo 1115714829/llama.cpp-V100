@@ -6,6 +6,7 @@
 #include <vector>
 
 #define LLAMA_MAX_SEQ 256
+#define LLAMA_MAX_DEVICES 16 // same as llama_max_devices()
 
 struct llama_cparams {
     uint32_t n_ctx;           // context size used during inference
@@ -58,6 +59,11 @@ struct llama_cparams {
 
     int32_t logits_topk        = 0; // output only the top k logits of every row, see llama_set_logits_topk
     int32_t logits_topk_shards = 1; // vocab shards that select their candidates independently
+    // the logits are split like the rows of the output projection; each shard takes the top k of
+    // its own slice, which is padded to the longest slice (logits_topk_shard_max), and the host
+    // rebases the local ids with the prefix sums in logits_topk_shard_off (see get_logits_topk_ith)
+    int32_t logits_topk_shard_max = 0;
+    int32_t logits_topk_shard_off[LLAMA_MAX_DEVICES] = {0};
 
     bool    logits_topk_active = false; // the current request reads the top-k output (the graph may keep a top-k output while it is off)
 

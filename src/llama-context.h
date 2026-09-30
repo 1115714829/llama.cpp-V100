@@ -377,8 +377,9 @@ private:
     bool    embd_src_enable = false; // draft: the next embd batch reads the staging sink
     int32_t embd_src_offset = 0;     // draft: first target-sink column to copy
 
-    // top-k logits output (3-dimensional arrays: [n_outputs][n_shards][k]), see llama_set_logits_topk;
-    // the ids are local to their vocab shard, topk_ids_row holds the global ids of the last row read
+    // top-k logits output (per row: n_shards blocks of k candidates), see llama_set_logits_topk;
+    // the graph ids are local to their vocab shard; topk_ids_row holds the global ids of the last
+    // row read, rebased with the shard prefix sums (cparams.logits_topk_shard_off)
     buffer_view<float>       topk_logits = {nullptr, 0};
     buffer_view<int32_t>     topk_ids    = {nullptr, 0};
     std::vector<llama_token> topk_ids_row;
