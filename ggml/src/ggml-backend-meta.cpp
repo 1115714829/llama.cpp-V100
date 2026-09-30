@@ -665,6 +665,8 @@ static bool ggml_backend_meta_pad_uneven(const struct ggml_tensor * node, const 
 // along the source split axis is intersected with the per-device source slices and scaled to the
 // units of the tensor's split axis. local_offs receives the per-device byte offset of the tensor
 // data inside the source's simple tensor.
+static size_t ggml_backend_meta_get_split_state_local_offs(const struct ggml_tensor * tensor, size_t j);
+
 static ggml_backend_meta_split_state ggml_backend_meta_map_has_off_state(
         const ggml_tensor * tensor, const ggml_tensor * src, const ggml_backend_meta_split_state & src_ss,
         int split_axis, std::vector<size_t> & local_offs, size_t n_bufs) {
@@ -694,7 +696,16 @@ static ggml_backend_meta_split_state ggml_backend_meta_map_has_off_state(
     ggml_backend_meta_split_state ret = {ggml_backend_meta_split_axis(A), {0}, {1}, 1, {0}, true};
     local_offs.assign(n_bufs, 0);
 
-    const bool is_view = tensor->op == GGML_OP_VIEW && tensor->view_src == src;
+    // A view of a view has the base tensor as view_src and an offset relative to it: work with the
+    // offset relative to the source view, and place the local offsets relative to the base, i.e.
+    // after the source view's own local offset.
+    const bool is_view = tensor->op == GGML_OP_VIEW && tensor->view_src != nullptr &&
+                         (tensor->view_src == src || src->view_src == tensor->view_src);
+    const bool chained = is_view && tensor->view_src != src;
+    const size_t view_offs_rel = chained ? tensor->view_offs - src->view_offs : tensor->view_offs;
+    auto src_local = [&](size_t j) -> size_t {
+        return chained ? ggml_backend_meta_get_split_state_local_offs(src, j) : 0;
+    };
     if (is_view && A != B) {
         // The view remaps the source split axis to a different tensor axis (e.g. a fused q+gate head
         // or a merge of several heads): rescale the units, the offsets stay inside the source slice.
@@ -702,7 +713,7 @@ static ggml_backend_meta_split_state ggml_backend_meta_map_has_off_state(
         for (size_t j = 0; j < n_bufs; j++) {
             ret.ne[j]  = to_tensor_units(src_ss.ne[j]);
             ret.off[j] = to_tensor_units(src_ss.off[j]);
-            local_offs[j] = tensor->view_offs; // interior offsets are not rescaled
+            local_offs[j] = src_local(j) + view_offs_rel; // interior offsets are not rescaled
         }
         return ret;
     }
@@ -713,8 +724,8 @@ static ggml_backend_meta_split_state ggml_backend_meta_map_has_off_state(
     int64_t w1 = src->ne[B];
     if (is_view) {
         GGML_ASSERT(A == B);
-        GGML_ASSERT(tensor->view_offs % src->nb[B] == 0);
-        w0 = tensor->view_offs / src->nb[B];
+        GGML_ASSERT(view_offs_rel % src->nb[B] == 0);
+        w0 = view_offs_rel / src->nb[B];
         w1 = w0 + tensor->ne[A];
     }
     GGML_ASSERT(w0 >= 0 && w1 <= src->ne[B]);
@@ -738,7 +749,7 @@ static ggml_backend_meta_split_state ggml_backend_meta_map_has_off_state(
                     ret.off[j] = to_tensor_units(is - w0);
                     ret.ne[j]  = to_tensor_units(ie - is);
                 }
-                local_offs[j] = ((is - off_s) + ne_before) * src->nb[B];
+                local_offs[j] = src_local(j) + ((is - off_s) + ne_before) * src->nb[B];
             }
             ne_before += ne_s;
         }
