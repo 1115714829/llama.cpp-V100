@@ -1072,7 +1072,22 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     auto handle_set_rows = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_1);
         GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-        GGML_ASSERT(split_states_equal(src_ss[0], src_ss[2]));
+        if (!split_states_equal(src_ss[0], src_ss[2])) {
+            auto ss_str = [&](const ggml_backend_meta_split_state & ss) {
+                std::string str = std::string(ggml_backend_meta_split_axis_name(ss.axis)) + (ss.has_off ? " off" : "") +
+                    " segs=" + std::to_string(ss.n_segments) + " {";
+                for (size_t s = 0; s < ss.n_segments; s++) {
+                    for (size_t j = 0; j < n_bufs; j++) {
+                        str += (s + j > 0 ? ", " : "") + std::to_string(ss.ne[s*n_bufs + j]) +
+                            (ss.has_off ? "@" + std::to_string(ss.off[s*n_bufs + j]) : "x" + std::to_string(ss.nr[s]));
+                    }
+                }
+                return str + "}";
+            };
+            GGML_LOG_ERROR("%s: SET_ROWS %s: split state of %s [%s] differs from %s [%s]\n", __func__, tensor->name,
+                tensor->src[0]->name, ss_str(src_ss[0]).c_str(), tensor->src[2]->name, ss_str(src_ss[2]).c_str());
+            GGML_ABORT("SET_ROWS source and destination split differently");
+        }
         return src_ss[0];
     };
 
