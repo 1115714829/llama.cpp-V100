@@ -1710,6 +1710,60 @@ private:
         return res;
     }
 
+    // probe the other slots for a cached prompt that shares a longer prefix with the incoming prompt
+    // than this slot's own cache; read-only, logs the result but does not copy KV or restore checkpoints
+    // (step 1 of the cross-slot prefix reuse, see docs/design/v107-711-spec.md)
+    void probe_cross_slot_prefix(const server_slot & slot, const server_tokens & input_tokens, size_t n_past_self) const {
+        if (slots.size() <= 1) {
+            return;
+        }
+
+        llama_memory_t mem = llama_get_memory(ctx_tgt);
+        if (mem == nullptr) {
+            return;
+        }
+
+        int       id_other     = -1;
+        size_t    n_past_other = 0;
+        llama_pos pos_ckpt     = 0;
+
+        for (const server_slot & other : slots) {
+            if (other.id == slot.id || other.prompt.tokens.empty()) {
+                continue;
+            }
+
+            // the shared prefix must be intact from position 0
+            if (llama_memory_seq_pos_min(mem, other.id) != 0) {
+                continue;
+            }
+
+            const size_t lcp_len = other.prompt.tokens.get_common_prefix(input_tokens);
+
+            if (lcp_len <= n_past_other) {
+                continue;
+            }
+
+            n_past_other = lcp_len;
+            id_other     = other.id;
+
+            // nearest checkpoint with GDN state at or before the shared prefix, 0 if none
+            pos_ckpt = 0;
+
+            for (const auto & ckpt : other.prompt.checkpoints) {
+                if (!ckpt.empty() && ckpt.pos_max > pos_ckpt && ckpt.pos_max <= (llama_pos) lcp_len) {
+                    pos_ckpt = ckpt.pos_max;
+                }
+            }
+        }
+
+        if (id_other < 0 || n_past_other <= n_past_self + 256) {
+            return;
+        }
+
+        SRV_INF("cross-slot prefix: self=%d other=%d (slot %d) ckpt=%d n_prompt=%d\n",
+                (int) n_past_self, (int) n_past_other, id_other, (int) pos_ckpt, (int) input_tokens.size());
+    }
+
     std::vector<common_adapter_lora_info> construct_lora_list(const std::map<int, float> & config) const {
         std::vector<common_adapter_lora_info> output = params_base.lora_adapters; // copy
         for (size_t i = 0; i < output.size(); ++i) {
@@ -3529,6 +3583,9 @@ private:
                         slot.stats.n_prompt_processed = 0;
 
                         metrics.add_prompt_cached(n_past);
+
+                        // read-only probe, does not affect the scheduling or the cache state
+                        probe_cross_slot_prefix(slot, input_tokens, n_past);
 
                         slot.prompt.tokens.keep_first(n_past);
 
