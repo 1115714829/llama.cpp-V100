@@ -8,7 +8,7 @@ A modified version of llama.cpp for the NVIDIA V100 (SM70). Current version **1.
 
 ## What's new in 1.0.5
 
-1.0.5 supports 2 to 6 GPUs, with measured data for both the Q8 and Q4 configurations at each GPU count; single-request and concurrent speed is the same as 1.0.4 (the floor check is yet to be filled in).
+1.0.5 supports 2 to 6 GPUs, with measured data for both the Q8 and Q4 configurations at each GPU count; single-request and concurrent speed is the same as 1.0.4 (measured alternately with 1.0.0 and 1.0.4 in the same session: 4-GPU 200K prefill 1643.0 vs 1642.1 tok/s, time per speculative round unchanged).
 
 - **Q4 configuration**: target model UD-Q4_K_M, KV cache q4_0. The SM70 attention kernels (prefill and speculative verification) support the q4_0 KV cache; long-context prefill is as fast as with a q8_0 KV cache, and the KV cache uses half the VRAM. This part comes from a PR by the external contributor ATIVX928, see "Contributors".
 - **2-6 GPU adaptation table**: for each GPU count and each configuration, single-request and two-request concurrent measurements at the highest context that can start; the data is in "GPU counts and quantization" under "Test data". With the Q4 configuration, 2 GPUs can run 262144 context, and 3 GPUs with Q4 can run 524288.
