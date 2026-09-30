@@ -2132,7 +2132,7 @@ static void ggml_cuda_mul_mat_q4k_skinny(ggml_backend_cuda_context & ctx, const 
         return;
     }
 
-    // M > 16 or an unsupported input: expand the repacked weights to dense F16 and run the
+    // M > 64 or an unsupported input: expand the repacked weights to dense F16 and run the
     // regular path on them. Prefill keeps using cuBLAS, as before the repack.
     const int64_t k = src0->ne[0];
     const int64_t n = src0->ne[1];

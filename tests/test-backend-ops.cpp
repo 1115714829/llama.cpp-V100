@@ -10848,14 +10848,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, 5120, {1, 1}, {1, 1}));
 
     // Q4_K skinny GEMM (repacked codes + raw super-block meta, sm_70): M <= 16 runs the
-    // single-stage kernel, M = 17..64 expands the repacked weights to F16 and uses the regular
-    // dense path. The kernel rounds d*sc and dmin*m to F16 once per 32 values, a relative error
-    // of <= 2^-11 on a constant per sub-block, so the default 5e-4 NMSE of test_mul_mat covers it.
+    // single-stage kernel, M = 17..64 the two-phase M=32 kernel (split-16 shapes), M > 64
+    // expands the repacked weights to F16 and uses the regular dense path. The kernel rounds
+    // d*sc and dmin*m to F16 once per 32 values, a relative error of <= 2^-11 on a constant per
+    // sub-block, so the default 5e-4 NMSE of test_mul_mat covers it.
     const std::vector<std::pair<int64_t, int64_t>> q4_k_skinny_shapes = {
         { 4096, 5120}, { 5120, 4096}, { 256, 5120},
     };
     for (const auto & [n_out, k_red] : q4_k_skinny_shapes) {
         for (int64_t n_tokens : {1, 2, 8, 16, 17, 32, 64}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, n_out, n_tokens, k_red, {1, 1}, {1, 1}));
+        }
+    }
+    // M = 17..64 on the DFlash2 verify shapes, K = 5120 and the 2/4-card N splits
+    const std::vector<std::pair<int64_t, int64_t>> q4_k_skinny_m32_shapes = {
+        { 4352, 5120}, { 8704, 5120}, { 1536, 5120}, { 3072, 5120},
+    };
+    for (const auto & [n_out, k_red] : q4_k_skinny_m32_shapes) {
+        for (int64_t n_tokens : {17, 24, 32, 48, 64}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, n_out, n_tokens, k_red, {1, 1}, {1, 1}));
         }
     }
@@ -10872,6 +10882,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 false, 1, 1, false, false, true, false, {1, 1}));
         }
     }
+    // M = 17..64: two M=32 two-phase kernels plus the elementwise SWIGLU
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 32, 4352, 5120,
+        false, 1, 1, false, false, true, false, {1, 1}));
 
     // Q8_0 skinny gated pair: both matmuls and the SWIGLU in one kernel on sm_70, M > 16 as two
     // M=32 kernels plus the elementwise SWIGLU
@@ -10886,7 +10899,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_multi({3072, 256, 256}, n_tokens, 5120));
     }
 
-    // multiple repacked Q4_K matmuls sharing one input, M <= 16 only. The N columns follow the
+    // multiple repacked Q4_K matmuls sharing one input: the multi-weight kernel for M <= 16,
+    // one M=32 two-phase launch per weight for M = 17..64. The N columns follow the
     // per-card qkv/z and q/k/v shapes of the 4-card (2560/1536, 3072/256/256) and 2-card
     // (5120/3072, 6144/512/512) tensor splits; all weights use K = 5120 so they share one src1.
     for (int64_t n_tokens : {1, 8, 16}) {
@@ -10895,6 +10909,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_multi({5120, 3072}, n_tokens, 5120, GGML_TYPE_Q4_K));
         test_cases.emplace_back(new test_mul_mat_multi({6144, 512, 512}, n_tokens, 5120, GGML_TYPE_Q4_K));
     }
+    test_cases.emplace_back(new test_mul_mat_multi({3072, 256, 256}, 32, 5120, GGML_TYPE_Q4_K));
 
     // the same matmuls with a large M: one shared input conversion across cuBLAS calls
     for (int64_t n_tokens : {64, 512}) {
