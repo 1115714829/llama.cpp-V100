@@ -129,6 +129,22 @@ __global__ void gdn_chunk_store_kernel(const half2 * __restrict__ src, float2 * 
     }
 }
 
+// kkt_solve + fused forward. HV/HK > 0 instantiate the kernels with compile-time head counts.
+template <int HV, int HK>
+static void gdn_chunk_launch_kkt_fwd(half_t * a, const ggml_cuda_gdn_chunk_args & args, int * chunk_indices, int * chunk_offsets,
+        int * cu_seqlens, float * gcum, half_t * k16, half_t * o16, half_t * q16, half_t * v16,
+        const int num_chunks, const int n, const int H, const int Hk, cudaStream_t stream) {
+    tilelang_kkt_solve_kernel_kernel<HV, HK><<<num_chunks * H, 128, GDN_CHUNK_SM70_SMEM_KKT, stream>>>(
+        a, args.beta, chunk_indices, cu_seqlens, k16, num_chunks, n, 1, H, Hk);
+    CUDA_CHECK(cudaGetLastError());
+
+    CUDA_SET_SHARED_MEMORY_LIMIT((tilelang_fused_chunk_gdr_fwd_kernel_kernel<HV, HK>), GDN_CHUNK_SM70_SMEM_FWD);
+    tilelang_fused_chunk_gdr_fwd_kernel_kernel<HV, HK><<<H * 4, 128, GDN_CHUNK_SM70_SMEM_FWD, stream>>>(
+        a, args.beta, chunk_offsets, cu_seqlens, gcum, args.s0, args.h_out,
+        k16, o16, q16, v16, 1, n, 1, H, Hk);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 int64_t ggml_cuda_gdn_chunk_sm70_n_tokens(int cc, int64_t S_v, int64_t H, int64_t H_k, int64_t n_tokens, int64_t n_seqs, int64_t rq3, bool kda, int K) {
     if (cc != GGML_CUDA_CC_VOLTA || kda || S_v != GDN_CHUNK_SM70_D || H < 1 || H_k < 1 || H % H_k != 0 ||
             n_seqs != 1 || rq3 != 1) {
@@ -193,15 +209,13 @@ void ggml_cuda_gdn_chunk_sm70(ggml_backend_cuda_context & ctx, const ggml_cuda_g
     }
     CUDA_CHECK(cudaGetLastError());
 
-    tilelang_kkt_solve_kernel_kernel<<<num_chunks * H, 128, GDN_CHUNK_SM70_SMEM_KKT, stream>>>(
-        a.get(), args.beta, chunk_indices, cu_seqlens, k16.get(), num_chunks, (int) n, 1, H, Hk);
-    CUDA_CHECK(cudaGetLastError());
-
-    CUDA_SET_SHARED_MEMORY_LIMIT(tilelang_fused_chunk_gdr_fwd_kernel_kernel, GDN_CHUNK_SM70_SMEM_FWD);
-    tilelang_fused_chunk_gdr_fwd_kernel_kernel<<<H * 4, 128, GDN_CHUNK_SM70_SMEM_FWD, stream>>>(
-        a.get(), args.beta, chunk_offsets, cu_seqlens, gcum.get(), args.s0, args.h_out,
-        k16.get(), o16.get(), q16.get(), v16.get(), 1, (int) n, 1, H, Hk);
-    CUDA_CHECK(cudaGetLastError());
+    if (H == 12 && Hk == 4) {
+        gdn_chunk_launch_kkt_fwd<12, 4>(a.get(), args, chunk_indices, chunk_offsets, cu_seqlens, gcum.get(),
+            k16.get(), o16.get(), q16.get(), v16.get(), num_chunks, (int) n, H, Hk, stream);
+    } else {
+        gdn_chunk_launch_kkt_fwd<0, 0>(a.get(), args, chunk_indices, chunk_offsets, cu_seqlens, gcum.get(),
+            k16.get(), o16.get(), q16.get(), v16.get(), num_chunks, (int) n, H, Hk, stream);
+    }
 
     const int64_t n2 = n * H * (GDN_CHUNK_SM70_D / 2);
     const unsigned int n_blocks = (unsigned int) ((n2 + 255) / 256);
