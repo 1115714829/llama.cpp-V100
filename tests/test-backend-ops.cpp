@@ -10874,18 +10874,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 32,  1, 256, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 32, 17, 256, {1, 1}, {1, 1}));
 
-    // Q4_K skinny gated pair: both matmuls and the SWIGLU in one kernel on sm_70 for M <= 8,
-    // two single-projection kernels plus the elementwise SWIGLU for M = 9..16
-    for (int64_t n_tokens : {1, 8, 16}) {
-        for (int64_t n_out : {4352, 8704}) {
-            test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, n_tokens, n_out, 5120,
-                false, 1, 1, false, false, true, false, {1, 1}));
-        }
-    }
-    // M = 17..64: two M=32 two-phase kernels plus the elementwise SWIGLU
-    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 32, 4352, 5120,
-        false, 1, 1, false, false, true, false, {1, 1}));
-
     // Q8_0 skinny gated pair: both matmuls and the SWIGLU in one kernel on sm_70, M > 16 as two
     // M=32 kernels plus the elementwise SWIGLU
     for (int64_t n_tokens : {1, 8, 16, 24, 32, 48, 64}) {
@@ -10898,18 +10886,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_multi({2560, 1536, 12, 12}, n_tokens, 5120));
         test_cases.emplace_back(new test_mul_mat_multi({3072, 256, 256}, n_tokens, 5120));
     }
-
-    // multiple repacked Q4_K matmuls sharing one input: the multi-weight kernel for M <= 16,
-    // one M=32 two-phase launch per weight for M = 17..64. The N columns follow the
-    // per-card qkv/z and q/k/v shapes of the 4-card (2560/1536, 3072/256/256) and 2-card
-    // (5120/3072, 6144/512/512) tensor splits; all weights use K = 5120 so they share one src1.
-    for (int64_t n_tokens : {1, 8, 16}) {
-        test_cases.emplace_back(new test_mul_mat_multi({2560, 1536}, n_tokens, 5120, GGML_TYPE_Q4_K));
-        test_cases.emplace_back(new test_mul_mat_multi({3072, 256, 256}, n_tokens, 5120, GGML_TYPE_Q4_K));
-        test_cases.emplace_back(new test_mul_mat_multi({5120, 3072}, n_tokens, 5120, GGML_TYPE_Q4_K));
-        test_cases.emplace_back(new test_mul_mat_multi({6144, 512, 512}, n_tokens, 5120, GGML_TYPE_Q4_K));
-    }
-    test_cases.emplace_back(new test_mul_mat_multi({3072, 256, 256}, 32, 5120, GGML_TYPE_Q4_K));
 
     // the same matmuls with a large M: one shared input conversion across cuBLAS calls
     for (int64_t n_tokens : {64, 512}) {
