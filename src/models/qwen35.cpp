@@ -266,6 +266,33 @@ static ggml_tensor * build_attn_3card_impl(
     const int64_t n_gqa    = ctx.hparams.n_gqa(il);
     const int64_t n_head_d = n_head / 3;
     const int64_t n_stream = k->ne[3];
+    const int64_t n_q      = q_cur->ne[2] / n_stream; // query tokens per stream
+
+    // The grouped verify kernel applies the per-device Q head boundary itself, so a verify batch
+    // needs a single flash attention per device and no concatenation. Prefill and single-token
+    // decode keep the two-group path: the split-D and vec kernels only do a uniform GQA mapping.
+    if (n_q >= 2 && n_q <= 16) {
+        ggml_tensor * q = ggml_view_4d(ctx.ctx0, q_cur, n_embd_head, n_head, n_q, n_stream,
+                q_cur->nb[1], q_cur->nb[2], q_cur->nb[3]/n_stream, 0);
+        q = ggml_permute(ctx.ctx0, q, 0, 2, 1, 3);
+
+        ggml_tensor * k_4d = ggml_permute(ctx.ctx0, k, 0, 2, 1, 3);
+        ggml_tensor * v_4d = ggml_permute(ctx.ctx0, v, 0, 2, 1, 3);
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx.ctx0, q, k_4d, v_4d, kq_mask, kq_scale,
+                ctx.hparams.f_max_alibi_bias,
+                ctx.hparams.attn_soft_cap ? ctx.hparams.f_attn_logit_softcapping : 0.0f);
+        ctx.res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, out, il});
+
+        ggml_flash_attn_ext_set_n_kv_max(out, 0);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_flash_attn_ext_set_q_head_boundary(out, -1); // the split backend fills g0 per device
+
+        ggml_tensor * cur = ggml_reshape_2d(ctx.ctx0, out, out->ne[0]*out->ne[1], out->ne[2]*out->ne[3]);
+        ggml_build_forward_expand(ctx.gf, cur);
+
+        return cur;
+    }
 
     // one node per (device, GQA group) pair, the windows are in global head coordinates:
     // a window is only non-zero on the device that holds its Q heads
