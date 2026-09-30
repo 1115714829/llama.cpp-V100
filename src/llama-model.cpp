@@ -383,10 +383,14 @@ bool attn_kv_overlap_3card(const llama_hparams & hparams, const llama_model & mo
     if (model.split_mode() != LLAMA_SPLIT_MODE_TENSOR || model.get_split_state_ud.n_devices != 3) {
         return false;
     }
+    // the Q windows assume an even split: no --tensor-split, or equal proportions (e.g. 1,1,1)
+    const float * ts = model.tensor_split();
+    if (ts != nullptr && !(ts[0] == ts[1] && ts[1] == ts[2])) {
+        return false;
+    }
     const uint32_t n_head    = hparams.n_head(il);
     const uint32_t n_head_kv = hparams.n_head_kv(il);
-    return model.tensor_split() == nullptr
-        && !hparams.is_recr(il)
+    return !hparams.is_recr(il)
         && n_head % 3 == 0
         && n_head_kv % 3 != 0
         && n_head / n_head_kv == hparams.n_gqa(il)
