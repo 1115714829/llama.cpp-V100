@@ -788,20 +788,20 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
                 /*mask_is_range*/ true,
                 q_pad, kv_len, heads_q, hkv, batch, kv_offset,
                 scale, 1.0f / scale,
-                (int) (row_lo / SM70_D256_BLOCK_M),
-                (int) ((row_lo + win_rows + SM70_D256_BLOCK_M - 1) / SM70_D256_BLOCK_M),
+                (int) (row_lo / SM70_D256_MASK_BLOCK_N),
+                (int) ((row_lo + win_rows + SM70_D256_MASK_BLOCK_N - 1) / SM70_D256_MASK_BLOCK_N),
                 w == 0 ? Os : p_out, w == 0 ? acc_max : p_max, w == 0 ? acc_sum : p_sum,
                 stream);
 
             if (w > 0) {
-                sm70_d256_window_merge_kernel<<<(unsigned) scratch.rows, 256, 0, stream>>>(
+                FLASH_NAMESPACE::sm70_d256_window_merge_kernel<<<(unsigned) scratch.rows, 256, 0, stream>>>(
                     Os, acc_max, acc_sum, p_out, p_max, p_sum,
                     (int64_t) scratch.rows, false, scale * float(M_LOG2E));
                 CUDA_CHECK(cudaGetLastError());
             }
         }
 
-        sm70_d256_window_finalize_kernel<<<(unsigned) scratch.rows, 256, 0, stream>>>(
+        FLASH_NAMESPACE::sm70_d256_window_finalize_kernel<<<(unsigned) scratch.rows, 256, 0, stream>>>(
             Os, acc_sum, Os, (int64_t) scratch.rows);
         CUDA_CHECK(cudaGetLastError());
     } else {
