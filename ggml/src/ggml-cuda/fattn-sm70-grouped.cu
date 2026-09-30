@@ -46,10 +46,27 @@ bool ggml_cuda_flash_attn_ext_sm70_grouped_supported(const ggml_tensor * dst, in
     if (K->ne[2] != V->ne[2]) {
         return false;
     }
-    // Only GQA 2, 4 and 6 are instantiated below.
-    const int gqa = Q->ne[2] / K->ne[2]; // K->ne[2] > 0, checked above
-    if (Q->ne[2] % K->ne[2] != 0 || (gqa != 2 && gqa != 4 && gqa != 6)) {
+    // op_params[5]: 0 = uniform GQA (the original behaviour), > 0 = the local Q head boundary
+    // of the 3-card attention split, < 0 = marker not filled in yet by the split backend.
+    const int32_t q_head_boundary = ggml_get_op_params_i32(dst, 5);
+    if (q_head_boundary < 0) {
         return false;
+    }
+    if (q_head_boundary > 0) {
+        // Non-uniform GQA: two local KV heads, the first g0 local query heads use KV head 0.
+        if (K->ne[2] != 2) {
+            return false;
+        }
+        const int64_t n_heads = Q->ne[2];
+        if (q_head_boundary > 6 || q_head_boundary >= n_heads || n_heads - q_head_boundary > 6) {
+            return false;
+        }
+    } else {
+        // Only GQA 2, 4 and 6 are instantiated below.
+        const int gqa = Q->ne[2] / K->ne[2]; // K->ne[2] > 0, checked above
+        if (Q->ne[2] % K->ne[2] != 0 || (gqa != 2 && gqa != 4 && gqa != 6)) {
+            return false;
+        }
     }
     // single-token decode stays on the vec kernel, which is faster there
     if (Q->ne[1] < 2 || Q->ne[1] > 16) {
@@ -80,12 +97,14 @@ bool ggml_cuda_flash_attn_ext_sm70_grouped_supported(const ggml_tensor * dst, in
     return true;
 }
 
-template <int MAX_QUERY_TOKENS, int HEADS, ggml_type type_K, ggml_type type_V>
+template <int MAX_QUERY_TOKENS, int HEADS, bool NONUNIFORM, ggml_type type_K, ggml_type type_V>
 static void ggml_cuda_flash_attn_ext_sm70_grouped_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
+
+    const int32_t q_head_boundary = NONUNIFORM ? ggml_get_op_params_i32(dst, 5) : 0;
 
     const int n_q        = (int) Q->ne[1];
     const int n_heads    = (int) Q->ne[2];
@@ -115,9 +134,9 @@ static void ggml_cuda_flash_attn_ext_sm70_grouped_launch(ggml_backend_cuda_conte
     const dim3 block_dim(kGroupedVerifyThreads, 1, 1);
     const size_t nbytes_shared = sizeof(GroupedVerifySmem);
 
-    CUDA_SET_SHARED_MEMORY_LIMIT((flash_attn_ext_sm70_grouped<MAX_QUERY_TOKENS, HEADS, type_K, type_V>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((flash_attn_ext_sm70_grouped<MAX_QUERY_TOKENS, HEADS, NONUNIFORM, type_K, type_V>), nbytes_shared);
     const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, nbytes_shared, stream);
-    ggml_cuda_kernel_launch(flash_attn_ext_sm70_grouped<MAX_QUERY_TOKENS, HEADS, type_K, type_V>, launch_params,
+    ggml_cuda_kernel_launch(flash_attn_ext_sm70_grouped<MAX_QUERY_TOKENS, HEADS, NONUNIFORM, type_K, type_V>, launch_params,
         (const char *) Q->data,
         (const char *) K->data,
         (const char *) V->data,
@@ -131,7 +150,8 @@ static void ggml_cuda_flash_attn_ext_sm70_grouped_launch(ggml_backend_cuda_conte
         (int64_t) V->nb[1], (int64_t) V->nb[2], (int64_t) V->nb[3],
         mask ? (int64_t) mask->nb[1] : (int64_t) 0,
         mask ? (int64_t) mask->nb[3] : (int64_t) 0,
-        mask && mask->type == GGML_TYPE_I32 ? 1 : 0);
+        mask && mask->type == GGML_TYPE_I32 ? 1 : 0,
+        q_head_boundary);
 
     const dim3 blocks_num_combine(n_q, n_heads, n_seq);
     const dim3 block_dim_combine(kGroupedVerifyHeadDim, 1, 1);
@@ -143,36 +163,41 @@ static void ggml_cuda_flash_attn_ext_sm70_grouped_launch(ggml_backend_cuda_conte
 }
 
 // The predicate rejects mixed K/V types, so only the matching combinations exist.
-template <int MAX_QUERY_TOKENS, int HEADS>
+template <int MAX_QUERY_TOKENS, int HEADS, bool NONUNIFORM>
 static void ggml_cuda_flash_attn_ext_sm70_grouped_select_kv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * K = dst->src[1];
     if (K->type == GGML_TYPE_F16) {
-        ggml_cuda_flash_attn_ext_sm70_grouped_launch<MAX_QUERY_TOKENS, HEADS, GGML_TYPE_F16, GGML_TYPE_F16>(ctx, dst);
+        ggml_cuda_flash_attn_ext_sm70_grouped_launch<MAX_QUERY_TOKENS, HEADS, NONUNIFORM, GGML_TYPE_F16, GGML_TYPE_F16>(ctx, dst);
     } else if (K->type == GGML_TYPE_Q8_0) {
-        ggml_cuda_flash_attn_ext_sm70_grouped_launch<MAX_QUERY_TOKENS, HEADS, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
+        ggml_cuda_flash_attn_ext_sm70_grouped_launch<MAX_QUERY_TOKENS, HEADS, NONUNIFORM, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
     } else if (K->type == GGML_TYPE_Q4_0) {
-        ggml_cuda_flash_attn_ext_sm70_grouped_launch<MAX_QUERY_TOKENS, HEADS, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0>(ctx, dst);
+        ggml_cuda_flash_attn_ext_sm70_grouped_launch<MAX_QUERY_TOKENS, HEADS, NONUNIFORM, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0>(ctx, dst);
     } else {
         GGML_ABORT("unsupported K/V type combination");
     }
 }
 
-// The predicate only lets GQA 2, 4 and 6 through.
-template <int MAX_QUERY_TOKENS>
+// The predicate only lets GQA 2, 4 and 6 through; a Q head boundary always uses the two-KV-head form.
+template <int MAX_QUERY_TOKENS, bool NONUNIFORM>
 static void ggml_cuda_flash_attn_ext_sm70_grouped_select_heads(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const int gqa = (int) (dst->src[0]->ne[2] / dst->src[1]->ne[2]);
-    switch (gqa) {
-        case 2:
-            ggml_cuda_flash_attn_ext_sm70_grouped_select_kv<MAX_QUERY_TOKENS, 2>(ctx, dst);
-            break;
-        case 4:
-            ggml_cuda_flash_attn_ext_sm70_grouped_select_kv<MAX_QUERY_TOKENS, 4>(ctx, dst);
-            break;
-        case 6:
-            ggml_cuda_flash_attn_ext_sm70_grouped_select_kv<MAX_QUERY_TOKENS, 6>(ctx, dst);
-            break;
-        default:
-            GGML_ABORT("unsupported GQA ratio");
+    if constexpr (NONUNIFORM) {
+        // A Q head boundary always has two local KV heads and fits the HEADS=6 slot layout.
+        ggml_cuda_flash_attn_ext_sm70_grouped_select_kv<MAX_QUERY_TOKENS, 6, true>(ctx, dst);
+    } else {
+        const int gqa = (int) (dst->src[0]->ne[2] / dst->src[1]->ne[2]);
+        switch (gqa) {
+            case 2:
+                ggml_cuda_flash_attn_ext_sm70_grouped_select_kv<MAX_QUERY_TOKENS, 2, false>(ctx, dst);
+                break;
+            case 4:
+                ggml_cuda_flash_attn_ext_sm70_grouped_select_kv<MAX_QUERY_TOKENS, 4, false>(ctx, dst);
+                break;
+            case 6:
+                ggml_cuda_flash_attn_ext_sm70_grouped_select_kv<MAX_QUERY_TOKENS, 6, false>(ctx, dst);
+                break;
+            default:
+                GGML_ABORT("unsupported GQA ratio");
+        }
     }
 }
 
@@ -181,9 +206,18 @@ void ggml_cuda_flash_attn_ext_sm70_grouped(ggml_backend_cuda_context & ctx, ggml
 
     GGML_ASSERT(ggml_cuda_flash_attn_ext_sm70_grouped_supported(dst, ggml_cuda_info().devices[ggml_cuda_get_device()].cc));
 
+    const bool nonuniform = ggml_get_op_params_i32(dst, 5) > 0;
     if (Q->ne[1] <= 8) {
-        ggml_cuda_flash_attn_ext_sm70_grouped_select_heads<8>(ctx, dst);
+        if (nonuniform) {
+            ggml_cuda_flash_attn_ext_sm70_grouped_select_heads<8, true>(ctx, dst);
+        } else {
+            ggml_cuda_flash_attn_ext_sm70_grouped_select_heads<8, false>(ctx, dst);
+        }
     } else {
-        ggml_cuda_flash_attn_ext_sm70_grouped_select_heads<16>(ctx, dst);
+        if (nonuniform) {
+            ggml_cuda_flash_attn_ext_sm70_grouped_select_heads<16, true>(ctx, dst);
+        } else {
+            ggml_cuda_flash_attn_ext_sm70_grouped_select_heads<16, false>(ctx, dst);
+        }
     }
 }

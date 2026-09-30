@@ -658,6 +658,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     const int cc = ggml_cuda_info().devices[device].cc;
 
+    // The non-uniform 3-card head mapping is only implemented by the sm70 grouped kernel.
+    // Never let another kernel treat a marked node as uniform GQA.
+    if (ggml_get_op_params_i32(dst, 5) != 0 && !ggml_cuda_flash_attn_ext_sm70_grouped_supported(dst, cc)) {
+        return BEST_FATTN_KERNEL_NONE; // the caller aborts, see ggml_cuda_flash_attn_ext_impl
+    }
+
     if (dst->src[3] && dst->src[3]->type == GGML_TYPE_I32) {
         // the sm70 kernels read a range mask directly; the others need the dense f16
         // mask it describes, and their selection only inspects the mask layout, so
@@ -956,6 +962,9 @@ static void ggml_cuda_flash_attn_ext_impl(ggml_backend_cuda_context & ctx, ggml_
     ggml_cuda_set_device(ctx.device);
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
+            if (ggml_get_op_params_i32(dst, 5) != 0) {
+                GGML_ABORT("non-uniform flash attention head mapping requires the sm70 grouped kernel\n");
+            }
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:
             ggml_cuda_flash_attn_ext_tile(ctx, dst);
