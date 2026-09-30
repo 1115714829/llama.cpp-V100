@@ -35,6 +35,10 @@ bool ggml_cuda_flash_attn_ext_sm70_grouped_supported(const ggml_tensor * dst, in
             }
         }
     }
+    // Only matching K/V types are instantiated below, so mixed caches take the generic path.
+    if (K->type != V->type) {
+        return false;
+    }
     // Under tensor split a device can get 0 KV heads (fewer KV heads than devices); fall back to the generic path.
     if (K->ne[2] == 0 || Q->ne[2] == 0) {
         return false;
@@ -136,49 +140,29 @@ static void ggml_cuda_flash_attn_ext_sm70_grouped_launch(ggml_backend_cuda_conte
 void ggml_cuda_flash_attn_ext_sm70_grouped(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
-    const ggml_tensor * V = dst->src[2];
 
     GGML_ASSERT(ggml_cuda_flash_attn_ext_sm70_grouped_supported(dst, ggml_cuda_info().devices[ggml_cuda_get_device()].cc));
 
+    // The predicate rejects mixed K/V types, so only the matching combinations exist.
     if (Q->ne[1] <= 8) {
-        if (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) {
-            ggml_cuda_flash_attn_ext_sm70_grouped_launch<8, GGML_TYPE_F16,  GGML_TYPE_F16 >(ctx, dst);
-        } else if (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_Q8_0) {
-            ggml_cuda_flash_attn_ext_sm70_grouped_launch<8, GGML_TYPE_F16,  GGML_TYPE_Q8_0>(ctx, dst);
-        } else if (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_Q4_0) {
-            ggml_cuda_flash_attn_ext_sm70_grouped_launch<8, GGML_TYPE_F16,  GGML_TYPE_Q4_0>(ctx, dst);
-        } else if (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_F16) {
-            ggml_cuda_flash_attn_ext_sm70_grouped_launch<8, GGML_TYPE_Q8_0, GGML_TYPE_F16 >(ctx, dst);
-        } else if (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0) {
-            ggml_cuda_flash_attn_ext_sm70_grouped_launch<8, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0>(ctx, dst);
-        } else if (K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_F16) {
-            ggml_cuda_flash_attn_ext_sm70_grouped_launch<8, GGML_TYPE_Q4_0, GGML_TYPE_F16 >(ctx, dst);
-        } else if (K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q8_0) {
-            ggml_cuda_flash_attn_ext_sm70_grouped_launch<8, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0>(ctx, dst);
-        } else if (K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0) {
+        if (K->type == GGML_TYPE_F16) {
+            ggml_cuda_flash_attn_ext_sm70_grouped_launch<8, GGML_TYPE_F16, GGML_TYPE_F16>(ctx, dst);
+        } else if (K->type == GGML_TYPE_Q8_0) {
+            ggml_cuda_flash_attn_ext_sm70_grouped_launch<8, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
+        } else if (K->type == GGML_TYPE_Q4_0) {
             ggml_cuda_flash_attn_ext_sm70_grouped_launch<8, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0>(ctx, dst);
         } else {
-            ggml_cuda_flash_attn_ext_sm70_grouped_launch<8, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
+            GGML_ABORT("unsupported K/V type combination");
         }
     } else {
-        if (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) {
-            ggml_cuda_flash_attn_ext_sm70_grouped_launch<16, GGML_TYPE_F16,  GGML_TYPE_F16 >(ctx, dst);
-        } else if (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_Q8_0) {
-            ggml_cuda_flash_attn_ext_sm70_grouped_launch<16, GGML_TYPE_F16,  GGML_TYPE_Q8_0>(ctx, dst);
-        } else if (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_Q4_0) {
-            ggml_cuda_flash_attn_ext_sm70_grouped_launch<16, GGML_TYPE_F16,  GGML_TYPE_Q4_0>(ctx, dst);
-        } else if (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_F16) {
-            ggml_cuda_flash_attn_ext_sm70_grouped_launch<16, GGML_TYPE_Q8_0, GGML_TYPE_F16 >(ctx, dst);
-        } else if (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0) {
-            ggml_cuda_flash_attn_ext_sm70_grouped_launch<16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0>(ctx, dst);
-        } else if (K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_F16) {
-            ggml_cuda_flash_attn_ext_sm70_grouped_launch<16, GGML_TYPE_Q4_0, GGML_TYPE_F16 >(ctx, dst);
-        } else if (K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q8_0) {
-            ggml_cuda_flash_attn_ext_sm70_grouped_launch<16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0>(ctx, dst);
-        } else if (K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0) {
+        if (K->type == GGML_TYPE_F16) {
+            ggml_cuda_flash_attn_ext_sm70_grouped_launch<16, GGML_TYPE_F16, GGML_TYPE_F16>(ctx, dst);
+        } else if (K->type == GGML_TYPE_Q8_0) {
+            ggml_cuda_flash_attn_ext_sm70_grouped_launch<16, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
+        } else if (K->type == GGML_TYPE_Q4_0) {
             ggml_cuda_flash_attn_ext_sm70_grouped_launch<16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0>(ctx, dst);
         } else {
-            ggml_cuda_flash_attn_ext_sm70_grouped_launch<16, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
+            GGML_ABORT("unsupported K/V type combination");
         }
     }
 }

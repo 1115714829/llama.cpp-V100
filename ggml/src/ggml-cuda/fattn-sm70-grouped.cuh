@@ -231,8 +231,10 @@ __device__ __forceinline__ float warp_reduce_max(float val) {
 }
 
 // One raw KV tile held in registers between the global load and the shared write,
-// so the global latency of tile i+1 hides behind the compute of tile i. Each warp
-// owns a contiguous row block of the staging buffer, see kGroupedVerifyStageRowsPerWarp.
+// so the global latency of tile i+1 hides behind the compute of tile i. A q4_0 tile
+// needs only 2 uint4 per thread, so two tiles fit the register budget, see
+// kPrefetchTiles. Each warp owns a contiguous row block of the staging buffer, see
+// kGroupedVerifyStageRowsPerWarp.
 template <ggml_type type_KV>
 struct GroupedVerifyKVRegs {
     static constexpr int kRowBytes  = type_KV == GGML_TYPE_F16  ? kGroupedVerifyHeadDim * (int) sizeof(__half)
@@ -240,7 +242,9 @@ struct GroupedVerifyKVRegs {
                                                                  : kGroupedVerifyKVQ8RowBytes;
     static constexpr int kVecsPerRow  = kRowBytes / 16;
     static constexpr int kVecsPerWarp = kGroupedVerifyStageRowsPerWarp * kVecsPerRow;
-    static constexpr int kVecsPerThread = (kVecsPerWarp + WARP_SIZE - 1) / WARP_SIZE;
+    static constexpr int kVecsPerTile = (kVecsPerWarp + WARP_SIZE - 1) / WARP_SIZE;
+    static constexpr int kPrefetchTiles = type_KV == GGML_TYPE_Q4_0 ? 2 : 1;
+    static constexpr int kVecsPerThread = kPrefetchTiles * kVecsPerTile;
     static_assert(kVecsPerThread <= 4, "the prefetch must stay small");
     uint4 vec[kVecsPerThread];
 };
@@ -270,22 +274,24 @@ __device__ __forceinline__ uint32_t grouped_verify_half2_uint(const __half2 h) {
     return u;
 }
 
-// Issue the global loads for the staging rows of this warp. Rows with kv_idx >= n_kv load as zero.
+// Issue the global loads for the staging rows of this warp into the register slot of
+// one tile. Rows with kv_idx >= n_kv load as zero.
 template <ggml_type type_KV>
 __device__ __forceinline__ void flash_attn_sm70_grouped_prefetch_kv(
         GroupedVerifyKVRegs<type_KV> & regs,
         const char * __restrict__ KV, const int64_t nb11, const int64_t nb12, const int64_t nb13,
-        const int seq, const int kv_head, const int tile_start, const int n_kv) {
+        const int seq, const int kv_head, const int tile_start, const int n_kv, const int tile) {
     static_assert(type_KV == GGML_TYPE_F16 || type_KV == GGML_TYPE_Q8_0 || type_KV == GGML_TYPE_Q4_0,
                   "unsupported KV type");
     constexpr int kVecsPerRow  = GroupedVerifyKVRegs<type_KV>::kVecsPerRow;
     constexpr int kVecsPerWarp = GroupedVerifyKVRegs<type_KV>::kVecsPerWarp;
+    constexpr int kVecsPerTile = GroupedVerifyKVRegs<type_KV>::kVecsPerTile;
     const int warp_id  = threadIdx.x / WARP_SIZE;
     const int lane_id  = threadIdx.x % WARP_SIZE;
     const int row_base = warp_id * kGroupedVerifyStageRowsPerWarp;
     const char * tile_base = KV + int64_t(tile_start)*nb11 + kv_head*nb12 + int64_t(seq)*nb13;
 #pragma unroll
-    for (int i = 0; i < GroupedVerifyKVRegs<type_KV>::kVecsPerThread; ++i) {
+    for (int i = 0; i < kVecsPerTile; ++i) {
         const int idx = lane_id + i * WARP_SIZE;
         if (idx >= kVecsPerWarp) {
             continue;
@@ -293,9 +299,9 @@ __device__ __forceinline__ void flash_attn_sm70_grouped_prefetch_kv(
         const int row     = row_base + idx / kVecsPerRow;
         const int vec_col = idx % kVecsPerRow;
         if (tile_start + row < n_kv) {
-            regs.vec[i] = __ldg(reinterpret_cast<const uint4 *>(tile_base + row*nb11 + vec_col*16));
+            regs.vec[tile * kVecsPerTile + i] = __ldg(reinterpret_cast<const uint4 *>(tile_base + row*nb11 + vec_col*16));
         } else {
-            regs.vec[i] = make_uint4(0, 0, 0, 0);
+            regs.vec[tile * kVecsPerTile + i] = make_uint4(0, 0, 0, 0);
         }
     }
 }
@@ -303,15 +309,16 @@ __device__ __forceinline__ void flash_attn_sm70_grouped_prefetch_kv(
 // fp16 tiles go straight into the half panel, quantized (q8_0/q4_0) tiles into the raw staging buffer.
 template <ggml_type type_KV>
 __device__ __forceinline__ void flash_attn_sm70_grouped_store_kv(
-        __half * shared_kv, uint8_t * kv_stage, const GroupedVerifyKVRegs<type_KV> & regs) {
+        __half * shared_kv, uint8_t * kv_stage, const GroupedVerifyKVRegs<type_KV> & regs, const int tile) {
     constexpr int kVecsPerRow  = GroupedVerifyKVRegs<type_KV>::kVecsPerRow;
     constexpr int kVecsPerWarp = GroupedVerifyKVRegs<type_KV>::kVecsPerWarp;
+    constexpr int kVecsPerTile = GroupedVerifyKVRegs<type_KV>::kVecsPerTile;
     constexpr int kSharedStrideVec = kGroupedVerifyKVStride / 8;
     const int warp_id  = threadIdx.x / WARP_SIZE;
     const int lane_id  = threadIdx.x % WARP_SIZE;
     const int row_base = warp_id * kGroupedVerifyStageRowsPerWarp;
 #pragma unroll
-    for (int i = 0; i < GroupedVerifyKVRegs<type_KV>::kVecsPerThread; ++i) {
+    for (int i = 0; i < kVecsPerTile; ++i) {
         const int idx = lane_id + i * WARP_SIZE;
         if (idx >= kVecsPerWarp) {
             continue;
@@ -319,9 +326,9 @@ __device__ __forceinline__ void flash_attn_sm70_grouped_store_kv(
         const int row     = row_base + idx / kVecsPerRow;
         const int vec_col = idx % kVecsPerRow;
         if constexpr (type_KV == GGML_TYPE_F16) {
-            reinterpret_cast<uint4 *>(shared_kv)[row * kSharedStrideVec + vec_col] = regs.vec[i];
+            reinterpret_cast<uint4 *>(shared_kv)[row * kSharedStrideVec + vec_col] = regs.vec[tile * kVecsPerTile + i];
         } else {
-            reinterpret_cast<uint4 *>(kv_stage)[row * kVecsPerRow + vec_col] = regs.vec[i];
+            reinterpret_cast<uint4 *>(kv_stage)[row * kVecsPerRow + vec_col] = regs.vec[tile * kVecsPerTile + i];
         }
     }
 }
@@ -618,41 +625,55 @@ static __global__ void flash_attn_ext_sm70_grouped(
 
     // Tile i+1 is fetched into registers while tile i is computed. The staging rows of
     // this warp are private, so a block wide fence is only needed around the panel.
+    // Two q4_0 tiles fit the register array: while tile t is computed, tile t+1 sits in
+    // the other slot and the load of t+2 goes into the slot just consumed by t. The
+    // other types keep one tile in flight.
+    constexpr bool kPrefetchTwoTiles = type_K == GGML_TYPE_Q4_0 && type_V == GGML_TYPE_Q4_0;
+    constexpr int  kPrefetchAhead    = kPrefetchTwoTiles ? 2 : 1;
     GroupedVerifyKVRegs<type_K> k_regs;
     GroupedVerifyKVRegs<type_V> v_regs;
     if (split_start < split_end) {
         flash_attn_sm70_grouped_prefetch_kv<type_K>(
-            k_regs, K, nb11, nb12, nb13, seq, kv_head, split_start, n_kv);
+            k_regs, K, nb11, nb12, nb13, seq, kv_head, split_start, n_kv, 0);
         flash_attn_sm70_grouped_prefetch_kv<type_V>(
-            v_regs, V, nb21, nb22, nb23, seq, kv_head, split_start, n_kv);
+            v_regs, V, nb21, nb22, nb23, seq, kv_head, split_start, n_kv, 0);
+        if constexpr (kPrefetchTwoTiles) {
+            if (split_start + kGroupedVerifyBlockN < split_end) {
+                flash_attn_sm70_grouped_prefetch_kv<type_K>(
+                    k_regs, K, nb11, nb12, nb13, seq, kv_head, split_start + kGroupedVerifyBlockN, n_kv, 1);
+                flash_attn_sm70_grouped_prefetch_kv<type_V>(
+                    v_regs, V, nb21, nb22, nb23, seq, kv_head, split_start + kGroupedVerifyBlockN, n_kv, 1);
+            }
+        }
     }
 
     for (int tile_start = split_start; tile_start < split_end; tile_start += kGroupedVerifyBlockN) {
-        const bool has_next = tile_start + kGroupedVerifyBlockN < split_end;
+        const bool has_prefetch = tile_start + kPrefetchAhead * kGroupedVerifyBlockN < split_end;
+        const int  tile_slot    = kPrefetchTwoTiles ? ((tile_start - split_start) / kGroupedVerifyBlockN) & 1 : 0;
 
         if constexpr (type_K == GGML_TYPE_F16) {
             __syncthreads(); // the previous P x V must be done reading the panel
-            flash_attn_sm70_grouped_store_kv<type_K>(shared_kv, kv_stage, k_regs);
+            flash_attn_sm70_grouped_store_kv<type_K>(shared_kv, kv_stage, k_regs, tile_slot);
             __syncthreads();
         } else {
-            flash_attn_sm70_grouped_store_kv<type_K>(shared_kv, kv_stage, k_regs);
+            flash_attn_sm70_grouped_store_kv<type_K>(shared_kv, kv_stage, k_regs, tile_slot);
             __syncthreads(); // the previous P x V must be done reading the panel
             flash_attn_sm70_grouped_dequant_kv<type_K>(shared_kv, kv_stage);
             __syncthreads();
         }
 
-        if (has_next) {
+        if (has_prefetch) {
             flash_attn_sm70_grouped_prefetch_kv<type_K>(
-                k_regs, K, nb11, nb12, nb13, seq, kv_head, tile_start + kGroupedVerifyBlockN, n_kv);
+                k_regs, K, nb11, nb12, nb13, seq, kv_head, tile_start + kPrefetchAhead * kGroupedVerifyBlockN, n_kv, tile_slot);
         }
         if constexpr (type_V != GGML_TYPE_F16) {
             // The staging buffer is free again once the K dequantize is done. For a
             // quantized V the raw tile waits there until the K panel dies after QK.
             // The next V tile starts loading right away so its latency hides behind QK.
-            flash_attn_sm70_grouped_store_kv<type_V>(shared_kv, kv_stage, v_regs);
-            if (has_next) {
+            flash_attn_sm70_grouped_store_kv<type_V>(shared_kv, kv_stage, v_regs, tile_slot);
+            if (has_prefetch) {
                 flash_attn_sm70_grouped_prefetch_kv<type_V>(
-                    v_regs, V, nb21, nb22, nb23, seq, kv_head, tile_start + kGroupedVerifyBlockN, n_kv);
+                    v_regs, V, nb21, nb22, nb23, seq, kv_head, tile_start + kPrefetchAhead * kGroupedVerifyBlockN, n_kv, tile_slot);
             }
         }
 
@@ -674,10 +695,10 @@ static __global__ void flash_attn_ext_sm70_grouped(
         if constexpr (type_V == GGML_TYPE_F16) {
             // The panel is free now; fp16 V goes straight into it. The next V tile
             // starts loading right away so its latency hides behind softmax and P x V.
-            flash_attn_sm70_grouped_store_kv<type_V>(shared_kv, kv_stage, v_regs);
-            if (has_next) {
+            flash_attn_sm70_grouped_store_kv<type_V>(shared_kv, kv_stage, v_regs, tile_slot);
+            if (has_prefetch) {
                 flash_attn_sm70_grouped_prefetch_kv<type_V>(
-                    v_regs, V, nb21, nb22, nb23, seq, kv_head, tile_start + kGroupedVerifyBlockN, n_kv);
+                    v_regs, V, nb21, nb22, nb23, seq, kv_head, tile_start + kPrefetchAhead * kGroupedVerifyBlockN, n_kv, tile_slot);
             }
         }
 
