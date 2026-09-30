@@ -580,6 +580,76 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
     }
 }
 
+// On Volta the MMA kernel has no device code for fewer than 32 columns and the dynamic shared
+// memory of wide tiles can exceed the device limit. Check the variant the MMA dispatch would pick
+// so that the kernel selection can fall back to the tile kernel instead of failing to launch.
+static bool ggml_cuda_flash_attn_ext_mma_f16_volta_fits(const int device, const ggml_tensor * dst) {
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    const int cc  = ggml_cuda_info().devices[device].cc;
+    const int DKQ = (int) K->ne[0];
+    const int DV  = (int) V->ne[0];
+
+    GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
+    const int gqa_ratio = Q->ne[2] / K->ne[2];
+
+    float max_bias = 0.0f;
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+
+    // Mirrors the ncols2 selection of ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2 and the
+    // special cases of ggml_cuda_flash_attn_ext_mma_f16.
+    int ncols2;
+    if (DKQ == 192) {
+        ncols2 = gqa_ratio % 16 == 0 ? 16 : 8;
+    } else if (DKQ == 320) {
+        ncols2 = 32;
+    } else if (DKQ == 576) {
+        ncols2 = gqa_ratio == 20 ? 4 : (gqa_ratio % 16 == 0 ? 16 : 4);
+    } else {
+        bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+        for (const ggml_tensor * t : {Q, K, V, mask}) {
+            if (t == nullptr || ggml_is_quantized(t->type)) {
+                continue;
+            }
+            for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
+                if (t->nb[i] % 16 != 0) {
+                    use_gqa_opt = false;
+                    break;
+                }
+            }
+        }
+        if (use_gqa_opt && gqa_ratio % 8 == 0) {
+            ncols2 = 8;
+        } else if (use_gqa_opt && gqa_ratio % 4 == 0) {
+            ncols2 = 4;
+        } else if (DKQ <= 256) {
+            ncols2 = use_gqa_opt && gqa_ratio % 2 == 0 ? 2 : 1;
+        } else {
+            return false;
+        }
+    }
+
+    // Mirrors the ncols1 selection of ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1 on Volta.
+    int ncols1;
+    if (ncols2 <= 16 && Q->ne[1] <= 16/ncols2) {
+        ncols1 = 16/ncols2;
+    } else if (Q->ne[1] <= 32/ncols2) {
+        ncols1 = 32/ncols2;
+    } else {
+        ncols1 = 64/ncols2;
+    }
+
+    if (ncols1*ncols2 < 32) {
+        return false;
+    }
+
+    return ggml_cuda_fattn_mma_get_nbytes_shared(DKQ, DV, ncols1, ncols2, cc, 32) <=
+        ggml_cuda_info().devices[device].smpbo;
+}
+
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
@@ -747,8 +817,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
             return BEST_FATTN_KERNEL_VEC;
         }
-        if (Q->ne[1] * gqa_ratio_eff <= 16) {
-            return BEST_FATTN_KERNEL_TILE; // On Volta tensor cores are only faster for sufficiently large matrices.
+        // On Volta tensor cores are only faster for sufficiently large matrices, and the variants
+        // that are too narrow or need too much shared memory are not usable on Volta
+        // (see ggml_cuda_flash_attn_ext_mma_f16_volta_fits).
+        if (Q->ne[1] * gqa_ratio_eff <= 16 || !ggml_cuda_flash_attn_ext_mma_f16_volta_fits(device, dst)) {
+            // The tile kernel is the only fallback and for 576/512 it exists only for GQA ratios that are a multiple of 4.
+            if (K->ne[0] == 576 && gqa_ratio % 4 != 0) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
+            return BEST_FATTN_KERNEL_TILE;
         }
         return BEST_FATTN_KERNEL_MMA_F16;
     }
