@@ -328,18 +328,13 @@ __device__ __forceinline__ void flash_attn_sm70_grouped_store_kv(
 
 // Dequantize a staged quantized tile into the half panel. No-op for fp16, which is stored there directly.
 // Only the staging rows of this warp are read back, see kGroupedVerifyStageRowsPerWarp.
-// A q8_0 item covers half a block (16 values, two uint4 panel writes). The code bytes of half h
-// start at base + 2 + h, with base = row * 272 + blk * 34 and h in {0, 16}. base is 4 B aligned
-// for even blk and 2 B aligned for odd blk, so odd blocks load the 4 code words as 4 u32 directly,
-// while even blocks read 5 aligned u32 starting 2 B early and funnel-shift each neighbor pair into
-// one code word. The 5th load stays inside the row for even blk (base + h + 20 <= row * 272 + 240).
 template <ggml_type type_KV>
 __device__ __forceinline__ void flash_attn_sm70_grouped_dequant_kv(
         __half * shared_kv, const uint8_t * kv_stage) {
     if constexpr (type_KV == GGML_TYPE_F16) {
         return;
     }
-    constexpr int kColsPerItem = type_KV == GGML_TYPE_Q8_0 ? 16 : 8;
+    constexpr int kColsPerItem = 8;
     constexpr int kGroupsPerRow = kGroupedVerifyHeadDim / kColsPerItem;
     constexpr int kItemsPerWarp = kGroupedVerifyStageRowsPerWarp * kGroupsPerRow;
     constexpr int kBlockBytes   = type_KV == GGML_TYPE_Q4_0 ? 18 : 34;
@@ -356,7 +351,7 @@ __device__ __forceinline__ void flash_attn_sm70_grouped_dequant_kv(
         const int base = row * kRowBytes + blk * kBlockBytes;
         const __half d = *reinterpret_cast<const __half *>(kv_stage + base);
         const __half2 d2 = __half2half2(d);
-        __half * out_ptr = reinterpret_cast<__half *>(shared_kv + row * kGroupedVerifyKVStride) + c;
+        uint4 out;
         if constexpr (type_KV == GGML_TYPE_Q4_0) {
             // 8 columns = 8 values of one nibble half; codes are 8 consecutive bytes.
             // The 18 B block makes qs only 2 B aligned, so assemble each u32 code word
@@ -367,42 +362,20 @@ __device__ __forceinline__ void flash_attn_sm70_grouped_dequant_kv(
             const uint32_t w1 = (uint32_t) *reinterpret_cast<const uint16_t *>(codes + 4)
                               | (uint32_t) *reinterpret_cast<const uint16_t *>(codes + 6) << 16;
             const bool hi_half = (c % 32) >= 16;
-            uint4 out;
             out.x = grouped_verify_half2_uint(grouped_verify_q4_pair_half2(w0,      hi_half, d2));
             out.y = grouped_verify_half2_uint(grouped_verify_q4_pair_half2(w0 >> 16, hi_half, d2));
             out.z = grouped_verify_half2_uint(grouped_verify_q4_pair_half2(w1,      hi_half, d2));
             out.w = grouped_verify_half2_uint(grouped_verify_q4_pair_half2(w1 >> 16, hi_half, d2));
-            *reinterpret_cast<uint4 *>(out_ptr) = out;
         } else {
-            // 16 columns = 16 code bytes, see the alignment note above.
-            const int h = c & 16;
-            uint32_t w0, w1, w2, w3;
-            if (blk & 1) {
-                const uint32_t * codes = reinterpret_cast<const uint32_t *>(kv_stage + base + 2 + h);
-                w0 = codes[0];
-                w1 = codes[1];
-                w2 = codes[2];
-                w3 = codes[3];
-            } else {
-                const uint32_t * u = reinterpret_cast<const uint32_t *>(kv_stage + base + h);
-                w0 = __funnelshift_r(u[0], u[1], 16);
-                w1 = __funnelshift_r(u[1], u[2], 16);
-                w2 = __funnelshift_r(u[2], u[3], 16);
-                w3 = __funnelshift_r(u[3], u[4], 16);
-            }
-            uint4 out0;
-            out0.x = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(w0,      d2));
-            out0.y = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(w0 >> 16, d2));
-            out0.z = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(w1,      d2));
-            out0.w = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(w1 >> 16, d2));
-            uint4 out1;
-            out1.x = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(w2,      d2));
-            out1.y = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(w2 >> 16, d2));
-            out1.z = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(w3,      d2));
-            out1.w = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(w3 >> 16, d2));
-            *reinterpret_cast<uint4 *>(out_ptr)     = out0;
-            *reinterpret_cast<uint4 *>(out_ptr + 8) = out1;
+            // 8 columns = 16 B, and base + 2 + (c % 32) is even, so use u16 loads and one uint4 store.
+            const uint16_t * packed = reinterpret_cast<const uint16_t *>(kv_stage + base + 2 + (c % 32));
+            out.x = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(packed[0], d2));
+            out.y = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(packed[1], d2));
+            out.z = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(packed[2], d2));
+            out.w = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(packed[3], d2));
         }
+        __half * out_ptr = reinterpret_cast<__half *>(shared_kv + row * kGroupedVerifyKVStride) + c;
+        *reinterpret_cast<uint4 *>(out_ptr) = out;
     }
 }
 
