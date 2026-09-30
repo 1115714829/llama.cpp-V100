@@ -17,9 +17,9 @@
 // graph per rank and replays the graph, which removes the host launch overhead
 // and the rank-to-rank skew from the per-call time.
 //
-// With 6 devices whose topology splits into two cliques the default comm
-// picks the hierarchical 3+3 kernel; to time the flat one against it, run
-// this test built against the older library.
+// With 5 or 6 devices whose topology splits into two cliques the default comm
+// picks the hierarchical 3+2 or 3+3 kernel; to time the flat one against it,
+// run this test built against the older library.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -352,11 +352,11 @@ static double ar_median_us(const ar_test & t, void * comm,
     return samples[samples.size() / 2];
 }
 
-// On 6 devices whose topology splits into two cliques the default comm picks
-// the hierarchical 3+3 kernel; the flat one is timed by running this test
-// built against the older library. Shapes are the decode sizes of the
-// tensor-parallel graph: [5120,8] and [5120,1] f32.
-static bool run_six_rank_default(ar_test & t) {
+// On 5 or 6 devices whose topology splits into two cliques the default comm
+// picks the hierarchical 3+2 or 3+3 kernel; the flat one is timed by running
+// this test built against the older library. Shapes are the decode sizes of
+// the tensor-parallel graph: [5120,8] and [5120,1] f32.
+static bool run_hier_rank_default(ar_test & t, const char * phase) {
     const int64_t sizes[] = { 5120 * 8, 5120 };
     const char * labels[] = { "5120x8", "5120x1" };
 
@@ -364,7 +364,7 @@ static bool run_six_rank_default(ar_test & t) {
     for (int s = 0; s < 2; ++s) {
         std::vector<bool> compute(t.n, true);
         const uint32_t seed = 0x6100u + (uint32_t) s;
-        if (!run_case(t, t.comm_allreduce, false, sizes[s], compute, seed, "six-default")) {
+        if (!run_case(t, t.comm_allreduce, false, sizes[s], compute, seed, phase)) {
             ok = false;
         }
     }
@@ -375,10 +375,10 @@ static bool run_six_rank_default(ar_test & t) {
             ok = false;
             continue;
         }
-        printf("six-default %s ne=%lld median_us=%.2f\n", labels[s], (long long) sizes[s], us);
+        printf("%s %s ne=%lld median_us=%.2f\n", phase, labels[s], (long long) sizes[s], us);
     }
 
-    printf("six-default: %s\n", ok ? "OK" : "FAILED");
+    printf("%s: %s\n", phase, ok ? "OK" : "FAILED");
     return ok;
 }
 
@@ -751,7 +751,10 @@ int main() {
         if (t.comm_allreduce_exact != nullptr) {
             run_timing(t, t.comm_allreduce_exact, "exact proc");
         }
-        if (n == 6 && !run_six_rank_default(t)) {
+        if (n == 5 && !run_hier_rank_default(t, "five-default")) {
+            n_failed++;
+        }
+        if (n == 6 && !run_hier_rank_default(t, "six-default")) {
             n_failed++;
         }
         if (!run_chain_timing(t, false)) {
