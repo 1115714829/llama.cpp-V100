@@ -29,7 +29,7 @@ Thanks also to:
 
 ## Introduction
 
-Based on llama.cpp (master `08618ff8e` as of 2026-09-26, already includes upstream v0.5.0). For the provenance and license of some code, see the file headers and the `licenses/` directory.
+Based on llama.cpp (master `08618ff8e` as of 2026-09-26, already includes upstream v0.5.0). Some SM70 compute kernels are ported from 1Cat-vLLM; see the file headers and the `licenses/` directory for provenance and license.
 
 The test data below all uses Qwen3.8-27B (Q8_0) with DFlash2 speculative decoding.
 
@@ -453,4 +453,4 @@ Thanks to all the projects and participants above.
 
 ## License
 
-Inherits the MIT license of llama.cpp (see `LICENSE`). Some code keeps its original license; see the file headers and the `licenses/` directory for provenance and license.
+Inherits the MIT license of llama.cpp (see `LICENSE`). Ported code keeps its original license; see the file headers for provenance and license.
