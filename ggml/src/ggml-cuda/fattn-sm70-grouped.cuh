@@ -327,6 +327,21 @@ __device__ __forceinline__ void flash_attn_sm70_grouped_store_kv(
         const int vec_col = idx % kVecsPerRow;
         if constexpr (type_KV == GGML_TYPE_F16) {
             reinterpret_cast<uint4 *>(shared_kv)[row * kSharedStrideVec + vec_col] = regs.vec[tile * kVecsPerTile + i];
+        } else if constexpr (type_KV == GGML_TYPE_Q8_0) {
+            // Split the 16 B vector into the two q8_0 planes: the 2 B scales go to
+            // byte 256 + blk*2 of the row, the 32 B code groups to byte blk*32.
+            // Every raw row field starts at an even byte, so the source reads as 8 u16
+            // (taken with shifts, the vector stays in registers).
+            const uint4 v = regs.vec[tile * kVecsPerTile + i];
+            const uint32_t w[4] = { v.x, v.y, v.z, v.w };
+            uint16_t * dst = reinterpret_cast<uint16_t *>(kv_stage + row * kGroupedVerifyKVQ8RowBytes);
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                const int b   = 16 * vec_col + 2 * k;
+                const int blk = b / 34;
+                const int off = b % 34;
+                dst[(off == 0 ? 256 + blk * 2 : blk * 32 + off - 2) / 2] = (uint16_t) (w[k / 2] >> (16 * (k % 2)));
+            }
         } else {
             reinterpret_cast<uint4 *>(kv_stage)[row * kVecsPerRow + vec_col] = regs.vec[tile * kVecsPerTile + i];
         }
@@ -355,11 +370,11 @@ __device__ __forceinline__ void flash_attn_sm70_grouped_dequant_kv(
         const int row = row_base + idx / kGroupsPerRow;
         const int c   = (idx % kGroupsPerRow) * kColsPerItem;
         const int blk = c / 32;
-        const int base = row * kRowBytes + blk * kBlockBytes;
-        const __half d = *reinterpret_cast<const __half *>(kv_stage + base);
-        const __half2 d2 = __half2half2(d);
         uint4 out;
         if constexpr (type_KV == GGML_TYPE_Q4_0) {
+            const int base = row * kRowBytes + blk * kBlockBytes;
+            const __half d = *reinterpret_cast<const __half *>(kv_stage + base);
+            const __half2 d2 = __half2half2(d);
             // 8 columns = 8 values of one nibble half; codes are 8 consecutive bytes.
             // The 18 B block makes qs only 2 B aligned, so assemble each u32 code word
             // from two u16 loads and shift the nibbles out.
@@ -374,12 +389,16 @@ __device__ __forceinline__ void flash_attn_sm70_grouped_dequant_kv(
             out.z = grouped_verify_half2_uint(grouped_verify_q4_pair_half2(w1,      hi_half, d2));
             out.w = grouped_verify_half2_uint(grouped_verify_q4_pair_half2(w1 >> 16, hi_half, d2));
         } else {
-            // 8 columns = 16 B, and base + 2 + (c % 32) is even, so use u16 loads and one uint4 store.
-            const uint16_t * packed = reinterpret_cast<const uint16_t *>(kv_stage + base + 2 + (c % 32));
-            out.x = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(packed[0], d2));
-            out.y = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(packed[1], d2));
-            out.z = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(packed[2], d2));
-            out.w = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(packed[3], d2));
+            // The q8_0 scale sits in the 16 B scale plane, the codes in the 256 B code
+            // plane. 8 columns = 8 code bytes, and (c % 32) is a multiple of 8, so one
+            // aligned uint2 covers them.
+            const uint8_t * row_stage = kv_stage + row * kGroupedVerifyKVQ8RowBytes;
+            const __half2 d2 = __half2half2(*reinterpret_cast<const __half *>(row_stage + 256 + blk * 2));
+            const uint2 code = *reinterpret_cast<const uint2 *>(row_stage + blk * 32 + (c % 32));
+            out.x = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(code.x,       d2));
+            out.y = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(code.x >> 16, d2));
+            out.z = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(code.y,       d2));
+            out.w = grouped_verify_half2_uint(grouped_verify_q8_pair_half2(code.y >> 16, d2));
         }
         __half * out_ptr = reinterpret_cast<__half *>(shared_kv + row * kGroupedVerifyKVStride) + c;
         *reinterpret_cast<uint4 *>(out_ptr) = out;
