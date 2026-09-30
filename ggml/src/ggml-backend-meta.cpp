@@ -701,7 +701,9 @@ static ggml_backend_meta_split_state ggml_backend_meta_map_has_off_state(
     // after the source view's own local offset.
     const bool is_view = tensor->op == GGML_OP_VIEW && tensor->view_src != nullptr &&
                          (tensor->view_src == src || src->view_src == tensor->view_src);
-    const bool chained = is_view && tensor->view_src != src;
+    // Any view-like op (view, permute, reshape of a view) whose source is itself a view shares the
+    // source's base: its per-device data sits after the source's own local offset.
+    const bool chained = tensor->view_src != nullptr && tensor->view_src != src && src->view_src == tensor->view_src;
     const size_t view_offs_rel = chained ? tensor->view_offs - src->view_offs : tensor->view_offs;
     auto src_local = [&](size_t j) -> size_t {
         return chained ? ggml_backend_meta_get_split_state_local_offs(src, j) : 0;
