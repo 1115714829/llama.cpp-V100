@@ -1787,7 +1787,18 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         simple_tensors.push_back(t_ij);
     }
 
-    // If one of the sources has a zero-sized slice, disable the computation:
+    // If one of the sources has a zero-sized slice, disable the computation. A concatenation still
+    // produces the other source's slice (the 3-card attention concatenates per-device head windows,
+    // most of them empty on a given device), so it is only skipped where its own slice is empty.
+    if (tensor->op == GGML_OP_CONCAT) {
+        for (size_t j = 0; j < n_simple_bufs; j++) {
+            if (ggml_nelements(simple_tensors[j]) == 0) {
+                simple_tensors[j]->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
+            }
+        }
+        stc.simple_tensors.insert_or_assign(tensor, std::move(simple_tensors));
+        return GGML_STATUS_SUCCESS;
+    }
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         if (tensor->src[i] == nullptr || !ggml_backend_buffer_is_meta(tensor->src[i]->buffer)) {
             continue;
