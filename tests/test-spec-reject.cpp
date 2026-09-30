@@ -273,8 +273,9 @@ static void test_sparse_penalty_draft_in_window() {
         row[id].logit = 9.0f - 0.1f * id;
     }
 
-    // the penalty window holds last_n distinct tokens below the raw top-k, none of them is draft0
-    for (llama_token id = 100; id < 100 + last_n; ++id) {
+    // the penalty window holds last_n - 1 distinct tokens below the raw top-k, none of them is
+    // draft0; accepting draft0 then fills the window without pushing an older token out of it
+    for (llama_token id = 100; id < 100 + last_n - 1; ++id) {
         row[id].logit = 7.0f - 0.01f * (id - 100);
     }
 
@@ -287,7 +288,7 @@ static void test_sparse_penalty_draft_in_window() {
     llama_sampler_chain_add(chain, llama_sampler_init_penalties(n_vocab, last_n, 1.0f, freq, present));
     llama_sampler_chain_add(chain, llama_sampler_init_top_k(top_k));
 
-    for (llama_token id = 100; id < 100 + last_n; ++id) {
+    for (llama_token id = 100; id < 100 + last_n - 1; ++id) {
         llama_sampler_accept(chain, id);
     }
 
