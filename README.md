@@ -29,7 +29,7 @@
 
 ## 简介
 
-基于 llama.cpp（2026-09-26 的 master `08618ff8e`，已包含上游 v0.5.0）修改。部分代码的出处与许可见各文件头和 `licenses/` 目录。
+基于 llama.cpp（2026-09-26 的 master `08618ff8e`，已包含上游 v0.5.0）修改。部分 SM70 计算内核移植自 1Cat-vLLM，出处与许可见各文件头和 `licenses/` 目录。
 
 下面的测试数据都用 Qwen3.8-27B（Q8_0）配合 DFlash2 投机解码。
 
@@ -453,4 +453,4 @@ CUDA_VISIBLE_DEVICES=0,1 numactl --membind=0,8 ./build/bin/llama-server \
 
 ## 许可
 
-继承 llama.cpp 的 MIT 许可（见 `LICENSE`）。部分代码保留原许可，出处与许可见各文件头和 `licenses/` 目录。
+继承 llama.cpp 的 MIT 许可（见 `LICENSE`）。移植的代码保留原许可，出处与许可见各文件头。
