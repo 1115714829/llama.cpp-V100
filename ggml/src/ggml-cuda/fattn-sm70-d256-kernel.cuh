@@ -25,7 +25,7 @@
 // The verified compute core is UNMODIFIED: SmemLayout (pitch-68 K / TT swizzled
 // V), HMMA.884 QK+PV atoms, the K ping-pong double buffer (V is staged in two
 // rounds per block), online softmax with row_scale_exchange and the
-// __launch_bounds__(256,1) smem budget (kSmemBytes==50048; the ~253-255
+// __launch_bounds__(256,1) smem budget (kSmemBytes==45568; the ~253-255
 // registers still cap the kernel at 1 CTA/SM).
 // Deviations from upstream, all required for llama.cpp semantics:
 //  * the causal Mask is replaced by a range mask (col >= kv_len -> -inf): the
@@ -154,29 +154,26 @@ struct Sm70D256SplitDTraitsT {
     static constexpr int kQElements = size(SmemLayoutQ{});
     static constexpr int kKVElements = size(SmemLayoutKV{});
     static_assert(size(SmemLayoutV{}) == kKVElements);
-    static constexpr int kPElements = size(SmemLayoutP{});
-    static constexpr int kExchangeRows = kMmaGroups * kGroupRows;
-    static constexpr int kExchangeBytes = 2 * kExchangeRows * sizeof(float);
-    static constexpr int kExchangeElements = kExchangeBytes / sizeof(Element);
-    // K stage 0 aliases the first V tile: its last reader is the chunk-2 gemm,
-    // and the barrier after that gemm's copy orders every V store after it.
-    // K stage 1 sits past P and the exchange region: with the alias removed, P
-    // can be staged before the single exchange/P barrier without racing the
-    // chunk-3 gemm that reads stage 1. 2240 elements = 4480 B = 35 x 128 B
-    // keeps both stages on the same 128-byte bank phase.
+    // The second K stage is live only before P is materialized, so it may
+    // alias the beginning of the later P region. Keep the K stages disjoint
+    // and on the same 128-byte bank phase without moving the V/P regions.
+    // 2240 elements = 4480 B = 35 x 128 B.
     static constexpr int kKStageElements = 2240;
     static_assert(kKStageElements >= cosize(SmemLayoutK{}));
-    static constexpr int kKStage1Offset =
-        2 * kKVElements + kPElements + kExchangeElements;
-    static_assert(kKStage1Offset * sizeof(Element) % 128 == 0);
-    static constexpr int kKVRegionElements = kKStage1Offset + kKStageElements;
-    static constexpr int kSmemBytes =
-        (kQElements + kKVRegionElements) * sizeof(Element);
+    static_assert(kKStageElements + cosize(SmemLayoutK{}) <=
+                  2 * kKVElements + size(SmemLayoutP{}));
+    static constexpr int kPElements = size(SmemLayoutP{});
+    static constexpr int kExchangeRows = kMmaGroups * kGroupRows;
+    static constexpr int kTensorSmemBytes =
+        (kQElements + 2 * kKVElements + kPElements) * sizeof(Element);
+    static constexpr int kExchangeBytes =
+        2 * kExchangeRows * sizeof(float);
+    static constexpr int kSmemBytes = kTensorSmemBytes + kExchangeBytes;
     static_assert(kSmemBytes <= 65536);
 };
 
 using Sm70D256SplitDTraits = Sm70D256SplitDTraitsT<64>;
-static_assert(Sm70D256SplitDTraits::kSmemBytes == 50048);
+static_assert(Sm70D256SplitDTraits::kSmemBytes == 45568);
 
 template <typename TiledCopy, typename SrcTensor, typename DstTensor>
 __device__ __forceinline__ void copy_even_tile(
@@ -307,9 +304,16 @@ __device__ __forceinline__ void splitd_pv_gemm_tt(
         tiled_mma, lane);
 }
 
-template <typename TensorScores>
+// kRows: number of rows in this warp's o accumulator (kGroupRows=16 for the
+// stock pair-shared path). kPerWarp: when true the warp's o accumulator covers
+// only its own kRows rows; when false it covers the whole kGroupRows group (no
+// offset). kOChunks/kOElements are deduced from the o_storage array shape.
+template <int kRows, bool kPerWarp, typename TensorScores, typename OLayout,
+          int kOChunks, int kOElements>
 __device__ __forceinline__ void splitd_n32_online_softmax(
     TensorScores &acc_s,
+    float (&o_storage)[kOChunks][kOElements],
+    OLayout o_layout,
     float (&row_max)[Sm70D256SplitDTraitsT<64>::kQkRowsPerThread],
     float (&row_sum)[Sm70D256SplitDTraitsT<64>::kQkRowsPerThread],
     float *row_scale_exchange,
@@ -363,8 +367,30 @@ __device__ __forceinline__ void splitd_n32_online_softmax(
                 + n_warp * Traits::kQkWarpRows + row] = work[slot];
         }
     }
-    // No barrier here: the caller publishes the row scales with the P and V
-    // stores and rescales O after that single barrier (splitd_n32_rescale_o).
+    __syncthreads();
+
+    if (!first_tile) {
+        const int row_scale_base = mma_group * Traits::kGroupRows
+            + (kPerWarp ? n_warp * kRows : 0);
+#pragma unroll
+        for (int d = 0; d < kOChunks; ++d) {
+            auto acc_o = make_tensor(make_rmem_ptr(&o_storage[d][0]), o_layout);
+            auto acc_o_rc = make_tensor(
+                acc_o.data(),
+                FLASH_NAMESPACE::convert_layout_acc_rowcol(acc_o.layout()));
+#pragma unroll
+            for (int row = 0; row < kRows / 4; ++row) {
+                const int logical_row = FLASH_NAMESPACE::sm70_row_slot<
+                    kRows>(row, lane);
+                const float row_scale = row_scale_exchange[
+                    row_scale_base + logical_row];
+#pragma unroll
+                for (int col = 0; col < size<1>(acc_o_rc); ++col) {
+                    acc_o_rc(row, col) *= row_scale;
+                }
+            }
+        }
+    }
 
     auto scores_max_tensor = make_tensor(
         make_rmem_ptr(&scores_max[0]),
@@ -376,52 +402,6 @@ __device__ __forceinline__ void splitd_n32_online_softmax(
 #pragma unroll
     for (int slot = 0; slot < Traits::kQkRowsPerThread; ++slot) {
         row_sum[slot] += work[slot];
-    }
-}
-
-// O online rescale, split out of the softmax so it runs after the barrier
-// that publishes row_scale_exchange and overlaps the P fragment loads.
-// A row whose running max did not change has scale exactly 1.0f, for which
-// the multiply is a bit-exact no-op, so such rows skip the multiply.
-// kRows: number of rows in this warp's o accumulator (kGroupRows=16 for the
-// stock pair-shared path). kPerWarp: when true the warp's o accumulator covers
-// only its own kRows rows; when false it covers the whole kGroupRows group (no
-// offset). kOChunks/kOElements are deduced from the o_storage array shape.
-template <int kRows, bool kPerWarp, typename OLayout, int kOChunks,
-          int kOElements>
-__device__ __forceinline__ void splitd_n32_rescale_o(
-    float (&o_storage)[kOChunks][kOElements],
-    OLayout o_layout,
-    const float *row_scale_exchange,
-    int mma_group,
-    int n_warp,
-    int lane,
-    bool first_tile) {
-    if (first_tile) {
-        return;
-    }
-    using Traits = Sm70D256SplitDTraits;
-    const int row_scale_base = mma_group * Traits::kGroupRows
-        + (kPerWarp ? n_warp * kRows : 0);
-#pragma unroll
-    for (int d = 0; d < kOChunks; ++d) {
-        auto acc_o = make_tensor(make_rmem_ptr(&o_storage[d][0]), o_layout);
-        auto acc_o_rc = make_tensor(
-            acc_o.data(),
-            FLASH_NAMESPACE::convert_layout_acc_rowcol(acc_o.layout()));
-#pragma unroll
-        for (int row = 0; row < kRows / 4; ++row) {
-            const int logical_row = FLASH_NAMESPACE::sm70_row_slot<
-                kRows>(row, lane);
-            const float row_scale = row_scale_exchange[
-                row_scale_base + logical_row];
-            if (row_scale != 1.0f) {
-#pragma unroll
-                for (int col = 0; col < size<1>(acc_o_rc); ++col) {
-                    acc_o_rc(row, col) *= row_scale;
-                }
-            }
-        }
     }
 }
 
@@ -856,7 +836,7 @@ void sm70_d256_splitd_dense_kernel(
             auto tOsQ = qk_mma_thread.partition_A(sQChunk);
             auto sKChunk = make_tensor(
                 make_smem_ptr(
-                    kv_smem_ptr + (d_chunk & 1) * Traits::kKStage1Offset),
+                    kv_smem_ptr + (d_chunk & 1) * Traits::kKStageElements),
                 typename Traits::SmemLayoutK{});
             auto tSrK = qk_mma_thread.partition_fragment_B(sKChunk);
             auto tOsK = qk_mma_thread.partition_B(sKChunk);
@@ -878,7 +858,7 @@ void sm70_d256_splitd_dense_kernel(
                 auto sKNext = make_tensor(
                     make_smem_ptr(
                         kv_smem_ptr
-                        + ((d_chunk + 1) & 1) * Traits::kKStage1Offset),
+                        + ((d_chunk + 1) & 1) * Traits::kKStageElements),
                     typename Traits::SmemLayoutK{});
                 auto tKsKNext = gmem_k_thread.partition_D(sKNext);
                 cute::copy(tKrKNext, tKsKNext);
@@ -950,8 +930,8 @@ void sm70_d256_splitd_dense_kernel(
             kv_smem_ptr + 2 * Traits::kKVElements;
         float *row_scale_exchange = reinterpret_cast<float *>(
             p_smem_ptr + Traits::kPElements);
-        splitd_n32_online_softmax(
-            acc_s, row_max, row_sum,
+        splitd_n32_online_softmax<Traits::kGroupRows, false>(
+            acc_s, o_storage, OLayout{}, row_max, row_sum,
             row_scale_exchange, mma_group, n_warp, lane,
             softmax_scale_log2, n_block == n_block_max);
 
@@ -960,10 +940,8 @@ void sm70_d256_splitd_dense_kernel(
 
         // The pair's 16-row P tile is staged into shared memory (each warp
         // writes its own 8 rows) and loaded back as the pair MMA's A
-        // fragment. One barrier publishes the P stores, the V smem stores
-        // above and the online-softmax row scales; K stage 1 no longer aliases
-        // P (see kKStage1Offset), so the P stores cannot race the chunk-3 K
-        // reads.
+        // fragment. The barrier makes the P stores - and the V smem stores
+        // above - visible before the PV gemms read them.
         auto sP = make_tensor(
             make_smem_ptr(p_smem_ptr), typename Traits::SmemLayoutP{});
         auto sPGroup = local_tile(
@@ -1010,10 +988,6 @@ void sm70_d256_splitd_dense_kernel(
                 tPsP(_, _, k_tile),
                 tPrPView(_, _, k_tile));
         }
-        // O rescale after the barrier, overlapping the P fragment loads.
-        splitd_n32_rescale_o<Traits::kGroupRows, false>(
-            o_storage, OLayout{}, row_scale_exchange, mma_group, n_warp, lane,
-            n_block == n_block_max);
 #pragma unroll
         for (int d_local = 0; d_local < Traits::kOwnedDChunks; ++d_local) {
             auto acc_o = make_tensor(
