@@ -2248,11 +2248,13 @@ struct clip_model_loader {
             int dev = 0;
             for (int il = 0; il < hparams.n_layer; ++il) {
                 const int layers_left = hparams.n_layer - il;
-                const int devs_left   = n_devices - dev;
-                if (dev < n_devices - 1 && dev_layers[dev] > 0 && layers_left >= devs_left) {
+                const int devs_after  = n_devices - 1 - dev;
+                if (dev < n_devices - 1 && dev_layers[dev] > 0) {
                     const double stay = fabs((double) dev_bytes[dev] - target[dev]);
                     const double cont = fabs((double) (dev_bytes[dev] + layer_bytes[il]) - target[dev]);
-                    if (cont > stay) {
+                    // every device gets at least one layer: a device without layers reserves no
+                    // compute buffer, which the free-memory targets do not account for
+                    if (cont > stay || layers_left <= devs_after) {
                         dev++;
                     }
                 }
