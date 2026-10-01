@@ -804,9 +804,11 @@ __global__ void sm70_d256_assist_read_split(volatile const ggml_backend_meta_ass
         ggml_backend_meta_assist_split * __restrict__ dst) {
     if (threadIdx.x == 0) {
         __threadfence_system();
-        const ggml_backend_meta_assist_split v = *src;
+        const int32_t kv_end = src->kv_end;
+        const int32_t split  = src->s;
         __threadfence_system();
-        *dst = v;
+        dst->kv_end = kv_end;
+        dst->s      = split;
     }
 }
 
