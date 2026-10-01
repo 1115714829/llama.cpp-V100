@@ -23,10 +23,11 @@
 // the llama.cpp launcher does not select it yet.
 //
 // The verified compute core is UNMODIFIED: SmemLayout (pitch-68 K / TT swizzled
-// V), HMMA.884 QK+PV atoms, K/V double-buffered pipeline, online softmax with
-// row_scale_exchange and the __launch_bounds__(256,1) smem budget
-// (kSmemBytes==45568 -> 2 CTA/SM). Deviations from upstream, all required for
-// llama.cpp semantics:
+// V), HMMA.884 QK+PV atoms, the K ping-pong double buffer (V is staged in two
+// rounds per block), online softmax with row_scale_exchange and the
+// __launch_bounds__(256,1) smem budget (kSmemBytes==45568; the ~253-255
+// registers still cap the kernel at 1 CTA/SM).
+// Deviations from upstream, all required for llama.cpp semantics:
 //  * the causal Mask is replaced by a range mask (col >= kv_len -> -inf): the
 //    llama.cpp mask carries the causal/padding semantics and test masks are
 //    arbitrary;
@@ -153,6 +154,14 @@ struct Sm70D256SplitDTraitsT {
     static constexpr int kQElements = size(SmemLayoutQ{});
     static constexpr int kKVElements = size(SmemLayoutKV{});
     static_assert(size(SmemLayoutV{}) == kKVElements);
+    // The second K stage is live only before P is materialized, so it may
+    // alias the beginning of the later P region. Keep the K stages disjoint
+    // and on the same 128-byte bank phase without moving the V/P regions.
+    // 2240 elements = 4480 B = 35 x 128 B.
+    static constexpr int kKStageElements = 2240;
+    static_assert(kKStageElements >= cosize(SmemLayoutK{}));
+    static_assert(kKStageElements + cosize(SmemLayoutK{}) <=
+                  2 * kKVElements + size(SmemLayoutP{}));
     static constexpr int kPElements = size(SmemLayoutP{});
     static constexpr int kExchangeRows = kMmaGroups * kGroupRows;
     static constexpr int kTensorSmemBytes =
@@ -782,9 +791,13 @@ void sm70_d256_splitd_dense_kernel(
                     mma_group * Traits::kWarpsPerGroup + n_warp,
                     d_chunk));
             auto tSrQ = qk_mma_thread.partition_fragment_A(sQChunk);
-            auto tSrK = qk_mma_thread.partition_fragment_B(sK);
             auto tOsQ = qk_mma_thread.partition_A(sQChunk);
-            auto tOsK = qk_mma_thread.partition_B(sK);
+            auto sKChunk = make_tensor(
+                make_smem_ptr(
+                    kv_smem_ptr + (d_chunk & 1) * Traits::kKStageElements),
+                typename Traits::SmemLayoutK{});
+            auto tSrK = qk_mma_thread.partition_fragment_B(sKChunk);
+            auto tOsK = qk_mma_thread.partition_B(sKChunk);
             auto smem_copy_q = make_tiled_copy_A(
                 typename Traits::SmemCopyAtom{}, qk_tiled_mma);
             auto smem_copy_k = make_tiled_copy_B(
@@ -797,8 +810,16 @@ void sm70_d256_splitd_dense_kernel(
                 acc_s, tSrQ, tSrK, tSsQ, tSsK, qk_tiled_mma,
                 smem_copy_q, smem_copy_k, smem_thread_q, smem_thread_k);
             if (d_chunk + 1 < Traits::kDChunks) {
-                __syncthreads();
-                cute::copy(tKrKNext, tKsK);
+                // Write the next chunk into the other stage: it does not
+                // conflict with the gemm that just read this one, so a single
+                // barrier makes the copy visible to the next gemm.
+                auto sKNext = make_tensor(
+                    make_smem_ptr(
+                        kv_smem_ptr
+                        + ((d_chunk + 1) & 1) * Traits::kKStageElements),
+                    typename Traits::SmemLayoutK{});
+                auto tKsKNext = gmem_k_thread.partition_D(sKNext);
+                cute::copy(tKrKNext, tKsKNext);
                 __syncthreads();
             }
         }
