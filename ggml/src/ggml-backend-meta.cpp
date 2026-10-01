@@ -4375,7 +4375,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             if (backend_ctx->assist_set != nullptr) {
                 for (int i = 0; i < cgraph->n_nodes; i++) {
                     const ggml_tensor * node = cgraph->nodes[i];
-                    if (node->op == GGML_OP_FLASH_ATTN_EXT && ggml_flash_attn_ext_get_assist_capable(node)) {
+                    // every FA node, marked or not: the decode graphs are never marked but must
+                    // leave room for a later assist plan of the same model
+                    if (node->op == GGML_OP_FLASH_ATTN_EXT) {
                         n_subgraphs_reserve += 2;
                     }
                 }
