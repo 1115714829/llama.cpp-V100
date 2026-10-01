@@ -148,7 +148,7 @@ struct clip_ctx {
     clip_model model;
 
     gguf_context_ptr ctx_gguf;
-    ggml_context_ptr ctx_data;
+    std::vector<ggml_context_ptr> ctx_data; // one per target device
 
     std::vector<uint8_t> buf_compute_meta;
 
@@ -157,7 +157,10 @@ struct clip_ctx {
 
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
-    ggml_backend_buffer_ptr buf;
+    std::vector<ggml_backend_buffer_ptr> bufs; // weights, one per target device
+
+    int n_gpu_backends = 0;
+    std::vector<int> layer_device; // layer index -> device index
 
 
     int max_nodes = 8192;
@@ -186,26 +189,47 @@ struct clip_ctx {
             throw std::runtime_error("failed to initialize CPU backend");
         }
         if (ctx_params.use_gpu) {
-            if (ctx_params.device != nullptr) {
+            if (ctx_params.devices != nullptr && ctx_params.n_devices > 0) {
+                for (int32_t i = 0; i < ctx_params.n_devices; ++i) {
+                    ggml_backend_t backend_gpu = ggml_backend_dev_init(ctx_params.devices[i], nullptr);
+                    if (!backend_gpu) {
+                        throw std::runtime_error(string_format("%s: failed to initialize \"%s\" backend\n",
+                                                               __func__, ggml_backend_dev_name(ctx_params.devices[i])));
+                    }
+                    backend_ptrs.push_back(backend_gpu);
+                    backend_buft.push_back(ggml_backend_get_default_buffer_type(backend_gpu));
+                }
+                backend = backend_ptrs.front();
+                for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                    LOG_INF("%s: CLIP using %s backend\n", __func__, ggml_backend_name(backend_ptrs[i]));
+                }
+            } else if (ctx_params.device != nullptr) {
                 backend = ggml_backend_dev_init(ctx_params.device, nullptr);
                 if (!backend) {
                     throw std::runtime_error(string_format("%s: failed to initialize \"%s\" backend\n",
                                                            __func__, ggml_backend_dev_name(ctx_params.device)));
                 }
+                LOG_INF("%s: CLIP using %s backend\n", __func__, ggml_backend_name(backend));
+                backend_ptrs.push_back(backend);
+                backend_buft.push_back(ggml_backend_get_default_buffer_type(backend));
             } else {
                 backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
                 backend = backend ? backend : ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU, nullptr);
+                if (backend) {
+                    LOG_INF("%s: CLIP using %s backend\n", __func__, ggml_backend_name(backend));
+                    backend_ptrs.push_back(backend);
+                    backend_buft.push_back(ggml_backend_get_default_buffer_type(backend));
+                }
             }
         }
 
-        if (backend) {
-            LOG_INF("%s: CLIP using %s backend\n", __func__, ggml_backend_name(backend));
-            backend_ptrs.push_back(backend);
-            backend_buft.push_back(ggml_backend_get_default_buffer_type(backend));
-        } else {
+        if (!backend) {
             backend = backend_cpu;
             LOG_INF("%s: CLIP using CPU backend\n", __func__);
         }
+        n_gpu_backends = backend_ptrs.empty() ? 0 : (int) backend_ptrs.size();
+
+        ctx_data.resize(n_gpu_backends > 0 ? n_gpu_backends : 1);
 
         if (ctx_params.image_min_tokens > 0) {
             model.hparams.custom_image_min_tokens = ctx_params.image_min_tokens;
@@ -229,9 +253,9 @@ struct clip_ctx {
     }
 
     ~clip_ctx() {
-        ggml_backend_free(backend);
-        if (backend != backend_cpu) {
-            ggml_backend_free(backend_cpu);
+        bufs.clear();
+        for (ggml_backend_t b : backend_ptrs) {
+            ggml_backend_free(b);
         }
     }
 
@@ -2115,7 +2139,7 @@ struct clip_model_loader {
         auto & model = ctx_clip.model;
         auto & hparams = model.hparams;
         std::map<std::string, size_t> tensor_offset;
-        std::vector<ggml_tensor *> tensors_to_load;
+        std::vector<std::pair<ggml_tensor *, int>> tensors_to_load; // data tensor, device index
 
         auto fin = open_ifstream_binary(fname);
         if (!fin) {
@@ -2127,21 +2151,127 @@ struct clip_model_loader {
                              : model.modality == CLIP_MODALITY_GEN_AUDIO ? "a.gen.code"
                              : "v";
 
+        const int n_devices = ctx_clip.n_gpu_backends > 0 ? ctx_clip.n_gpu_backends : 1;
+
+        // tensors consumed by the projector (and similar output-side tensors) go to the last device
+        auto is_output_side = [](const std::string & name) {
+            return strncmp(name.c_str(), "mm.", 3) == 0
+                || name.find("post_ln")        != std::string::npos
+                || name.find("deepstack")      != std::string::npos
+                || name.find("norm_embd")      != std::string::npos
+                || name.find("image_newline")  != std::string::npos
+                || name.find("view_seperator") != std::string::npos
+                || name.find("resampler")      != std::string::npos;
+        };
+
+        const std::string blk_prefix = std::string(prefix) + ".blk.";
+
+        // split the layers into contiguous segments with roughly equal weight bytes
+        ctx_clip.layer_device.assign(hparams.n_layer, 0);
+        if (n_devices > 1) {
+            std::vector<size_t> layer_bytes(hparams.n_layer, 0);
+            size_t fixed_first = 0;
+            size_t fixed_last  = 0;
+            for (int64_t i = 0; i < gguf_get_n_tensors(ctx_gguf.get()); ++i) {
+                const char * name = gguf_get_tensor_name(ctx_gguf.get(), i);
+                const size_t nbytes = ggml_nbytes(ggml_get_tensor(ctx_meta.get(), name));
+                if (strncmp(name, blk_prefix.c_str(), blk_prefix.size()) == 0) {
+                    const int il = atoi(name + blk_prefix.size());
+                    if (il >= 0 && il < hparams.n_layer) {
+                        layer_bytes[il] += nbytes;
+                    }
+                } else if (is_output_side(name)) {
+                    fixed_last += nbytes;
+                } else {
+                    fixed_first += nbytes;
+                }
+            }
+
+            size_t total_bytes = fixed_first + fixed_last;
+            for (size_t b : layer_bytes) {
+                total_bytes += b;
+            }
+            const double target = (double) total_bytes / n_devices;
+
+            std::vector<size_t> dev_bytes(n_devices, 0);
+            std::vector<int> dev_layers(n_devices, 0);
+            dev_bytes[0] += fixed_first;
+            dev_bytes[n_devices - 1] += fixed_last;
+
+            int dev = 0;
+            for (int il = 0; il < hparams.n_layer; ++il) {
+                const int layers_left = hparams.n_layer - il;
+                const int devs_left   = n_devices - dev;
+                if (dev < n_devices - 1 && dev_layers[dev] > 0 && layers_left >= devs_left) {
+                    const double stay = fabs((double) dev_bytes[dev] - target);
+                    const double cont = fabs((double) (dev_bytes[dev] + layer_bytes[il]) - target);
+                    if (cont > stay) {
+                        dev++;
+                    }
+                }
+                ctx_clip.layer_device[il] = dev;
+                dev_layers[dev]++;
+                dev_bytes[dev] += layer_bytes[il];
+            }
+
+            for (int d = 0; d < n_devices; ++d) {
+                int il_begin = -1;
+                int il_end   = -1;
+                for (int il = 0; il < hparams.n_layer; ++il) {
+                    if (ctx_clip.layer_device[il] == d) {
+                        if (il_begin < 0) {
+                            il_begin = il;
+                        }
+                        il_end = il;
+                    }
+                }
+                if (il_begin < 0) {
+                    LOG_INF("%s: device %d: no layers, weights %.2f MiB\n", __func__, d, dev_bytes[d] / 1024.0 / 1024.0);
+                } else {
+                    LOG_INF("%s: device %d: layers %d..%d, weights %.2f MiB\n", __func__, d, il_begin, il_end, dev_bytes[d] / 1024.0 / 1024.0);
+                }
+            }
+        }
+
+        // layer tensors follow their layer, output-side tensors go to the last device,
+        // everything else (input-side) goes to the first device
+        auto tensor_device = [&](const std::string & name) {
+            if (n_devices <= 1) {
+                return 0;
+            }
+            if (strncmp(name.c_str(), blk_prefix.c_str(), blk_prefix.size()) == 0) {
+                const int il = atoi(name.c_str() + blk_prefix.size());
+                if (il >= 0 && il < hparams.n_layer) {
+                    return ctx_clip.layer_device[il];
+                }
+            }
+            return is_output_side(name) ? n_devices - 1 : 0;
+        };
+
         // get offsets
         for (int64_t i = 0; i < gguf_get_n_tensors(ctx_gguf.get()); ++i) {
             const char * name = gguf_get_tensor_name(ctx_gguf.get(), i);
             tensor_offset[name] = gguf_get_data_offset(ctx_gguf.get()) + gguf_get_tensor_offset(ctx_gguf.get(), i);
         }
 
-        // create data context
-        struct ggml_init_params params = {
-            /*.mem_size =*/ static_cast<size_t>(gguf_get_n_tensors(ctx_gguf.get()) + 1) * ggml_tensor_overhead(),
-            /*.mem_buffer =*/ NULL,
-            /*.no_alloc =*/ true,
-        };
-        ctx_clip.ctx_data.reset(ggml_init(params));
-        if (!ctx_clip.ctx_data) {
-            throw std::runtime_error(string_format("%s: failed to init ggml context\n", __func__));
+        // create one data context per device
+        {
+            std::vector<size_t> n_tensors_per_dev(ctx_clip.ctx_data.size(), 0);
+            for (int64_t i = 0; i < gguf_get_n_tensors(ctx_gguf.get()); ++i) {
+                const char * name = gguf_get_tensor_name(ctx_gguf.get(), i);
+                n_tensors_per_dev[tensor_device(name)]++;
+            }
+            for (size_t dev = 0; dev < ctx_clip.ctx_data.size(); ++dev) {
+                struct ggml_init_params params = {
+                    /*.mem_size =*/ (n_tensors_per_dev[dev] + 1) * ggml_tensor_overhead(),
+                    /*.mem_buffer =*/ NULL,
+                    /*.no_alloc =*/ true,
+                };
+                ctx_clip.ctx_data[dev].reset(ggml_init(params));
+                if (!ctx_clip.ctx_data[dev]) {
+                    throw std::runtime_error(string_format("%s: failed to init ggml context\n", __func__));
+                }
+            }
         }
 
         // helper function
@@ -2156,13 +2286,14 @@ struct clip_model_loader {
                 throw std::runtime_error(string_format("%s: unable to find tensor %s\n", __func__, name.c_str()));
             }
             if (cur) {
-                tensors_to_load.push_back(cur);
-                ggml_tensor * data_tensor = ggml_dup_tensor(ctx_clip.ctx_data.get(), cur);
+                const int dev = tensor_device(name);
+                ggml_tensor * data_tensor = ggml_dup_tensor(ctx_clip.ctx_data[dev].get(), cur);
                 ggml_set_name(data_tensor, cur->name);
                 loaded_tensor_names.insert(name);
+                tensors_to_load.push_back({data_tensor, dev});
                 cur = data_tensor;
                 // add to weight memory counter
-                ctx_clip.mem_usage[ggml_backend_get_device(ctx_clip.backend)] += ggml_nbytes(cur);
+                ctx_clip.mem_usage[ggml_backend_get_device(ctx_clip.backend_ptrs[dev])] += ggml_nbytes(cur);
             }
             return cur;
         };
@@ -3618,25 +3749,33 @@ struct clip_model_loader {
             // compute total tensor data size for progress reporting
             size_t total_data_size = 0;
             for (auto & t : tensors_to_load) {
-                total_data_size += ggml_nbytes(t);
+                total_data_size += ggml_nbytes(t.first);
             }
 
-            // alloc memory and offload data
-            ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx_clip.backend);
-            ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
-            ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            // alloc memory and offload data, one buffer per device
+            ctx_clip.bufs.clear();
+            for (size_t dev = 0; dev < ctx_clip.ctx_data.size(); ++dev) {
+                ggml_backend_buffer_t buf_dev = nullptr;
+                if (ggml_get_first_tensor(ctx_clip.ctx_data[dev].get()) != nullptr) {
+                    buf_dev = ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data[dev].get(), ctx_clip.backend_buft[dev]);
+                    if (buf_dev == nullptr) {
+                        throw std::runtime_error(string_format("%s: failed to allocate weights buffer for device %d\n", __func__, (int) dev));
+                    }
+                    ggml_backend_buffer_set_usage(buf_dev, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                }
+                ctx_clip.bufs.push_back(ggml_backend_buffer_ptr(buf_dev));
+            }
             // read the weight from file
             if (!ctx_clip.no_alloc) {
                 size_t data_loaded = 0;
-                for (auto & t : tensors_to_load) {
-                    ggml_tensor * cur = ggml_get_tensor(ctx_clip.ctx_data.get(), t->name);
-                    GGML_ASSERT(cur && "tensor not found in ctx_data");
-                    auto it_off = tensor_offset.find(t->name);
+                for (auto & [cur, dev] : tensors_to_load) {
+                    ggml_backend_buffer_type_t buft = ctx_clip.backend_buft[dev];
+                    auto it_off = tensor_offset.find(cur->name);
                     GGML_ASSERT(it_off != tensor_offset.end() && "no offset for tensor");
                     const size_t offset = it_off->second;
                     fin.seekg(offset, std::ios::beg);
                     if (!fin) {
-                        throw std::runtime_error(string_format("%s: failed to seek for tensor %s\n", __func__, t->name));
+                        throw std::runtime_error(string_format("%s: failed to seek for tensor %s\n", __func__, cur->name));
                     }
                     size_t num_bytes = ggml_nbytes(cur);
                     if (ggml_backend_buft_is_host(buft)) {
@@ -3668,7 +3807,7 @@ struct clip_model_loader {
     struct support_info_op {
         ggml_tensor * op;
 
-        // true if the op runs on the accelerated ctx_clip.backend
+        // true if the op is supported by all accelerated backends
         bool is_accel = true;
     };
 
@@ -3813,16 +3952,21 @@ struct clip_model_loader {
             /*.ops      = */ {},
         };
 
-        // check op support
+        // check op support; the accelerated path is used only if all GPU backends support the op
+        const int n_backends_to_check = ctx_clip.n_gpu_backends > 0 ? ctx_clip.n_gpu_backends : 1;
         for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
             ggml_tensor * node = ggml_graph_node(gf, i);
-            res.ops.push_back({node, true});
-            if (!ggml_backend_supports_op(ctx_clip.backend, node)) {
-                res.ops.back().is_accel = false;
-                if (node->op == GGML_OP_FLASH_ATTN_EXT) {
-                    res.fattn    = false;
-                    res.fattn_op = node;
+            bool supported = true;
+            for (int bi = 0; bi < n_backends_to_check; ++bi) {
+                if (!ggml_backend_supports_op(ctx_clip.backend_ptrs[bi], node)) {
+                    supported = false;
+                    break;
                 }
+            }
+            res.ops.push_back({node, supported});
+            if (!supported && node->op == GGML_OP_FLASH_ATTN_EXT) {
+                res.fattn    = false;
+                res.fattn_op = node;
             }
         }
 

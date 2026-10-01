@@ -97,6 +97,10 @@ typedef bool (*mtmd_progress_callback)(float progress, void * user_data);
 struct mtmd_context_params {
     bool use_gpu;
     ggml_backend_dev_t device;
+    // optional list of devices to split the mmproj model across; when set, it takes
+    // precedence over "device". nullptr/0 keeps the single-device behavior.
+    const ggml_backend_dev_t * devices;
+    int32_t n_devices;
     bool print_timings;
     int n_threads;
     const char * image_marker; // deprecated, use media_marker instead

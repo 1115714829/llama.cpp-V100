@@ -49,6 +49,10 @@ enum clip_flash_attn_type {
 struct clip_context_params {
     bool use_gpu;
     ggml_backend_dev_t device;
+    // optional list of devices to split the model across; when set, it takes
+    // precedence over "device". nullptr/0 keeps the single-device behavior.
+    const ggml_backend_dev_t * devices;
+    int32_t n_devices;
     enum clip_flash_attn_type flash_attn_type;
     int image_min_tokens;
     int image_max_tokens;

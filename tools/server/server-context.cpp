@@ -1055,6 +1055,7 @@ private:
 
         std::string & mmproj_path = params_base.mmproj.path;
         mtmd_context_params mparams = mtmd_context_params_default();
+        std::vector<ggml_backend_dev_t> mmproj_devices; // devices to split the mmproj model across
         if (has_mmproj) {
             mparams.use_gpu          = params_base.mmproj_use_gpu;
             mparams.device           = params_base.mmproj_device;
@@ -1069,6 +1070,25 @@ private:
             // progress callback
             mparams.progress_callback           = load_progress_callback;
             mparams.progress_callback_user_data = &load_progress_mmproj;
+            // split the mmproj model across the devices used by the main model;
+            // an explicitly set mmproj_device (without --device) keeps the single-device behavior
+            if (params_base.mmproj_use_gpu) {
+                if (!params_base.devices.empty()) {
+                    mmproj_devices = params_base.devices;
+                } else if (params_base.mmproj_device == nullptr) {
+                    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                            mmproj_devices.push_back(dev);
+                        }
+                    }
+                }
+                if (mmproj_devices.size() > 1) {
+                    SRV_INF("splitting mmproj across %zu devices\n", mmproj_devices.size());
+                    mparams.devices   = mmproj_devices.data();
+                    mparams.n_devices = (int32_t) mmproj_devices.size();
+                }
+            }
         }
 
         // optionally get the memory usage of mmproj
