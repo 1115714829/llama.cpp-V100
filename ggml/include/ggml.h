@@ -2522,6 +2522,15 @@ extern "C" {
     GGML_API int32_t ggml_flash_attn_ext_get_q_head_boundary(
             const struct ggml_tensor * a);
 
+    // Mark a full attention node as shareable with the idle devices of a 6-device meta backend:
+    // the meta backend may split its KV range and hand the tail to an idle device (assist).
+    GGML_API void ggml_flash_attn_ext_set_assist_capable(
+            struct ggml_tensor * a,
+            bool                 capable);
+
+    GGML_API bool ggml_flash_attn_ext_get_assist_capable(
+            const struct ggml_tensor * a);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);

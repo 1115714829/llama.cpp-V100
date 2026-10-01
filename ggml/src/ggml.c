@@ -5590,6 +5590,21 @@ int32_t ggml_flash_attn_ext_get_q_head_boundary(
     return ggml_get_op_params_i32(a, 5);
 }
 
+void ggml_flash_attn_ext_set_assist_capable(
+        struct ggml_tensor * a,
+        bool                 capable) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+
+    ggml_set_op_params_i32(a, 6, capable ? 1 : 0);
+}
+
+bool ggml_flash_attn_ext_get_assist_capable(
+        const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+
+    return ggml_get_op_params_i32(a, 6) != 0;
+}
+
 void ggml_flash_attn_ext_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {

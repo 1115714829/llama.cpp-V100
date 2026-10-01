@@ -1495,6 +1495,20 @@ static size_t ggml_backend_cuda_assist_workspace_size(int q_pad, int heads_q) {
         return 0;
     }
 }
+
+static bool ggml_backend_cuda_assist_scratch_layout(const ggml_tensor * dst, ggml_backend_meta_assist_scratch * layout) {
+    if constexpr (GGML_CUDA_SM70_D256_COMPILED) {
+        return ggml_cuda_sm70_d256_assist_scratch_layout(dst, layout);
+    } else {
+        return false;
+    }
+}
+
+static int ggml_backend_cuda_get_device_ordinal(ggml_backend_t backend) {
+    GGML_ASSERT(backend != nullptr);
+    GGML_ASSERT(ggml_backend_is_cuda(backend));
+    return static_cast<ggml_backend_cuda_context *>(backend->context)->device;
+}
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 // host buffer type
@@ -7351,6 +7365,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_assist_workspace_size") == 0) {
         return (void *)ggml_backend_cuda_assist_workspace_size;
+    }
+    if (strcmp(name, "ggml_backend_cuda_assist_scratch_layout") == 0) {
+        return (void *)ggml_backend_cuda_assist_scratch_layout;
+    }
+    if (strcmp(name, "ggml_backend_cuda_get_device_ordinal") == 0) {
+        return (void *)ggml_backend_cuda_get_device_ordinal;
     }
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if (strcmp(name, "ggml_backend_capture_begin") == 0) {

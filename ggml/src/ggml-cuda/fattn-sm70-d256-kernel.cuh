@@ -565,6 +565,26 @@ __device__ __forceinline__ void sm70_d256_partial_block_range(
     }
 }
 
+// Intersect a block range with the device-side row range [*visit_lo, *visit_hi): the owner caps
+// its share at the assist split point, the idle restricts its share to the rows past it. Either
+// pointer may be null. An empty intersection comes back as n_block_max < n_block_min.
+__device__ __forceinline__ void sm70_d256_clamp_visit_rows(
+    const int * visit_lo, const int * visit_hi, int kBlockN,
+    int & n_block_min, int & n_block_max) {
+    if (visit_lo != nullptr) {
+        const int lo = (*visit_lo + kBlockN - 1) / kBlockN;
+        if (n_block_min < lo) {
+            n_block_min = lo;
+        }
+    }
+    if (visit_hi != nullptr) {
+        const int hi = (*visit_hi + kBlockN - 1) / kBlockN;
+        if (n_block_max > hi - 1) {
+            n_block_max = hi - 1;
+        }
+    }
+}
+
 // ElementOut (default = Element): output element type. The llama.cpp launcher
 // instantiates ElementOut=float so the attention output is written as f32
 // directly (the f16 output staging was a per-layer rounding source). Q/K/V
@@ -617,7 +637,9 @@ void sm70_d256_splitd_dense_kernel(
     float *__restrict__ partial_sum,
     int win_block_lo,
     int win_block_hi,
-    int kv_splits) {
+    int kv_splits,
+    const int * __restrict__ visit_lo,
+    const int * __restrict__ visit_hi) {
     static_assert(!(SplitKV3 && Partial), "SplitKV3 and Partial are mutually exclusive");
     using Traits = TraitsT;
     constexpr int kBlockM = Traits::kBlockM;
@@ -671,6 +693,7 @@ void sm70_d256_splitd_dense_kernel(
         sm70_d256_partial_block_range(
             n_visited_blocks, win_block_lo, win_block_hi, split, kv_splits,
             block_min, block_max);
+        sm70_d256_clamp_visit_rows(visit_lo, visit_hi, kBlockN, block_min, block_max);
         if (block_max < block_min) {
             // Flat partial buffers: slice s starts at s * (grid.y/kv_splits)
             // rows, so a segment writes its own slice.
@@ -767,10 +790,11 @@ void sm70_d256_splitd_dense_kernel(
         n_block_max = visible_n_blocks * (split + 1) / 3 - 1;
     }
     if constexpr (Partial) {
-        // Window clamp plus the optional SplitKV2 segment split.
+        // Window clamp plus the optional SplitKV2 segment split, then the device-side row range.
         sm70_d256_partial_block_range(
             n_visited_blocks, win_block_lo, win_block_hi, split, kv_splits,
             n_block_min, n_block_max);
+        sm70_d256_clamp_visit_rows(visit_lo, visit_hi, kBlockN, n_block_min, n_block_max);
     } else {
         // Restrict the walk to the caller's KV block window [win_block_lo, win_block_hi).
         // The windowed path passes the window bounds; every other call passes 0 and

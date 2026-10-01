@@ -2394,6 +2394,7 @@ enum ggml_backend_meta_collect_kind {
     GGML_BACKEND_META_COLLECT_TOPK,          // sharded TOP_K, candidates merged across backends
     GGML_BACKEND_META_COLLECT_GETROWS,       // sharded GET_ROWS, rows summed across backends
     GGML_BACKEND_META_COLLECT_PAD,           // unevenly split PAD, every backend pads its own slice
+    GGML_BACKEND_META_COLLECT_ASSIST,        // idle devices compute the KV tail of a full attention node
 };
 
 // output that has to land on [dst] at [offset] instead of into the per-backend scratch buffer
@@ -2414,6 +2415,7 @@ struct ggml_backend_meta_collect {
     std::vector<ggml_backend_meta_aux_graph> local;
     std::vector<ggml_backend_meta_aux_graph> merge;
     std::vector<ggml_tensor *>               reduce; // per-backend tensors summed across backends
+    std::vector<ggml_backend_meta_assist_rank> assist; // per-backend descriptors, kind == ASSIST only
 };
 
 static bool ggml_backend_meta_node_topk_collective(const struct ggml_tensor * node) {
@@ -2718,6 +2720,7 @@ struct ggml_backend_meta_plan {
     std::vector<ggml_backend_meta_collect>            collects;
     std::vector<ggml_context_ptr>                     ctx_collect;
     std::vector<ggml_backend_buffer_ptr>              buf_collect; // per backend, scratch for the cross-shard collectives
+    std::vector<ggml_backend_buffer_ptr>              buf_assist;  // per backend, assist slots, workspace and epoch words
 
     // Meta buffers used by the graph, with the simple tensor container slot holding its views.
     std::vector<std::pair<ggml_backend_buffer_t, int>> slots;
@@ -2740,10 +2743,434 @@ struct ggml_backend_meta_plan {
         collects.clear();
         ctx_collect.clear();
         buf_collect.clear();
+        buf_assist.clear();
         slots.clear();
         // cgraphs and nodes keep their capacity and are overwritten on rebuild
     }
 };
+
+//
+// Meta assist: an idle device computes the KV tail of a full attention node of two owner
+// devices, the owners keep the head segment. See ggml_backend_meta_assist_rank.
+//
+
+// Consecutive shareable layers rotate between two partial slots on the owner so that a layer does
+// not wait for the merge of its predecessor; the free epoch orders the reuse of a slot.
+static constexpr int GGML_META_ASSIST_N_SLOTS   = 2;
+static constexpr int GGML_META_ASSIST_HEAD_DIM  = 256;    // matches SM70_D256_D
+static constexpr int GGML_META_ASSIST_N_OWNERS  = 2;      // owners served by one idle device
+
+struct ggml_backend_meta_assist_layer {
+    int     i_node    = -1;
+    int     slot      = 0;
+    int64_t q_len     = 0;
+    int     q_pad     = 0;
+    int     heads_q   = 0;
+    int64_t kv_view   = 0;
+    int     kv_type   = GGML_TYPE_F16;
+    float   scale     = 1.0f;
+    size_t  qs_offset = 0;
+    int     idle[2]   = {-1, -1};
+    int     owners[2][GGML_META_ASSIST_N_OWNERS] = {{-1, -1}, {-1, -1}};
+    std::vector<ggml_backend_meta_assist_rank> desc;
+};
+
+// Per-backend buffer behind plan.buf_assist. Offsets are relative to `base`:
+//   [owner slots: p_out, p_max, p_sum per slot][idle workspace][epochs][split points][last words]
+struct ggml_backend_meta_assist_buf {
+    ggml_backend_buffer_t buf = nullptr;
+    char *   base             = nullptr;
+    size_t   slot_off[GGML_META_ASSIST_N_SLOTS] = {0, 0};
+    int64_t  rows             = 0;
+    size_t   work_off         = 0;
+    size_t   work_bytes       = 0;
+    size_t   epochs_off       = 0;
+    size_t   split_off        = 0;
+    size_t   lasts_off        = 0;
+};
+
+static float * ggml_backend_meta_assist_p_out(const ggml_backend_meta_assist_buf & b, int slot) {
+    return (float *) (b.base + b.slot_off[slot]);
+}
+
+static float * ggml_backend_meta_assist_p_max(const ggml_backend_meta_assist_buf & b, int slot) {
+    return (float *) (b.base + b.slot_off[slot] + (size_t) b.rows * GGML_META_ASSIST_HEAD_DIM * sizeof(float));
+}
+
+static float * ggml_backend_meta_assist_p_sum(const ggml_backend_meta_assist_buf & b, int slot) {
+    return (float *) (b.base + b.slot_off[slot] + (size_t) b.rows * (GGML_META_ASSIST_HEAD_DIM + 1) * sizeof(float));
+}
+
+// epoch words of an owner slot: 0 = epoch_kv, 1 = epoch_partial, 2 = epoch_free
+static uint32_t * ggml_backend_meta_assist_epoch(const ggml_backend_meta_assist_buf & b, int slot, int which) {
+    return (uint32_t *) (b.base + b.epochs_off + ((size_t) slot*3 + which)*sizeof(uint32_t));
+}
+
+static uint32_t * ggml_backend_meta_assist_last_partial(const ggml_backend_meta_assist_buf & b, int slot) {
+    return (uint32_t *) (b.base + b.lasts_off + (size_t) slot * sizeof(uint32_t));
+}
+
+// device-side split point of (owner rank, slot), written by the owner and read by its idle
+static ggml_backend_meta_assist_split * ggml_backend_meta_assist_split_at(const ggml_backend_meta_assist_buf & b, int slot) {
+    return (ggml_backend_meta_assist_split *) (b.base + b.split_off + (size_t) slot * sizeof(ggml_backend_meta_assist_split));
+}
+
+// idle local words of (owner rank, slot): 0 = last_kv, 1 = last_free
+static uint32_t * ggml_backend_meta_assist_last_idle(const ggml_backend_meta_assist_buf & b, int owner, int slot, int which) {
+    const size_t i = GGML_META_ASSIST_N_SLOTS + ((size_t) owner*GGML_META_ASSIST_N_SLOTS + slot)*2 + which;
+    return (uint32_t *) (b.base + b.lasts_off + i * sizeof(uint32_t));
+}
+
+// Returns true when the marked FA node can be shared: shapes, types and per-device K/V slices must
+// match the transfer and sync assumptions of the CUDA side.
+static bool ggml_backend_meta_assist_check(
+        const ggml_cgraph * cgraph,
+        const ggml_backend_meta_plan & plan,
+        int i_node,
+        size_t n_backends,
+        const ggml_backend_assist_scratch_layout_t scratch_layout,
+        const ggml_backend_assist_workspace_size_t workspace_size,
+        ggml_backend_meta_assist_layer & layer) {
+    const ggml_tensor * node = cgraph->nodes[i_node];
+    if (node->op != GGML_OP_FLASH_ATTN_EXT || !ggml_flash_attn_ext_get_assist_capable(node)) {
+        return false;
+    }
+    const ggml_tensor * q    = node->src[0];
+    const ggml_tensor * k    = node->src[1];
+    const ggml_tensor * v    = node->src[2];
+    const ggml_tensor * mask = node->src[3];
+    if (q == nullptr || k == nullptr || v == nullptr || mask == nullptr) {
+        return false;
+    }
+    if (mask->type != GGML_TYPE_I32) {
+        return false; // range mask
+    }
+    if (q->ne[3] != 1) {
+        return false; // one stream per rank
+    }
+    if (q->ne[1] < GGML_BACKEND_META_ASSIST_MIN_Q || k->ne[1] < GGML_BACKEND_META_ASSIST_MIN_KV) {
+        return false; // host gate: the view is long enough, the real length is gated on the device
+    }
+    if (k->type != GGML_TYPE_Q8_0 && k->type != GGML_TYPE_Q4_0) {
+        return false;
+    }
+    if (v->type != k->type) {
+        return false;
+    }
+    if (k->ne[0] != GGML_META_ASSIST_HEAD_DIM || v->ne[0] != GGML_META_ASSIST_HEAD_DIM || k->ne[3] != 1 || v->ne[3] != 1) {
+        return false;
+    }
+
+    const size_t row_bytes = ggml_row_size(k->type, GGML_META_ASSIST_HEAD_DIM);
+    int owners[8] = {0};
+    int idles[8]  = {0};
+    int n_owners  = 0;
+    int n_idles   = 0;
+    for (size_t j = 0; j < n_backends; j++) {
+        const ggml_tensor * fa_j = plan.nodes[j][i_node];
+        GGML_ASSERT(fa_j != nullptr);
+        const ggml_tensor * q_j = fa_j->src[0];
+        const ggml_tensor * k_j = fa_j->src[1];
+        const ggml_tensor * v_j = fa_j->src[2];
+        if (q_j == nullptr || k_j == nullptr || v_j == nullptr || fa_j->src[3] == nullptr) {
+            return false;
+        }
+        if (k_j->ne[2] > 0) {
+            // a KV head holder: the K/V rows of the per-device slice must be contiguous
+            if (k_j->ne[0] != GGML_META_ASSIST_HEAD_DIM || k_j->ne[1] != k->ne[1] || k_j->ne[2] != 1 || k_j->ne[3] != 1) {
+                return false;
+            }
+            if (v_j->ne[0] != GGML_META_ASSIST_HEAD_DIM || v_j->ne[1] != v->ne[1] || v_j->ne[2] != 1 || v_j->ne[3] != 1) {
+                return false;
+            }
+            if (k_j->nb[1] != row_bytes || v_j->nb[1] != row_bytes) {
+                return false;
+            }
+            // the idle device pulls the raw K/V bytes with 16 B vector loads
+            if ((uintptr_t) k_j->data % 16 != 0 || (uintptr_t) v_j->data % 16 != 0) {
+                return false;
+            }
+            if (q_j->ne[2] <= 0) {
+                return false;
+            }
+            owners[n_owners++] = (int) j;
+        } else {
+            idles[n_idles++] = (int) j;
+        }
+    }
+    if (n_owners != 4 || n_idles != 2) {
+        return false;
+    }
+
+    const int64_t heads_q = plan.nodes[owners[0]][i_node]->src[0]->ne[2];
+    for (int ii = 1; ii < n_owners; ii++) {
+        if (plan.nodes[owners[ii]][i_node]->src[0]->ne[2] != heads_q) {
+            return false;
+        }
+    }
+
+    // every owner must take the windowed partial path, expose the same shape and have an idle
+    // device with a workspace (the idle devices are the same across the plan, but check anyway)
+    int q_pad = -1;
+    size_t qs_offset = 0;
+    for (int ii = 0; ii < n_owners; ii++) {
+        ggml_backend_meta_assist_scratch scratch = {};
+        if (!scratch_layout(plan.nodes[owners[ii]][i_node], &scratch)) {
+            return false;
+        }
+        if (q_pad < 0) {
+            q_pad     = scratch.q_pad;
+            qs_offset = scratch.qs_offset;
+        } else if (q_pad != scratch.q_pad) {
+            return false;
+        }
+    }
+    if (q_pad < GGML_BACKEND_META_ASSIST_MIN_Q) {
+        return false;
+    }
+
+    // every idle device serves the two owners of its own group (rank / 3), every owner is served once
+    for (int ii = 0; ii < n_idles; ii++) {
+        const int r = idles[ii];
+        int n_paired = 0;
+        for (int oi = 0; oi < n_owners; oi++) {
+            if (owners[oi] / 3 == r / 3) {
+                if (n_paired >= GGML_META_ASSIST_N_OWNERS) {
+                    return false; // more than two owners in one group
+                }
+                layer.owners[ii][n_paired++] = owners[oi];
+            }
+        }
+        if (n_paired != GGML_META_ASSIST_N_OWNERS) {
+            return false;
+        }
+        layer.idle[ii] = r;
+        if (workspace_size(q_pad, (int) heads_q) == 0) {
+            return false;
+        }
+    }
+    for (int oi = 0; oi < n_owners; oi++) {
+        int n_serves = 0;
+        for (int ii = 0; ii < n_idles; ii++) {
+            if (layer.owners[ii][0] == owners[oi] || layer.owners[ii][1] == owners[oi]) {
+                n_serves++;
+            }
+        }
+        if (n_serves != 1) {
+            return false;
+        }
+    }
+
+    layer.i_node    = i_node;
+    layer.q_len     = q->ne[1];
+    layer.q_pad     = q_pad;
+    layer.heads_q   = (int) heads_q;
+    layer.kv_view   = k->ne[1];
+    layer.kv_type   = k->type;
+    layer.qs_offset = qs_offset;
+    memcpy(&layer.scale, node->op_params, sizeof(float));
+    return true;
+}
+
+// Scan the graph for shareable layers, allocate their per-backend buffers and fill the per-rank
+// descriptors. Returns false and leaves everything untouched when no layer can be shared.
+// `before_alloc` runs after the scan but before the buffers are allocated, so the caller can
+// release assist buffers of other plans first (they are too large to keep several around).
+static bool ggml_backend_meta_assist_build(
+        const ggml_cgraph * cgraph,
+        ggml_backend_meta_plan & plan,
+        const std::vector<ggml_backend_t> & simple_backends,
+        const std::vector<int> & device_ordinal,
+        const ggml_backend_assist_scratch_layout_t scratch_layout,
+        const ggml_backend_assist_workspace_size_t workspace_size,
+        const std::function<void()> & before_alloc,
+        std::vector<ggml_backend_meta_assist_layer> & layers,
+        std::vector<int> & at_node) {
+    const size_t n_backends = simple_backends.size();
+    at_node.assign(cgraph->n_nodes, -1);
+    if (n_backends != 6 || scratch_layout == nullptr || workspace_size == nullptr || device_ordinal.size() != n_backends) {
+        return false;
+    }
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_backend_meta_assist_layer layer;
+        if (!ggml_backend_meta_assist_check(cgraph, plan, i, n_backends, scratch_layout, workspace_size, layer)) {
+            continue;
+        }
+        layer.slot = (int) (layers.size() % GGML_META_ASSIST_N_SLOTS);
+        layer.desc.resize(n_backends);
+        at_node[i] = (int) layers.size();
+        layers.push_back(std::move(layer));
+    }
+    if (layers.empty()) {
+        return false;
+    }
+
+    int64_t rows = 0;
+    std::vector<size_t> work_bytes(n_backends, 0);
+    for (const auto & layer : layers) {
+        rows = std::max(rows, (int64_t) layer.q_pad * layer.heads_q);
+        for (int ii = 0; ii < GGML_META_ASSIST_N_OWNERS; ii++) {
+            work_bytes[layer.idle[ii]] = std::max(work_bytes[layer.idle[ii]],
+                workspace_size(layer.q_pad, layer.heads_q));
+        }
+    }
+    if (rows <= 0) {
+        layers.clear();
+        at_node.assign(cgraph->n_nodes, -1);
+        return false;
+    }
+
+    before_alloc();
+
+    const size_t n_epochs = GGML_META_ASSIST_N_SLOTS*3;
+    const size_t n_lasts  = GGML_META_ASSIST_N_SLOTS + n_backends*GGML_META_ASSIST_N_SLOTS*2;
+
+    std::vector<ggml_backend_meta_assist_buf> bufs(n_backends);
+    plan.buf_assist.clear();
+    plan.buf_assist.resize(n_backends);
+    for (size_t j = 0; j < n_backends; j++) {
+        ggml_backend_meta_assist_buf & b = bufs[j];
+        b.rows = rows;
+        size_t off = 0;
+        for (int s = 0; s < GGML_META_ASSIST_N_SLOTS; s++) {
+            off = (off + 127) & ~size_t(127);
+            b.slot_off[s] = off;
+            off += (size_t) rows * GGML_META_ASSIST_HEAD_DIM * sizeof(float) + (size_t) rows * 2 * sizeof(float);
+        }
+        if (work_bytes[j] > 0) {
+            off = (off + 127) & ~size_t(127);
+            b.work_off   = off;
+            b.work_bytes = work_bytes[j];
+            off += work_bytes[j];
+        }
+        off = (off + 3) & ~size_t(3);
+        b.epochs_off = off;
+        off += n_epochs * sizeof(uint32_t);
+        off = (off + 7) & ~size_t(7);
+        b.split_off = off;
+        off += GGML_META_ASSIST_N_SLOTS * sizeof(ggml_backend_meta_assist_split);
+        off = (off + 3) & ~size_t(3);
+        b.lasts_off = off;
+        off += n_lasts * sizeof(uint32_t);
+
+        ggml_backend_buffer_t buf = ggml_backend_alloc_buffer(simple_backends[j], off);
+        GGML_ASSERT(buf != nullptr);
+        b.buf  = buf;
+        b.base = (char *) ggml_backend_buffer_get_base(buf);
+        GGML_ASSERT((uintptr_t) b.base % 128 == 0);
+        // epochs start at 0. The data epochs (KV ready, partial ready) start their last word at 0
+        // so the first wait blocks until the peer signals; the free epoch starts at 0xFFFFFFFF
+        // because there is no earlier use of the slot to wait for.
+        ggml_backend_buffer_clear(buf, 0x00);
+        {
+            std::vector<uint8_t> lasts_init(n_lasts * sizeof(uint32_t), 0x00);
+            for (size_t o = 0; o < n_backends; o++) {
+                for (int s = 0; s < GGML_META_ASSIST_N_SLOTS; s++) {
+                    const size_t i = GGML_META_ASSIST_N_SLOTS + (o*GGML_META_ASSIST_N_SLOTS + s)*2 + 1; // last_free
+                    memset(&lasts_init[i * sizeof(uint32_t)], 0xFF, sizeof(uint32_t));
+                }
+            }
+            const ggml_init_params params = {
+                /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            ggml_context_ptr ctx(ggml_init(params));
+            ggml_tensor * lasts = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, n_lasts * sizeof(uint32_t));
+            ggml_backend_tensor_alloc(buf, lasts, b.base + b.lasts_off);
+            ggml_backend_tensor_set(lasts, lasts_init.data(), 0, lasts_init.size());
+        }
+        plan.buf_assist[j].reset(buf);
+    }
+
+    for (auto & layer : layers) {
+        const int slot = layer.slot;
+        for (size_t j = 0; j < n_backends; j++) {
+            ggml_backend_meta_assist_rank d = {};
+
+            int i_idle = -1;
+            for (int ii = 0; ii < GGML_META_ASSIST_N_OWNERS; ii++) {
+                if (layer.idle[ii] == (int) j) {
+                    i_idle = ii;
+                }
+            }
+
+            d.q_pad    = layer.q_pad;
+            d.q_len    = (int32_t) layer.q_len;
+            d.heads_q  = layer.heads_q;
+            d.heads_kv = 1;
+            d.batch    = 1;
+            d.kv_view  = (int32_t) layer.kv_view;
+            d.kv_window = GGML_BACKEND_META_ASSIST_KV_WINDOW;
+            d.kv_type  = layer.kv_type;
+            d.scale    = layer.scale;
+
+            if (i_idle >= 0) {
+                // idle device: it serves the two owners of its group
+                d.role     = 1;
+                d.n_owners = GGML_META_ASSIST_N_OWNERS;
+                d.split_local = ggml_backend_meta_assist_split_at(bufs[j], slot);
+                d.mask_is_range   = true;
+
+                const ggml_tensor * mask = plan.nodes[j][layer.i_node]->src[3];
+                d.mask = mask->data;
+                // int2 units, as the CUDA range bounds kernel indexes the mask
+                d.mask_row_stride   = (int64_t) mask->nb[1] / sizeof(int64_t);
+                d.mask_batch_stride = mask->ne[3] == 1 ? 0 : (int64_t) mask->nb[3] / sizeof(int64_t);
+
+                d.work       = bufs[j].base + bufs[j].work_off;
+                d.work_bytes = bufs[j].work_bytes;
+
+                for (int jj = 0; jj < GGML_META_ASSIST_N_OWNERS; jj++) {
+                    const int o = layer.owners[i_idle][jj];
+                    const ggml_tensor * fa_o = plan.nodes[o][layer.i_node];
+                    d.owners[jj]   = o;
+                    d.owner_dev[jj] = device_ordinal[o];
+                    d.k_src[jj] = fa_o->src[1]->data;
+                    d.v_src[jj] = fa_o->src[2]->data;
+                    d.qs_src[jj] = (const char *) fa_o->data + ggml_nbytes(fa_o) + layer.qs_offset;
+                    d.p_out_dst[jj] = ggml_backend_meta_assist_p_out(bufs[o], slot);
+                    d.p_max_dst[jj] = ggml_backend_meta_assist_p_max(bufs[o], slot);
+                    d.p_sum_dst[jj] = ggml_backend_meta_assist_p_sum(bufs[o], slot);
+                    d.epoch_kv[jj]      = ggml_backend_meta_assist_epoch(bufs[o], slot, 0);
+                    d.epoch_partial[jj] = ggml_backend_meta_assist_epoch(bufs[o], slot, 1);
+                    d.epoch_free[jj]    = ggml_backend_meta_assist_epoch(bufs[o], slot, 2);
+                    d.last_kv[jj]   = ggml_backend_meta_assist_last_idle(bufs[j], o, slot, 0);
+                    d.last_free[jj] = ggml_backend_meta_assist_last_idle(bufs[j], o, slot, 1);
+                    d.split_src[jj] = ggml_backend_meta_assist_split_at(bufs[o], slot);
+                }
+            } else {
+                // owner device: it merges the tail partial of its single idle device
+                int idle_rank = -1;
+                for (int ii = 0; ii < GGML_META_ASSIST_N_OWNERS && idle_rank < 0; ii++) {
+                    for (int jj = 0; jj < GGML_META_ASSIST_N_OWNERS; jj++) {
+                        if (layer.owners[ii][jj] == (int) j) {
+                            idle_rank = layer.idle[ii];
+                            break;
+                        }
+                    }
+                }
+                GGML_ASSERT(idle_rank >= 0);
+
+                d.role        = 0;
+                d.n_owners    = 1;
+                d.assist_rank = idle_rank;
+                d.owner_dev[0] = device_ordinal[j];
+                d.split_local = ggml_backend_meta_assist_split_at(bufs[j], slot);
+                d.p_out_local = ggml_backend_meta_assist_p_out(bufs[j], slot);
+                d.p_max_local = ggml_backend_meta_assist_p_max(bufs[j], slot);
+                d.p_sum_local = ggml_backend_meta_assist_p_sum(bufs[j], slot);
+                d.epoch_kv_local      = ggml_backend_meta_assist_epoch(bufs[j], slot, 0);
+                d.epoch_partial_local = ggml_backend_meta_assist_epoch(bufs[j], slot, 1);
+                d.last_partial_local  = ggml_backend_meta_assist_last_partial(bufs[j], slot);
+                d.epoch_free_local    = ggml_backend_meta_assist_epoch(bufs[j], slot, 2);
+            }
+            layer.desc[j] = d;
+        }
+    }
+
+    return true;
+}
 
 // One launcher thread per backend: with a single thread the launch overhead of every
 // subgraph of every rank is serialized on the host and can keep the GPUs idle. The
@@ -2764,6 +3191,8 @@ struct ggml_backend_meta_launchers {
     void *                                  comm_ctx           = nullptr;
     ggml_backend_comm_allreduce_rank_can_t  allreduce_rank_can = nullptr;
     ggml_backend_comm_allreduce_rank_t      allreduce_rank     = nullptr;
+    ggml_backend_set_assist_t               assist_set         = nullptr;
+    ggml_backend_assist_run_t               assist_run         = nullptr;
 
     // optional whole-graph capture, all set or all nullptr
     ggml_backend_capture_begin_t  capture_begin  = nullptr;
@@ -2801,9 +3230,12 @@ struct ggml_backend_meta_launchers {
     ggml_backend_meta_launchers(std::vector<ggml_backend_t> backends,
             void * comm_ctx,
             ggml_backend_comm_allreduce_rank_can_t allreduce_rank_can,
-            ggml_backend_comm_allreduce_rank_t allreduce_rank) :
+            ggml_backend_comm_allreduce_rank_t allreduce_rank,
+            ggml_backend_set_assist_t assist_set,
+            ggml_backend_assist_run_t assist_run) :
         backends(std::move(backends)), comm_ctx(comm_ctx),
         allreduce_rank_can(allreduce_rank_can), allreduce_rank(allreduce_rank),
+        assist_set(assist_set), assist_run(assist_run),
         capture_ok(this->backends.size(), 0),
         statuses(this->backends.size(), GGML_STATUS_SUCCESS) {
         threads.reserve(this->backends.size());
@@ -2950,14 +3382,34 @@ struct ggml_backend_meta_launchers {
         ggml_backend_t backend = backends[j];
 
         for (size_t i = i0; i < i1; i++) {
+            const ggml_backend_meta_collect & collect = p->collects[i];
+            const bool assist = collect.kind == GGML_BACKEND_META_COLLECT_ASSIST;
+
+            // mount the assist on the owner just for the FA node at the end of this subgraph
+            if (assist && collect.assist[j].role == 0) {
+                if (!assist_set(backend, &collect.assist[j])) {
+                    return GGML_STATUS_FAILED;
+                }
+            }
             if (p->cgraphs[j][i].cgraph_main->n_nodes > 0) {
                 const ggml_status status = ggml_backend_graph_compute_async(backend, p->cgraphs[j][i].cgraph_main);
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;
                 }
             }
+            if (assist && collect.assist[j].role == 0) {
+                if (!assist_set(backend, nullptr)) {
+                    return GGML_STATUS_FAILED;
+                }
+            }
 
-            const ggml_backend_meta_collect & collect = p->collects[i];
+            if (assist) {
+                // the idle rank copies and attends the owner's KV tail, the owner is a no-op here
+                if (!assist_run(backend, &collect.assist[j]) || !barrier()) {
+                    return GGML_STATUS_FAILED;
+                }
+                continue;
+            }
             if (collect.kind != GGML_BACKEND_META_COLLECT_ALLREDUCE) {
                 if (collect.local[j].graph != nullptr) {
                     const ggml_status status = ggml_backend_graph_compute_async(backend, collect.local[j].graph);
@@ -3096,6 +3548,14 @@ struct ggml_backend_meta_context {
     // optional, see ggml_backend_meta_launchers
     ggml_backend_comm_allreduce_rank_capturable_t comm_allreduce_rank_capturable = nullptr;
 
+    // Optional: meta assist, see ggml_backend_meta_assist_rank. All procs and the device
+    // ordinals must be available for a plan to take the assist path.
+    ggml_backend_set_assist_t            assist_set            = nullptr;
+    ggml_backend_assist_run_t            assist_run            = nullptr;
+    ggml_backend_assist_workspace_size_t assist_workspace_size = nullptr;
+    ggml_backend_assist_scratch_layout_t assist_scratch_layout = nullptr;
+    std::vector<int>                     device_ordinal;
+
     // Invalidate a plan. Its executables may still run, so the ranks are synchronized before they are freed.
     void plan_clear(ggml_backend_meta_plan & plan) {
         if (plan.uid != 0) {
@@ -3133,6 +3593,29 @@ struct ggml_backend_meta_context {
         }
         name += ")";
 
+        {
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0]));
+            assist_set            = (ggml_backend_set_assist_t)            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_assist");
+            assist_run            = (ggml_backend_assist_run_t)            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_assist_run");
+            assist_workspace_size = (ggml_backend_assist_workspace_size_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_assist_workspace_size");
+            assist_scratch_layout = (ggml_backend_assist_scratch_layout_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_assist_scratch_layout");
+            ggml_backend_device_ordinal_t get_device_ordinal = (ggml_backend_device_ordinal_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_get_device_ordinal");
+
+            if (assist_set != nullptr && assist_run != nullptr && assist_workspace_size != nullptr &&
+                    assist_scratch_layout != nullptr && get_device_ordinal != nullptr) {
+                device_ordinal.resize(n_devs);
+                for (size_t i = 0; i < n_devs; i++) {
+                    device_ordinal[i] = get_device_ordinal(simple_backends[i]);
+                }
+            } else {
+                assist_set            = nullptr;
+                assist_run            = nullptr;
+                assist_workspace_size = nullptr;
+                assist_scratch_layout = nullptr;
+            }
+        }
+
         if (n_devs > 1) {
             ggml_backend_comm_init_t comm_init = (ggml_backend_comm_init_t) ggml_backend_reg_get_proc_address(
                 ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_init");
@@ -3162,7 +3645,8 @@ struct ggml_backend_meta_context {
             // this way when every collective in it can be driven per rank.
             if (n_devs > 1 && comm_allreduce_rank_can != nullptr && comm_allreduce_rank != nullptr) {
                 launchers = std::make_unique<ggml_backend_meta_launchers>(
-                    simple_backends, comm_ctx, comm_allreduce_rank_can, comm_allreduce_rank);
+                    simple_backends, comm_ctx, comm_allreduce_rank_can, comm_allreduce_rank,
+                    assist_set, assist_run);
 
                 // Optional: whole-graph capture of the launch sequences.
                 ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0]));
@@ -3622,6 +4106,30 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
+        // Full attention nodes the model marked shareable: identify them before the collectives are
+        // built and allocate the per-backend assist buffers (the boundary lands on the FA node).
+        std::vector<ggml_backend_meta_assist_layer> assist_layers;
+        std::vector<int> assist_at;
+        {
+            std::vector<ggml_backend_t> simple_backends(n_backends);
+            for (size_t j = 0; j < n_backends; j++) {
+                simple_backends[j] = backend_ctx->backend_configs[j].backend;
+            }
+            ggml_backend_meta_assist_build(cgraph, plan, simple_backends, backend_ctx->device_ordinal,
+                backend_ctx->assist_scratch_layout, backend_ctx->assist_workspace_size,
+                [&]() {
+                    // one assist plan at a time: the workspace is hundreds of MB per device and
+                    // the graphs that use it are submitted in sequence, so drop the captured
+                    // plans of the previous graphs instead of keeping them all
+                    for (auto & plan_other : backend_ctx->plans) {
+                        if (&plan_other != &plan && !plan_other.buf_assist.empty()) {
+                            backend_ctx->plan_clear(plan_other);
+                        }
+                    }
+                },
+                assist_layers, assist_at);
+        }
+
         {
             // For MoE models it may make sense to delay the AllReduce in order to reduce I/O:
             auto get_i_delayed_branch = [&](const int i) -> int {
@@ -3803,6 +4311,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 } else if (ggml_backend_meta_node_pad_uneven(node)) {
                     collect_kind = GGML_BACKEND_META_COLLECT_PAD;
                 }
+                // a shareable FA node ends its subgraph so that its assist sits right after it;
+                // the FA node itself is computed by the subgraph, not by the collective
+                const int i_assist = assist_at[i];
+                if (i_assist >= 0) {
+                    collect_kind = GGML_BACKEND_META_COLLECT_ASSIST;
+                }
                 const bool new_subgraph = i + 1 == cgraph->n_nodes || split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL ||
                                           collect_kind != GGML_BACKEND_META_COLLECT_ALLREDUCE;
                 if (!new_subgraph) {
@@ -3833,6 +4347,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 plan.collects.emplace_back();
                 plan.collects.back().kind   = collect_kind;
                 plan.collects.back().i_node = i;
+                if (i_assist >= 0) {
+                    plan.collects.back().assist = std::move(assist_layers[i_assist].desc);
+                }
                 n_subgraphs++;
                 i_start = i + 1;
             }
@@ -3892,7 +4409,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 const size_t i_node_start = plan.cgraphs[j][i_graph].offset;
                 const size_t i_node_stop = i_graph + 1 < n_subgraphs ? plan.cgraphs[j][i_graph + 1].offset : cgraph->n_nodes;
                 size_t n_nodes_ij = i_node_stop - i_node_start;
-                if (plan.collects[i_graph].kind != GGML_BACKEND_META_COLLECT_ALLREDUCE) {
+                const int kind_ij = plan.collects[i_graph].kind;
+                if (kind_ij != GGML_BACKEND_META_COLLECT_ALLREDUCE && kind_ij != GGML_BACKEND_META_COLLECT_ASSIST) {
                     // the boundary node itself is computed by the collective
                     GGML_ASSERT(plan.collects[i_graph].i_node == (int) i_node_stop - 1);
                     n_nodes_ij--;
@@ -3939,6 +4457,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 for (size_t j = 0; j < n_backends; j++) {
                     collect.reduce[j] = plan.nodes[j][collect.i_node];
                 }
+                continue;
+            }
+            if (collect.kind == GGML_BACKEND_META_COLLECT_ASSIST) {
+                // the descriptors built with the buffers, no auxiliary graphs
                 continue;
             }
             if (collect.kind == GGML_BACKEND_META_COLLECT_PAD) {
@@ -4010,6 +4532,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     needed = (needed + 15) & ~size_t(15);
                     needed += ggml_nbytes(t);
                 }
+            }
+            if (needed == 0) {
+                // e.g. a plan whose only collectives are the assist ones
+                continue;
             }
             if (!plan.buf_collect[j] || ggml_backend_buffer_get_size(plan.buf_collect[j].get()) < needed) {
                 plan.buf_collect[j].reset(ggml_backend_alloc_buffer(simple_backend, needed));
@@ -4255,18 +4781,37 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     }
 
     for (size_t i = 0; i < p->n_subgraphs; i++) {
+        ggml_backend_meta_collect & collect = p->collects[i];
+        const bool assist = collect.kind == GGML_BACKEND_META_COLLECT_ASSIST;
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
-            if (p->cgraphs[j][i].cgraph_main->n_nodes == 0) {
-                continue;
+            if (assist && collect.assist[j].role == 0) {
+                if (!backend_ctx->assist_set(bcj.backend, &collect.assist[j])) {
+                    return GGML_STATUS_FAILED;
+                }
             }
-            const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, p->cgraphs[j][i].cgraph_main);
-            if (status != GGML_STATUS_SUCCESS) {
-                return status;
+            if (p->cgraphs[j][i].cgraph_main->n_nodes > 0) {
+                const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, p->cgraphs[j][i].cgraph_main);
+                if (status != GGML_STATUS_SUCCESS) {
+                    return status;
+                }
+            }
+            if (assist && collect.assist[j].role == 0) {
+                if (!backend_ctx->assist_set(bcj.backend, nullptr)) {
+                    return GGML_STATUS_FAILED;
+                }
             }
         }
 
-        ggml_backend_meta_collect & collect = p->collects[i];
+        if (assist) {
+            // the idle rank copies and attends the owner's KV tail, the owner is a no-op here
+            for (size_t j = 0; j < n_backends; j++) {
+                if (!backend_ctx->assist_run(backend_ctx->backend_configs[j].backend, &collect.assist[j])) {
+                    return GGML_STATUS_FAILED;
+                }
+            }
+            continue;
+        }
         if (collect.kind != GGML_BACKEND_META_COLLECT_ALLREDUCE) {
             for (size_t j = 0; j < n_backends; j++) {
                 if (collect.local[j].graph == nullptr) {
