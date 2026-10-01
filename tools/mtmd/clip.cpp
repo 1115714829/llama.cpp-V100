@@ -2750,7 +2750,8 @@ struct clip_model_loader {
                     model.std_bias  = get_tensor(TN_STD_BIAS,  false);
                     model.std_scale = get_tensor(TN_STD_SCALE, false);
                     // load scalar for Gemma4ClippableLinear
-                    for (auto * tensor : tensors_to_load) {
+                    for (const auto & entry : tensors_to_load) {
+                        ggml_tensor * tensor = entry.first;
                         std::string name = tensor->name;
                         if (string_ends_with(name, ".weight")) {
                             std::string name_inp_max = name;
@@ -3465,7 +3466,8 @@ struct clip_model_loader {
                     }
 
                     // Load clamp info for ClippableLinear AFTER all tensors are loaded
-                    for (auto * tensor : tensors_to_load) {
+                    for (const auto & entry : tensors_to_load) {
+                        ggml_tensor * tensor = entry.first;
                         std::string name = tensor->name;
                         if (string_ends_with(name, ".weight")) {
                             std::string name_inp_max = name;
