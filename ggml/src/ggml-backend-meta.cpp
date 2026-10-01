@@ -479,7 +479,7 @@ struct ggml_backend_meta_simple_tensor_container {
 
 // Number of plan slots. Decode plans stay alive while prefill/checkpoint shapes rotate through the
 // remaining slots.
-static constexpr int GGML_META_N_PLANS = 6;
+static constexpr int GGML_META_N_PLANS = 8;
 
 // Number of rotating "compute" containers: one per plan plus two that are being filled by the
 // next graph allocations, so that a rebuild never evicts the views of all plans at once.
