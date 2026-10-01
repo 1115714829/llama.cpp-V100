@@ -32,8 +32,9 @@ constexpr int SM70_D256_D       = 256;
 // Windowed KV mirror: when a range mask covers far fewer rows than the K/V
 // view, the q8_0/q4_0 f16 mirror costs many hundreds of MB per device. The
 // launcher then converts at most this many KV rows per window and runs the
-// Partial kernel once per window. 65536 is a multiple of kBlockN (64).
-#define SM70_D256_KV_WINDOW 65536
+// Partial kernel once per window. 131072 keeps the prefill speed of the unwindowed
+// mirror while still capping it, and is a multiple of kBlockN (64).
+#define SM70_D256_KV_WINDOW 131072
 static_assert(SM70_D256_KV_WINDOW % SM70_D256_BLOCK_M == 0, "window is not a multiple of the q block");
 
 // Q f32 -> f16 staging. grid = (q_pad, batch*hkv, gqa), block = 128 threads
