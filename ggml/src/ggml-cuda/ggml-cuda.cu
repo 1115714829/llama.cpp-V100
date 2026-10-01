@@ -1464,7 +1464,7 @@ static bool ggml_backend_cuda_set_assist(ggml_backend_t backend, const ggml_back
         if (desc->role != 0 && desc->role != 1) {
             return false;
         }
-        if (desc->q_len < GGML_BACKEND_META_ASSIST_MIN_Q || desc->kv_len < GGML_BACKEND_META_ASSIST_MIN_KV) {
+        if (desc->q_len < GGML_BACKEND_META_ASSIST_MIN_Q || desc->kv_view < GGML_BACKEND_META_ASSIST_MIN_KV) {
             return false;
         }
     }
