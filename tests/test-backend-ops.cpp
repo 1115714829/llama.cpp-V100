@@ -218,7 +218,9 @@ static void init_tensor_kq_mask_causal(ggml_tensor * tensor) {
 
 // generate an I32 range mask: the row for query i1 holds [lo, hi), the visible KV columns
 // mode: 1 = causal, 2 = random, 3 = causal over the first half of the KV positions (a range
-// that ends well before the KV view the kernel is given)
+// that ends well before the KV view the kernel is given), 4 = deterministic split coverage:
+// every third row sees only the first eighth of the KV view, the next one only the last
+// eighth, and the last one is fully masked (all -inf)
 static void init_tensor_kq_range(ggml_tensor * tensor, int64_t n_kv, int mode) {
     GGML_ASSERT(tensor->type == GGML_TYPE_I32);
     GGML_ASSERT(tensor->ne[0] == 2);
@@ -245,6 +247,21 @@ static void init_tensor_kq_range(ggml_tensor * tensor, int64_t n_kv, int mode) {
                     lo = 0;
                     hi = n_kv/2 - ne1 + i1 + 1;
                     hi = std::max<int64_t>(1, std::min<int64_t>(hi, n_kv/2));
+                } else if (mode == 4) {
+                    switch (i1 % 3) {
+                        case 0:
+                            lo = 0;
+                            hi = std::max<int64_t>(1, n_kv/8);
+                            break;
+                        case 1:
+                            lo = n_kv - n_kv/8;
+                            hi = n_kv;
+                            break;
+                        default:
+                            lo = n_kv/2;
+                            hi = n_kv/2;
+                            break;
+                    }
                 } else {
                     lo = std::uniform_int_distribution<int64_t>(0, n_kv - 1)(gen);
                     hi = std::uniform_int_distribution<int64_t>(lo + 1, n_kv)(gen);
@@ -8554,7 +8571,7 @@ struct test_flash_attn_ext : public test_case {
     const bool v_is_view_of_k;
     const int64_t n_kv_max;
     const bool causal; // use a causal mask instead of a random mask
-    const int range; // 0: dense f16 mask, 1: causal range mask (I32), 2: random range mask (I32)
+    const int range; // 0: dense f16 mask, 1: causal range mask (I32), 2: random range mask (I32), 3/4: deterministic range masks
 
     std::string vars() override {
         return VARS_TO_STR19(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max, causal, range);
@@ -12022,6 +12039,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 131072, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, false, 3));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 131072,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, false, 2));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 163840, 256, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}, true, false, 0, false, 1));
+    // KV-split edges (mode 4): rows whose range lies only in the upper half of
+    // the first window leave split 0 empty, rows whose range lies only in the
+    // second window leave the whole first window empty, and all -inf rows must
+    // come out zero. The second case also runs the split with a full q block grid.
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 163840,   64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}, true, false, 0, false, 4));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 163840, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, false, 4));
 
     // range masks that stop at half of the KV view (the split-d conversion must
     // follow the bounds, not the view width)
