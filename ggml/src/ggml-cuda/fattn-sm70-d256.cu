@@ -730,6 +730,247 @@ void ggml_cuda_sm70_d256_launch_raw(
         stream);
 }
 
+// ---------------------------------------------------------------------------
+// Meta assist: cross-device epochs, idle-rank workspace and idle-rank run
+// ---------------------------------------------------------------------------
+
+// Cross-device epoch flags. The owner bumps its own epoch after the data it produced (Q staging)
+// or consumed (raw partials) is visible; the waiting rank spins on that epoch before it touches
+// the data. __threadfence_system orders the data accesses (peer visible) against the flag update.
+static __global__ void sm70_d256_assist_signal(uint32_t * epoch) {
+    __threadfence_system();
+    atomicAdd(epoch, 1);
+}
+
+// One thread spins until the epoch changes, then records it. `last` lives on the waiting device,
+// `epoch` may live on a peer device; the volatile read keeps the poll in the spin loop. The
+// fences order the data reads/writes around the flag access.
+static __global__ void sm70_d256_assist_wait(volatile uint32_t * epoch, uint32_t * last) {
+    if (threadIdx.x != 0) {
+        return;
+    }
+    __threadfence_system();
+    const uint32_t seen = *last;
+    if (*epoch == seen) {
+        while (*epoch == seen) {
+        }
+    }
+    __threadfence_system();
+    *last = *epoch;
+}
+
+static void sm70_d256_assist_signal_launch(uint32_t * epoch, cudaStream_t stream) {
+    sm70_d256_assist_signal<<<1, 1, 0, stream>>>(epoch);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static void sm70_d256_assist_wait_launch(volatile uint32_t * epoch, uint32_t * last, cudaStream_t stream) {
+    sm70_d256_assist_wait<<<1, 1, 0, stream>>>(epoch, last);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// Idle-rank workspace, one block per device reused by every layer. All offsets are relative to
+// the buffer base, padded to 128 B:
+//   [q8 K staging: one window][q8 V staging: one window]
+//   [f16 K mirror: one window][f16 V mirror: one window]
+//   [Qs f16 copy of the owner staging][mask bounds int2][kv_limit int]
+//   [window O f32: q_pad*heads_q rows][window max][window sum]
+struct sm70_d256_assist_workspace {
+    size_t total;
+    size_t stage_k;
+    size_t stage_v;
+    size_t mirror_k;
+    size_t mirror_v;
+    size_t qs;
+    size_t bounds;
+    size_t kv_limit;
+    size_t win_out;
+    size_t win_max;
+    size_t win_sum;
+    int64_t rows;      // q_pad * heads_q
+    int q_pad;
+    int q_blocks;      // q_pad / SM70_D256_BLOCK_M
+};
+
+static sm70_d256_assist_workspace sm70_d256_assist_get_workspace(int q_pad, int heads_q, int kv_type) {
+    sm70_d256_assist_workspace w = {};
+    const size_t row_bytes = ggml_row_size((enum ggml_type) kv_type, SM70_D256_D);
+    const size_t staging = (size_t) SM70_D256_KV_WINDOW * row_bytes;
+    const size_t mirror = (size_t) SM70_D256_KV_WINDOW * SM70_D256_D * sizeof(half);
+    w.rows = (int64_t) q_pad * heads_q;
+    w.q_pad = q_pad;
+    w.q_blocks = q_pad / SM70_D256_BLOCK_M;
+
+    size_t off = 0;
+    off = GGML_PAD(off, 128); w.stage_k  = off; off += staging;
+    off = GGML_PAD(off, 128); w.stage_v  = off; off += staging;
+    off = GGML_PAD(off, 128); w.mirror_k = off; off += mirror;
+    off = GGML_PAD(off, 128); w.mirror_v = off; off += mirror;
+    off = GGML_PAD(off, 128); w.qs       = off; off += (size_t) w.rows * SM70_D256_D * sizeof(half);
+    off = GGML_PAD(off, 128); w.bounds   = off; off += (size_t) w.q_blocks * sizeof(int2);
+    off = GGML_PAD(off, 128); w.kv_limit = off; off += sizeof(int);
+    off = GGML_PAD(off, 128); w.win_out  = off; off += (size_t) w.rows * SM70_D256_D * sizeof(float);
+    off = GGML_PAD(off, 128); w.win_max  = off; off += (size_t) w.rows * sizeof(float);
+    off = GGML_PAD(off, 128); w.win_sum  = off; off += (size_t) w.rows * sizeof(float);
+    w.total = GGML_PAD(off, 128);
+    return w;
+}
+
+size_t ggml_cuda_sm70_d256_assist_workspace_size(int q_pad, int heads_q) {
+    // q8_0 gives the largest staging rows of the supported KV types, so size for it
+    return sm70_d256_assist_get_workspace(q_pad, heads_q, GGML_TYPE_Q8_0).total;
+}
+
+// One window of the q8_0/q4_0 staging rows -> the local f16 mirror. `src` is the staging base,
+// shifted back by the segment start so the kernel row indices stay global (as in the owner's
+// windowed path); rows at or past *kv_limit are skipped on the device.
+template <ggml_type type>
+static void sm70_d256_dequant_staging_window(
+        const char * src, half * dst, const int * kv_limit,
+        const int row_lo, const int win_rows, const int64_t row_bytes, cudaStream_t stream) {
+    const dim3 grid((unsigned) ((win_rows + 7) / 8), 1, 1);
+    sm70_d256_dequant_rows<type><<<grid, 256, 0, stream>>>(
+        src, dst, SM70_D256_D, 1, row_bytes, 0, 0, kv_limit, row_lo, win_rows);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+bool ggml_cuda_sm70_d256_assist_run(void * backend, const ggml_backend_meta_assist_rank * d) {
+    if (backend == nullptr || d == nullptr || d->role != 1 || d->work == nullptr) {
+        return false;
+    }
+    if (d->n_owners < 1 || d->n_owners > 2 || d->batch != 1 || d->heads_kv != 1 || d->mask == nullptr || !d->mask_is_range) {
+        return false;
+    }
+    if (d->q_len < GGML_BACKEND_META_ASSIST_MIN_Q || d->kv_len < GGML_BACKEND_META_ASSIST_MIN_KV) {
+        return false;
+    }
+    if (d->q_pad <= 0 || d->q_pad % SM70_D256_BLOCK_M != 0 || d->heads_q <= 0 || d->row0 < 0 || d->n_rows <= 0 ||
+        d->row0 + d->n_rows > d->kv_len) {
+        return false;
+    }
+    if (d->kv_type != GGML_TYPE_Q8_0 && d->kv_type != GGML_TYPE_Q4_0) {
+        return false;
+    }
+    ggml_backend_t be = (ggml_backend_t) backend;
+    if (!ggml_backend_is_cuda(be)) {
+        return false;
+    }
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) be->context;
+    ggml_cuda_set_device(ctx->device);
+    cudaStream_t stream = ctx->stream();
+
+    const sm70_d256_assist_workspace w = sm70_d256_assist_get_workspace(d->q_pad, d->heads_q, d->kv_type);
+    GGML_ASSERT(d->work_bytes >= w.total);
+    GGML_ASSERT((uintptr_t) d->work % 128 == 0);
+
+    char * const work = (char *) d->work;
+    char * const stage_k  = work + w.stage_k;
+    char * const stage_v  = work + w.stage_v;
+    half * const mirror_k = (half *) (work + w.mirror_k);
+    half * const mirror_v = (half *) (work + w.mirror_v);
+    half * const qs       = (half *) (work + w.qs);
+    int2 * const bounds   = (int2 *) (work + w.bounds);
+    int  * const kv_limit = (int *) (work + w.kv_limit);
+    float * const win_out = (float *) (work + w.win_out);
+    float * const win_max = (float *) (work + w.win_max);
+    float * const win_sum = (float *) (work + w.win_sum);
+
+    const int64_t row_bytes = ggml_row_size((enum ggml_type) d->kv_type, SM70_D256_D);
+    const int64_t qs_bytes = (int64_t) d->heads_q * d->q_pad * SM70_D256_D * sizeof(half);
+    const int n_win = (int) ((d->n_rows + SM70_D256_KV_WINDOW - 1) / SM70_D256_KV_WINDOW);
+    const unsigned n_merge = (unsigned) ((w.rows
+        + FLASH_NAMESPACE::kWindowMergeRowsPerCta - 1)
+        / FLASH_NAMESPACE::kWindowMergeRowsPerCta);
+
+    // Two owners are processed back to back on the one stream; the owner cards run in parallel
+    // with each other, but a single idle device serves both, so the copies and kernels of the
+    // second owner are simply enqueued after the first owner's epoch signalled.
+    for (int j = 0; j < d->n_owners; ++j) {
+        GGML_ASSERT(d->k_src[j] != nullptr && d->v_src[j] != nullptr && d->qs_src[j] != nullptr);
+        GGML_ASSERT(d->p_out_dst[j] != nullptr && d->p_max_dst[j] != nullptr && d->p_sum_dst[j] != nullptr);
+        GGML_ASSERT(d->epoch_kv[j] != nullptr && d->epoch_partial[j] != nullptr && d->epoch_free[j] != nullptr);
+        GGML_ASSERT(d->last_kv[j] != nullptr && d->last_free[j] != nullptr);
+
+        // The owner's Q staging and its K/V cache writes are complete once it bumps this epoch.
+        sm70_d256_assist_wait_launch(d->epoch_kv[j], d->last_kv[j], stream);
+
+        CUDA_CHECK(cudaMemcpyPeerAsync(qs, ctx->device, d->qs_src[j], d->owner_dev[j], (size_t) qs_bytes, stream));
+        CUDA_CHECK(cudaMemsetAsync(kv_limit, 0, sizeof(int), stream));
+        {
+            const dim3 grid(w.q_blocks, d->batch);
+            sm70_d256_range_bounds_kernel<<<grid, SM70_D256_BLOCK_M, 0, stream>>>(
+                (const int2 *) d->mask, bounds, kv_limit,
+                d->q_len, d->kv_len, d->mask_row_stride, d->mask_batch_stride);
+            CUDA_CHECK(cudaGetLastError());
+        }
+
+        for (int wi = 0; wi < n_win; ++wi) {
+            const int64_t row_lo = d->row0 + (int64_t) wi * SM70_D256_KV_WINDOW;
+            const int64_t rows_left = d->row0 + d->n_rows - row_lo;
+            const int win_rows = (int) (rows_left < SM70_D256_KV_WINDOW ? rows_left : SM70_D256_KV_WINDOW);
+
+            CUDA_CHECK(cudaMemcpyPeerAsync(stage_k, ctx->device,
+                (const char *) d->k_src[j] + row_lo * row_bytes, d->owner_dev[j],
+                (size_t) win_rows * row_bytes, stream));
+            CUDA_CHECK(cudaMemcpyPeerAsync(stage_v, ctx->device,
+                (const char *) d->v_src[j] + row_lo * row_bytes, d->owner_dev[j],
+                (size_t) win_rows * row_bytes, stream));
+
+            if (d->kv_type == GGML_TYPE_Q8_0) {
+                sm70_d256_dequant_staging_window<GGML_TYPE_Q8_0>(
+                    stage_k - row_lo * row_bytes, mirror_k, kv_limit, (int) row_lo, win_rows, row_bytes, stream);
+                sm70_d256_dequant_staging_window<GGML_TYPE_Q8_0>(
+                    stage_v - row_lo * row_bytes, mirror_v, kv_limit, (int) row_lo, win_rows, row_bytes, stream);
+            } else {
+                sm70_d256_dequant_staging_window<GGML_TYPE_Q4_0>(
+                    stage_k - row_lo * row_bytes, mirror_k, kv_limit, (int) row_lo, win_rows, row_bytes, stream);
+                sm70_d256_dequant_staging_window<GGML_TYPE_Q4_0>(
+                    stage_v - row_lo * row_bytes, mirror_v, kv_limit, (int) row_lo, win_rows, row_bytes, stream);
+            }
+
+            // The owner may still be reading its partial slots of the previous execution; wait
+            // before the first write of this execution (the first merge below). On the very
+            // first execution the free epoch is still the initial value, so this passes.
+            if (wi == 0) {
+                sm70_d256_assist_wait_launch(d->epoch_free[j], d->last_free[j], stream);
+            }
+
+            const half * const K_win = mirror_k - row_lo * SM70_D256_D;
+            const half * const V_win = mirror_v - row_lo * SM70_D256_D;
+            const int64_t kv_head_stride = (int64_t) win_rows * SM70_D256_D;
+            const int64_t kv_outer_stride = (int64_t) d->heads_kv * win_rows * SM70_D256_D;
+
+            sm70_d256_launch_dense<true>(
+                qs, K_win, V_win, win_out, d->mask, bounds,
+                /*q_batch_stride */ (int64_t) d->heads_q * d->q_pad * SM70_D256_D,
+                /*q_row_stride   */ SM70_D256_D,
+                /*q_head_stride  */ (int64_t) d->q_pad * SM70_D256_D,
+                kv_outer_stride, SM70_D256_D, kv_head_stride,
+                kv_outer_stride, SM70_D256_D, kv_head_stride,
+                d->mask_row_stride, d->mask_batch_stride, true,
+                d->q_pad, d->kv_len, d->heads_q, d->heads_kv, d->batch, d->kv_len - d->q_len,
+                d->scale, 1.0f / d->scale,
+                (int) (row_lo / SM70_D256_MASK_BLOCK_N),
+                (int) ((row_lo + win_rows + SM70_D256_MASK_BLOCK_N - 1) / SM70_D256_MASK_BLOCK_N),
+                1,
+                win_out, win_max, win_sum,
+                stream);
+
+            // Merge this window into the owner's slot as one more partial; window 0 initializes
+            // the owner slot (first = true), later windows fold into it. No local accumulator and
+            // no final copy: the merged partial is what the owner waits for.
+            FLASH_NAMESPACE::sm70_d256_window_merge_kernel<<<n_merge, 256, 0, stream>>>(
+                d->p_out_dst[j], d->p_max_dst[j], d->p_sum_dst[j],
+                win_out, win_max, win_sum,
+                w.rows, wi == 0, d->scale * float(M_LOG2E));
+            CUDA_CHECK(cudaGetLastError());
+        }
+
+        sm70_d256_assist_signal_launch(d->epoch_partial[j], stream);
+    }
+    return true;
+}
+
 size_t ggml_cuda_sm70_d256_alloc_size(const ggml_tensor * dst) {
     return sm70_d256_get_scratch(dst).total;
 }
@@ -766,11 +1007,29 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
 
     cudaStream_t stream = ctx.stream();
 
+    // Owner side of a meta assist: the assist rank covers the KV tail [n_rows, kv_len), this
+    // launcher limits its window loop to [0, n_rows), signals the staged Q, then merges the
+    // assist partial and signals the partial slot as free for the next execution.
+    const ggml_backend_meta_assist_rank * const assist = ctx.assist;
+    const bool assist_owner = assist != nullptr && assist->role == 0;
+    if (assist_owner && !scratch.windowed) {
+        // the meta backend only builds assist when the KV range needs the windowed path
+        GGML_ABORT("%s: assist owner requires the windowed partial path", __func__);
+    }
+
     if (scratch.windowed) {
         // Fixed-size mirror: convert and attend one KV window at a time and
         // merge each window's raw partials into the Os/acc_max/acc_sum
         // accumulator. The first window of an unsplit launch writes the
         // accumulator directly; otherwise the partial slices merge in.
+        if (assist_owner) {
+            GGML_ASSERT(assist->batch == 1 && assist->q_pad == q_pad && assist->q_len == q_len);
+            GGML_ASSERT(assist->heads_q == heads_q && assist->kv_len == kv_len);
+            GGML_ASSERT(assist->n_rows > 0 && assist->n_rows < K->ne[1]);
+            GGML_ASSERT(assist->p_out_local != nullptr && assist->p_max_local != nullptr && assist->p_sum_local != nullptr);
+            GGML_ASSERT(assist->epoch_kv_local != nullptr && assist->epoch_partial_local != nullptr);
+            GGML_ASSERT(assist->last_partial_local != nullptr && assist->epoch_free_local != nullptr);
+        }
         CUDA_CHECK(cudaMemsetAsync(Qs, 0, scratch.n_q * sizeof(half), stream));
         // the bounds kernel raises it to the rows its bounds allow
         CUDA_CHECK(cudaMemsetAsync(kv_limit, 0, sizeof(int), stream));
@@ -782,6 +1041,12 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
                 q_len, hkv, gqa, q_pad,
                 Q->nb[1] / sizeof(float2), Q->nb[2] / sizeof(float2), Q->nb[3] / sizeof(float2));
             CUDA_CHECK(cudaGetLastError());
+        }
+
+        // The assist rank needs the staged Q; the K/V cache rows are written by earlier nodes
+        // on this stream, so stream order already makes them visible to the copy engine.
+        if (assist_owner) {
+            sm70_d256_assist_signal_launch(assist->epoch_kv_local, stream);
         }
 
         {
@@ -810,10 +1075,13 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
         const int window_ctas = m_blocks * batch * heads_q;
         const bool split_window = window_ctas < 4 * SM70_D256_NSM;
 
-        const int n_win = (int) ((K->ne[1] + SM70_D256_KV_WINDOW - 1) / SM70_D256_KV_WINDOW);
+        // In assist owner mode only the head segment [0, n_rows) is computed here; the assist
+        // rank owns [n_rows, kv_len).
+        const int64_t n_kv_rows = assist_owner ? assist->n_rows : K->ne[1];
+        const int n_win = (int) ((n_kv_rows + SM70_D256_KV_WINDOW - 1) / SM70_D256_KV_WINDOW);
         for (int w = 0; w < n_win; ++w) {
             const int64_t row_lo = (int64_t) w * SM70_D256_KV_WINDOW;
-            const int64_t rows_left = K->ne[1] - row_lo;
+            const int64_t rows_left = n_kv_rows - row_lo;
             const int win_rows = (int) (rows_left < SM70_D256_KV_WINDOW ? rows_left : SM70_D256_KV_WINDOW);
 
             // Both segments run in one launch (grid.y = batch * kv_splits);
@@ -905,6 +1173,21 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
                 }
                 CUDA_CHECK(cudaGetLastError());
             }
+        }
+
+        if (assist_owner) {
+            // Wait for the assist partial [n_rows, kv_len) and fold it into the accumulator as
+            // one more window; the merge kernel skips empty (-inf) rows and takes the assist
+            // values for rows this segment never saw.
+            sm70_d256_assist_wait_launch(assist->epoch_partial_local, assist->last_partial_local, stream);
+            const unsigned n_merge = (unsigned) ((scratch.rows
+                + FLASH_NAMESPACE::kWindowMergeRowsPerCta - 1)
+                / FLASH_NAMESPACE::kWindowMergeRowsPerCta);
+            FLASH_NAMESPACE::sm70_d256_window_merge_kernel<<<n_merge, 256, 0, stream>>>(
+                Os, acc_max, acc_sum,
+                assist->p_out_local, assist->p_max_local, assist->p_sum_local,
+                (int64_t) scratch.rows, false, scale * float(M_LOG2E));
+            CUDA_CHECK(cudaGetLastError());
         }
     } else {
         // A range mask bounds the rows the dense kernel reads, so a quantized K/V mirror
@@ -1090,6 +1373,12 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
                 dst->nb[3] / sizeof(float2));
         }
         CUDA_CHECK(cudaGetLastError());
+    }
+
+    // The scatter has consumed the merged partial: the assist rank may now overwrite the partial
+    // slots for the next execution.
+    if (assist_owner) {
+        sm70_d256_assist_signal_launch(assist->epoch_free_local, stream);
     }
 }
 

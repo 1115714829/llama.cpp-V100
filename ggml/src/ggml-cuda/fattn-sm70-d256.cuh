@@ -15,3 +15,8 @@
 bool   ggml_cuda_sm70_d256_supported(int cc, const ggml_tensor * dst);
 size_t ggml_cuda_sm70_d256_alloc_size(const ggml_tensor * dst);
 void   ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+// Assist: the idle rank (role 1) copies and attends the owner's KV tail segment on its own
+// device, the owner rank (role 0) merges the result in its FA launcher. See ggml-backend.h.
+size_t ggml_cuda_sm70_d256_assist_workspace_size(int q_pad, int heads_q);
+bool   ggml_cuda_sm70_d256_assist_run(void * backend, const struct ggml_backend_meta_assist_rank * desc);

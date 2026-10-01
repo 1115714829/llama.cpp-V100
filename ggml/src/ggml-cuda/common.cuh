@@ -1463,6 +1463,10 @@ struct ggml_backend_cuda_context {
     // see ggml_backend_cuda_capture_begin()
     bool capture_external = false;
 
+    // meta backend assist description mounted for the next graph execution, see ggml-backend.h;
+    // nullptr leaves every existing path unchanged
+    const struct ggml_backend_meta_assist_rank * assist = nullptr;
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)

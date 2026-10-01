@@ -27,6 +27,7 @@
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
+#include "ggml-cuda/fattn-sm70-d256.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
@@ -1445,6 +1446,56 @@ static bool ggml_backend_cuda_comm_allreduce_rank(
     GGML_ABORT("per-rank AllReduce not supported for this tensor");
     return false;
 }
+
+// ---------------------------------------------------------------------------
+// Meta assist: mount the per-rank assist description on a CUDA context and run
+// the idle-rank part of the collective (see ggml-backend.h). The owner part is
+// executed inside the SM70 D256 FA launcher.
+// ---------------------------------------------------------------------------
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static bool ggml_backend_cuda_set_assist(ggml_backend_t backend, const ggml_backend_meta_assist_rank * desc) {
+    if (backend == nullptr || !GGML_CUDA_SM70_D256_COMPILED) {
+        // the SM70 D256 object is absent from builds without sm_70
+        return false;
+    }
+    GGML_ASSERT(ggml_backend_is_cuda(backend));
+    if (desc != nullptr) {
+        if (desc->role != 0 && desc->role != 1) {
+            return false;
+        }
+        if (desc->q_len < GGML_BACKEND_META_ASSIST_MIN_Q || desc->kv_len < GGML_BACKEND_META_ASSIST_MIN_KV) {
+            return false;
+        }
+    }
+    ggml_backend_cuda_context * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    cuda_ctx->assist = desc;
+    return true;
+}
+
+static bool ggml_backend_cuda_assist_run(ggml_backend_t backend, const ggml_backend_meta_assist_rank * desc) {
+    if (backend == nullptr || desc == nullptr) {
+        return false;
+    }
+    GGML_ASSERT(ggml_backend_is_cuda(backend));
+    if (desc->role == 0) {
+        return true; // the FA launcher of this rank merges the assist partial
+    }
+    if constexpr (GGML_CUDA_SM70_D256_COMPILED) {
+        return ggml_cuda_sm70_d256_assist_run(backend, desc);
+    } else {
+        return false;
+    }
+}
+
+static size_t ggml_backend_cuda_assist_workspace_size(int q_pad, int heads_q) {
+    if constexpr (GGML_CUDA_SM70_D256_COMPILED) {
+        return ggml_cuda_sm70_d256_assist_workspace_size(q_pad, heads_q);
+    } else {
+        return 0;
+    }
+}
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 // host buffer type
 
@@ -7291,6 +7342,17 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_comm_allreduce_rank_capturable") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_rank_capturable;
     }
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (strcmp(name, "ggml_backend_cuda_set_assist") == 0) {
+        return (void *)ggml_backend_cuda_set_assist;
+    }
+    if (strcmp(name, "ggml_backend_cuda_assist_run") == 0) {
+        return (void *)ggml_backend_cuda_assist_run;
+    }
+    if (strcmp(name, "ggml_backend_cuda_assist_workspace_size") == 0) {
+        return (void *)ggml_backend_cuda_assist_workspace_size;
+    }
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if (strcmp(name, "ggml_backend_capture_begin") == 0) {
         return (void *)ggml_backend_cuda_capture_begin;
     }
