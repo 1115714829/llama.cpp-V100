@@ -564,7 +564,7 @@ template <> struct qskinny_codec<GGML_TYPE_Q3_K> {
     static __device__ __forceinline__ void decode(const qskinny_code records[2], const meta_t meta,
                                                   const int sub_block, half2 out[16]) {
         const float d_all = __half2float(__ushort_as_half((unsigned short) (meta.s_hi >> 32)));
-        // f16 folding: the effective code is code2 - (hbit ? 0 : 4), in [鈭?, 3]. 1024 + code2 + 8
+        // f16 folding: the effective code is code2 - (hbit ? 0 : 4), in [-4, 3]. 1024 + code2 + 8
         // (hbit set) or 1024 + code2 + 4 (hbit clear) minus 1032 gives it exactly, in one hsub2.
         const unsigned offset_bits = 0x64086408u; // f16 1032 in both halves
         const half2 offset = *reinterpret_cast<const half2 *>(&offset_bits);
