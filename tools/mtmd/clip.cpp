@@ -2191,7 +2191,39 @@ struct clip_model_loader {
             for (size_t b : layer_bytes) {
                 total_bytes += b;
             }
-            const double target = (double) total_bytes / n_devices;
+            // per-device target: level the free memory left after loading, so a device the main
+            // model already fills more gets fewer layers (one device running out fails the whole
+            // context); fall back to an even split when the free memory is unknown
+            std::vector<double> target(n_devices, (double) total_bytes / n_devices);
+            {
+                std::vector<double> free_mem(n_devices, 0.0);
+                bool known = true;
+                for (int d = 0; d < n_devices; ++d) {
+                    size_t free = 0;
+                    size_t total = 0;
+                    ggml_backend_dev_memory(ggml_backend_get_device(ctx_clip.backend_ptrs[d]), &free, &total);
+                    known = known && total > 0;
+                    free_mem[d] = (double) free;
+                }
+                if (known) {
+                    // find the level L with sum(max(0, free - L)) == total_bytes
+                    double lo = *std::min_element(free_mem.begin(), free_mem.end()) - (double) total_bytes;
+                    double hi = *std::max_element(free_mem.begin(), free_mem.end());
+                    for (int it = 0; it < 64; ++it) {
+                        const double mid = 0.5 * (lo + hi);
+                        double sum = 0.0;
+                        for (double f : free_mem) {
+                            sum += std::max(0.0, f - mid);
+                        }
+                        (sum > (double) total_bytes ? lo : hi) = mid;
+                    }
+                    for (int d = 0; d < n_devices; ++d) {
+                        target[d] = std::max(0.0, free_mem[d] - hi);
+                        LOG_INF("%s: device %d: free %.2f MiB, target weights %.2f MiB\n", __func__, d,
+                                free_mem[d] / 1024.0 / 1024.0, target[d] / 1024.0 / 1024.0);
+                    }
+                }
+            }
 
             std::vector<size_t> dev_bytes(n_devices, 0);
             std::vector<int> dev_layers(n_devices, 0);
@@ -2203,8 +2235,8 @@ struct clip_model_loader {
                 const int layers_left = hparams.n_layer - il;
                 const int devs_left   = n_devices - dev;
                 if (dev < n_devices - 1 && dev_layers[dev] > 0 && layers_left >= devs_left) {
-                    const double stay = fabs((double) dev_bytes[dev] - target);
-                    const double cont = fabs((double) (dev_bytes[dev] + layer_bytes[il]) - target);
+                    const double stay = fabs((double) dev_bytes[dev] - target[dev]);
+                    const double cont = fabs((double) (dev_bytes[dev] + layer_bytes[il]) - target[dev]);
                     if (cont > stay) {
                         dev++;
                     }
