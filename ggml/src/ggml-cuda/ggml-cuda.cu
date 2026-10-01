@@ -26,7 +26,6 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
-#include "ggml-cuda/f32-pair-gemv.cuh"
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/fattn-sm70-d256.cuh"
 #include "ggml-cuda/fwht.cuh"
@@ -4770,54 +4769,6 @@ static int ggml_cuda_match_mul_mat_multi_large(const ggml_cgraph * cgraph, int n
     return n >= 2 ? n : 0;
 }
 
-// Two consecutive MUL_MAT nodes that share one src1 and read two narrow F32 weights
-// (qwen35 linear attention ssm_alpha/ssm_beta). The pair runs in one launch with one read
-// of the input, see ggml_cuda_f32_pair_mul_mat().
-static bool ggml_cuda_match_mul_mat_f32_pair(const ggml_cgraph * cgraph, int node_idx,
-                                             const ggml_tensor ** w_a, ggml_tensor ** dst_a,
-                                             const ggml_tensor ** w_b, ggml_tensor ** dst_b) {
-    if (node_idx + 1 >= cgraph->n_nodes) {
-        return false;
-    }
-    ggml_tensor * a = cgraph->nodes[node_idx];
-    ggml_tensor * b = cgraph->nodes[node_idx + 1];
-    if (a->op != GGML_OP_MUL_MAT || b->op != GGML_OP_MUL_MAT) {
-        return false;
-    }
-    if ((a->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 || (b->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
-        return false;
-    }
-    const ggml_tensor * src1 = a->src[1];
-    if (src1 == nullptr || b->src[1] != src1) {
-        return false;
-    }
-    // the pair kernel copies the mmvf F32 path, which is only used for up to 3 rows;
-    // above that the regular path runs cuBLAS and the fusion must not change its results
-    // the kernel loads float2, so the base pointers of src1 and both weights must be 8-byte
-    // aligned (the strides are checked below)
-    if (src1->type != GGML_TYPE_F32 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
-            src1->ne[1] < 1 || src1->ne[1] > 3 || (src1->ne[0] & 1) ||
-            ((uintptr_t) src1->data & 7) != 0) {
-        return false;
-    }
-    for (ggml_tensor * node : { a, b }) {
-        const ggml_tensor * w = node->src[0];
-        if (w->type != GGML_TYPE_F32 || w->ne[0] != src1->ne[0] || w->ne[2] != 1 || w->ne[3] != 1 ||
-                w->ne[1] < 1 || w->ne[1] > 256 || w->nb[0] != sizeof(float) ||
-                (w->nb[1] & 7) != 0 || ((uintptr_t) w->data & 7) != 0) {
-            return false;
-        }
-        if (node->type != GGML_TYPE_F32 || !ggml_is_contiguous(node)) {
-            return false;
-        }
-    }
-    *w_a   = a->src[0];
-    *dst_a = a;
-    *w_b   = b->src[0];
-    *dst_b = b;
-    return true;
-}
-
 // Runs several MUL_MAT nodes that share one F32 src1: the input is converted to F16 once,
 // each weight is densified to F16, and each product uses cuBLAS.
 static bool ggml_cuda_mul_mat_multi_shared_src1(ggml_backend_cuda_context & ctx,
@@ -5527,24 +5478,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_multi, out_nodes, n_multi) &&
                     ggml_cuda_mul_mat_multi_shared_src1(*cuda_ctx, multi_src0, multi_dst, n_multi, node->src[1])) {
                 return n_multi - 1;
-            }
-        }
-    }
-
-    // a pair of narrow F32 weights that share one src1 (ssm_alpha/ssm_beta) runs as one
-    // pair GEMV kernel instead of two mul_mat launches.
-    if (node->op == GGML_OP_MUL_MAT) {
-        const ggml_tensor * w_a;
-        const ggml_tensor * w_b;
-        ggml_tensor * dst_a;
-        ggml_tensor * dst_b;
-        if (ggml_cuda_match_mul_mat_f32_pair(cgraph, i, &w_a, &dst_a, &w_b, &dst_b)) {
-            ggml_op ops[2] = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT };
-            int out_nodes[2] = { i, i + 1 };
-            if (ggml_can_fuse_subgraph(cgraph, i, 2, ops, out_nodes, 2) &&
-                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 2) &&
-                    ggml_cuda_f32_pair_mul_mat(*cuda_ctx, w_a, dst_a, w_b, dst_b, node->src[1])) {
-                return 1;
             }
         }
     }

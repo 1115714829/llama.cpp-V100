@@ -11119,12 +11119,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // F32 pair GEMV: two narrow F32 weights sharing one input run as one kernel for M <= 3;
-    // M = 4 stays on the regular path
-    for (int64_t n_tokens : {1, 2, 3, 4}) {
-        test_cases.emplace_back(new test_mul_mat_multi({48, 48}, n_tokens, 5120, GGML_TYPE_F32));
-    }
-
     // multiple Q8_0 matmuls sharing one input: one input conversion and one multi-weight kernel
     for (int64_t n_tokens : {1, 8, 16, 32}) {
         test_cases.emplace_back(new test_mul_mat_multi({2560, 1536, 12, 12}, n_tokens, 5120));
