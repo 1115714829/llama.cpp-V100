@@ -1,4 +1,4 @@
-// Q4_K skinny GEMM for sm_70 (Volta).
+// Q2_K/Q3_K/Q4_K/Q5_K/Q6_K skinny GEMM for sm_70 (Volta).
 //
 // Design follows the QPN8 execution layout of q8-skinny.cu (itself adapted from 1Cat-vLLM
 // fp8_qpn8_sm70.cu, Apache-2.0) and the int4 scale/bias folding of 1Cat's awq_qpn_m1_sm70.cu
@@ -10,14 +10,15 @@
 
 #include "common.cuh"
 
-// Weights are repacked in place from the row-major Q4_K layout (ne0 = K, ne1 = N) into:
-//   codes: [N/32][K/16][32][ 8] uint8 at data,         N*K/2 bytes
-//   meta:  [K/256][N/32][32][16] uint8 at data + N*K/2, N*K/16 bytes
-// codes hold the 4-bit quants in QPN8 order, one 8-byte record per 16 K values and lane.
-// meta holds the raw 16-byte super-block header (dm + 12 scale bytes), copied unchanged.
-// The byte count is the same as Q4_K. A repacked tensor is tagged through tensor->extra;
-// reading it with ggml_backend_tensor_get() returns the repacked bytes, there is no
-// conversion back to the Q4_K layout.
+// Weights are repacked in place from the row-major K-quant layout (ne0 = K, ne1 = N) into:
+//   codes: [N/32][K/16][32][record_bytes] uint8 at data
+//   meta:  [K/256][N/32][32][meta_bytes]  uint8 at data + codes_bytes
+// record_bytes is 4/6/8/10/12 and meta_bytes is 20/14/16/16/18 for Q2_K/Q3_K/Q4_K/Q5_K/Q6_K,
+// and 16*record_bytes + meta_bytes equals the block size of the type. codes hold the raw
+// quants in QPN8 order, one record per 16 K values and lane; meta holds the raw super-block
+// header, copied unchanged. A type keeps its byte count. A repacked tensor is tagged through
+// tensor->extra; reading it with ggml_backend_tensor_get() returns the repacked bytes, there
+// is no conversion back to the original layout.
 bool ggml_cuda_q4k_skinny_can_repack(const ggml_tensor * t);
 bool ggml_cuda_q4k_skinny_is_repacked(const ggml_tensor * t);
 

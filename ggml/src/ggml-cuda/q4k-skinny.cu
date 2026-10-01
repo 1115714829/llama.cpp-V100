@@ -1,4 +1,4 @@
-﻿// Q4_K skinny GEMM for sm_70 (Volta).
+﻿// Q2_K/Q3_K/Q4_K/Q5_K/Q6_K skinny GEMM for sm_70 (Volta).
 //
 // Design follows the QPN8 execution layout of q8-skinny.cu (itself adapted from 1Cat-vLLM
 // fp8_qpn8_sm70.cu, Apache-2.0) and the int4 scale/bias folding of 1Cat's awq_qpn_m1_sm70.cu
@@ -741,7 +741,7 @@ __global__ void q4k_skinny_kernel(
     const int sub_block_begin = warp * sub_blocks_per_warp;
     const typename codec::record_t * code_ptr = reinterpret_cast<const typename codec::record_t *>(codes) +
                                                 (size_t) tile * groups_k16 * 32 + lane;
-    // MERGE-CODEC: meta stride and offset are per codec type
+    // meta stride and offset are per codec type
     const uint8_t * meta_ptr = codes + codec::codes_bytes(n, k) +
                                (size_t) codec::meta_bytes * (tile * 32 + lane);
 
@@ -769,7 +769,7 @@ __global__ void q4k_skinny_kernel(
         }
 
         const int group = sub_block << 1;
-        const qskinny_code records[2] = { // MERGE-CODEC: record load per codec type
+        const qskinny_code records[2] = { // record load per codec type
             codec::load_record(code_ptr + (size_t) (group + 0) * 32),
             codec::load_record(code_ptr + (size_t) (group + 1) * 32),
         };
@@ -897,8 +897,7 @@ struct q4k_skinny_multi_params {
 // Same execution as q4k_skinny_kernel, but each CTA picks its segment from blockIdx.x and
 // writes to that segment's dst with its own row length. launch_bounds keeps the register
 // count at the single-kernel level so a row tile fits two CTAs per SM.
-template <ggml_type T, int SplitK, int NAcc, bool M1Only = false, int RowTiles = 1,
-          bool PrefetchCodes = false>
+template <ggml_type T, int SplitK, int NAcc, bool M1Only = false, int RowTiles = 1>
 __global__ void __launch_bounds__(32 * SplitK, RowTiles == 1 ? 2 : 1)
 q4k_skinny_multi_kernel(const q4k_skinny_multi_params p) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
@@ -931,7 +930,7 @@ q4k_skinny_multi_kernel(const q4k_skinny_multi_params p) {
     const int sub_block_begin = warp * sub_blocks_per_warp;
     const typename codec::record_t * code_ptr = reinterpret_cast<const typename codec::record_t *>(codes) +
                                                 (size_t) tile * groups_k16 * 32 + lane;
-    // MERGE-CODEC: meta stride and offset are per codec type
+    // meta stride and offset are per codec type
     const uint8_t * meta_ptr = codes + codec::codes_bytes(n, k) +
                                (size_t) codec::meta_bytes * (tile * 32 + lane);
 
@@ -947,43 +946,21 @@ q4k_skinny_multi_kernel(const q4k_skinny_multi_params p) {
         }
     }
     int loaded_meta_kb = -1;
-        typename codec::meta_t meta = {};
-        qskinny_code prefetched[2] = {};
-        typename codec::meta_t prefetched_meta = {};
-        int prefetched_meta_kb = -1;
-        if constexpr (PrefetchCodes) {
-            prefetched[0] = codec::load_record(code_ptr + (size_t) (sub_block_begin * 2 + 0) * 32);
-            prefetched[1] = codec::load_record(code_ptr + (size_t) (sub_block_begin * 2 + 1) * 32);
-        }
+    typename codec::meta_t meta = {};
 
 #pragma unroll 2
-        for (int sub_block = sub_block_begin; sub_block < sub_block_begin + sub_blocks_per_warp; ++sub_block) {
-            const int kb = sub_block >> 3;
-            if (kb != loaded_meta_kb) {
-                meta = (PrefetchCodes && kb == prefetched_meta_kb) ? prefetched_meta
-                    : codec::load_meta(meta_ptr + (size_t) kb * n * codec::meta_bytes);
-                loaded_meta_kb = kb;
-            }
+    for (int sub_block = sub_block_begin; sub_block < sub_block_begin + sub_blocks_per_warp; ++sub_block) {
+        const int kb = sub_block >> 3;
+        if (kb != loaded_meta_kb) {
+            meta = codec::load_meta(meta_ptr + (size_t) kb * n * codec::meta_bytes);
+            loaded_meta_kb = kb;
+        }
 
-            const int group = sub_block << 1;
-            qskinny_code records[2]; // MERGE-CODEC: record load per codec type
-            if constexpr (PrefetchCodes) {
-                records[0] = prefetched[0];
-                records[1] = prefetched[1];
-                // the next batch is loaded here so its latency hides under decode and mma
-                if (sub_block + 1 < sub_block_begin + sub_blocks_per_warp) {
-                    prefetched[0] = codec::load_record(code_ptr + (size_t) (group + 2) * 32);
-                    prefetched[1] = codec::load_record(code_ptr + (size_t) (group + 3) * 32);
-                    const int next_kb = (sub_block + 1) >> 3;
-                    if (next_kb != loaded_meta_kb && next_kb != prefetched_meta_kb) {
-                        prefetched_meta = codec::load_meta(meta_ptr + (size_t) next_kb * n * codec::meta_bytes);
-                        prefetched_meta_kb = next_kb;
-                    }
-                }
-            } else {
-                records[0] = codec::load_record(code_ptr + (size_t) (group + 0) * 32);
-                records[1] = codec::load_record(code_ptr + (size_t) (group + 1) * 32);
-            }
+        const int group = sub_block << 1;
+        const qskinny_code records[2] = { // record load per codec type
+            codec::load_record(code_ptr + (size_t) (group + 0) * 32),
+            codec::load_record(code_ptr + (size_t) (group + 1) * 32),
+        };
         half2 weights[codec::values_per_sub_block / 2];
         codec::decode(records, meta, sub_block & 7, weights);
 
@@ -1092,8 +1069,7 @@ q4k_skinny_multi_kernel(const q4k_skinny_multi_params p) {
 // silu(gate) * up with the ggml_cuda_op_silu_single formula and writes float.
 // launch_bounds keeps the register count at the single-kernel level so a row tile fits
 // two CTAs per SM; the phase loop is not unrolled to keep the body shared.
-template <ggml_type T, int SplitK, int NAcc, bool M1Only = false, int RowTiles = 1,
-          bool PrefetchCodes = false>
+template <ggml_type T, int SplitK, int NAcc, bool M1Only = false, int RowTiles = 1>
 __global__ void __launch_bounds__(32 * SplitK, RowTiles == 1 ? 2 : 1)
 q4k_skinny_gated_kernel(
     const uint8_t * __restrict__ gate_codes, const uint8_t * __restrict__ up_codes,
@@ -1126,7 +1102,7 @@ q4k_skinny_gated_kernel(
         const uint8_t * codes = projection ? up_codes : gate_codes;
         const typename codec::record_t * code_ptr = reinterpret_cast<const typename codec::record_t *>(codes) +
                                                     (size_t) tile * groups_k16 * 32 + lane;
-        // MERGE-CODEC: meta stride and offset are per codec type
+        // meta stride and offset are per codec type
         const uint8_t * meta_ptr = codes + codec::codes_bytes(n, k) +
                                    (size_t) codec::meta_bytes * (tile * 32 + lane);
 
@@ -1143,42 +1119,20 @@ q4k_skinny_gated_kernel(
         }
         int loaded_meta_kb = -1;
         typename codec::meta_t meta = {};
-        qskinny_code prefetched[2] = {};
-        typename codec::meta_t prefetched_meta = {};
-        int prefetched_meta_kb = -1;
-        if constexpr (PrefetchCodes) {
-            prefetched[0] = codec::load_record(code_ptr + (size_t) (sub_block_begin * 2 + 0) * 32);
-            prefetched[1] = codec::load_record(code_ptr + (size_t) (sub_block_begin * 2 + 1) * 32);
-        }
 
 #pragma unroll 2
         for (int sub_block = sub_block_begin; sub_block < sub_block_begin + sub_blocks_per_warp; ++sub_block) {
             const int kb = sub_block >> 3;
             if (kb != loaded_meta_kb) {
-                meta = (PrefetchCodes && kb == prefetched_meta_kb) ? prefetched_meta
-                    : codec::load_meta(meta_ptr + (size_t) kb * n * codec::meta_bytes);
+                meta = codec::load_meta(meta_ptr + (size_t) kb * n * codec::meta_bytes);
                 loaded_meta_kb = kb;
             }
 
             const int group = sub_block << 1;
-            qskinny_code records[2]; // MERGE-CODEC: record load per codec type
-            if constexpr (PrefetchCodes) {
-                records[0] = prefetched[0];
-                records[1] = prefetched[1];
-                // the next batch is loaded here so its latency hides under decode and mma
-                if (sub_block + 1 < sub_block_begin + sub_blocks_per_warp) {
-                    prefetched[0] = codec::load_record(code_ptr + (size_t) (group + 2) * 32);
-                    prefetched[1] = codec::load_record(code_ptr + (size_t) (group + 3) * 32);
-                    const int next_kb = (sub_block + 1) >> 3;
-                    if (next_kb != loaded_meta_kb && next_kb != prefetched_meta_kb) {
-                        prefetched_meta = codec::load_meta(meta_ptr + (size_t) next_kb * n * codec::meta_bytes);
-                        prefetched_meta_kb = next_kb;
-                    }
-                }
-            } else {
-                records[0] = codec::load_record(code_ptr + (size_t) (group + 0) * 32);
-                records[1] = codec::load_record(code_ptr + (size_t) (group + 1) * 32);
-            }
+            const qskinny_code records[2] = { // record load per codec type
+                codec::load_record(code_ptr + (size_t) (group + 0) * 32),
+                codec::load_record(code_ptr + (size_t) (group + 1) * 32),
+            };
             half2 weights[codec::values_per_sub_block / 2];
             codec::decode(records, meta, sub_block & 7, weights);
 
@@ -1286,19 +1240,14 @@ q4k_skinny_gated_kernel(
 
 // Split-K 16 for the long K weights, 8 for the smallest ones (k = 256 has only 8 sub-blocks
 // per tile). can_repack guarantees k % 256 == 0, so one of the two always divides the
-// sub-block count. The long K weights use two accumulator chains, as in the Q8_0 path. No
-// prefetch variant yet.
+// sub-block count. The long K weights use two accumulator chains, as in the Q8_0 path.
 struct q4k_skinny_config {
     int  split_k;
     int  n_acc;
-    bool prefetch;
 };
 
 static q4k_skinny_config q4k_skinny_config_for(const int64_t k) {
-    // The prefetch variant of the multi/gated kernels is kept but not selected: on sm_70 it
-    // measured a decode loss for every long-K shape of the Qwen3.8-27B weights (k =
-    // 5120/6144/17408). Select a shape here only after re-measuring it.
-    return { k % 512 == 0 ? 16 : 8, k >= 4096 ? 2 : 1, false };
+    return { k % 512 == 0 ? 16 : 8, k >= 4096 ? 2 : 1 };
 }
 
 template <ggml_type T, int SplitK, int NAcc, bool M1Only, int RowTiles>
@@ -1318,7 +1267,7 @@ static void q4k_skinny_launch(const uint8_t * codes, const half * input, float *
         }                                                                                       \
     } while (0)
 
-// MERGE-CODEC: the launch table is instantiated per codec type
+// the launch table is instantiated per codec type
 template <ggml_type T>
 static void q4k_skinny_mul_mat_launch_t(const uint8_t * codes, const half * input, float * output,
                                         int n, int k, int m, cudaStream_t stream) {
@@ -1342,9 +1291,9 @@ __global__ void q4k_skinny_swiglu_kernel(float * __restrict__ gate, const float 
         gate[i] = g / (1.0f + expf(-g)) * up[i];
     }
 }
-template <ggml_type T, int SplitK, int NAcc, bool M1Only, int RowTiles, bool PrefetchCodes = false>
+template <ggml_type T, int SplitK, int NAcc, bool M1Only, int RowTiles>
 static void q4k_skinny_multi_launch(const q4k_skinny_multi_params & p, cudaStream_t stream) {
-    q4k_skinny_multi_kernel<T, SplitK, NAcc, M1Only, RowTiles, PrefetchCodes>
+    q4k_skinny_multi_kernel<T, SplitK, NAcc, M1Only, RowTiles>
         <<<p.n_tiles, 32 * SplitK, 0, stream>>>(p);
 }
 
@@ -1356,30 +1305,10 @@ static void q4k_skinny_multi_launch(const q4k_skinny_multi_params & p, cudaStrea
         }                                                                                        \
     } while (0)
 
-// MERGE-CODEC+PERF
-#define Q4K_SKINNY_MULTI_LAUNCH_PF(NAcc, M1Only, RowTiles)                                       \
-    do {                                                                                         \
-        switch (config.split_k) {                                                                \
-            case 16: q4k_skinny_multi_launch<T, 16, NAcc, M1Only, RowTiles, true>(p, stream); break; \
-            default: q4k_skinny_multi_launch<T, 8, NAcc, M1Only, RowTiles, true>(p, stream); break;  \
-        }                                                                                        \
-    } while (0)
-
-// MERGE-CODEC: the launch table is instantiated per codec type
+// the launch table is instantiated per codec type
 template <ggml_type T>
 static void q4k_skinny_multi_mul_mat_launch_t(const q4k_skinny_multi_params & p, cudaStream_t stream) {
     const q4k_skinny_config config = q4k_skinny_config_for(p.k);
-    if (config.prefetch) {
-        if (config.n_acc == 2) {
-            if (p.m == 1) { Q4K_SKINNY_MULTI_LAUNCH_PF(2, true, 1); } else if (p.m <= 8) { Q4K_SKINNY_MULTI_LAUNCH_PF(2, false, 1); }
-            else { Q4K_SKINNY_MULTI_LAUNCH_PF(2, false, 2); }
-        } else {
-            if (p.m == 1) { Q4K_SKINNY_MULTI_LAUNCH_PF(1, true, 1); } else if (p.m <= 8) { Q4K_SKINNY_MULTI_LAUNCH_PF(1, false, 1); }
-            else { Q4K_SKINNY_MULTI_LAUNCH_PF(1, false, 2); }
-        }
-        CUDA_CHECK(cudaGetLastError());
-        return;
-    }
     if (config.n_acc == 2) {
         if (p.m == 1) { Q4K_SKINNY_MULTI_LAUNCH(2, true, 1); } else if (p.m <= 8) { Q4K_SKINNY_MULTI_LAUNCH(2, false, 1); }
         else { Q4K_SKINNY_MULTI_LAUNCH(2, false, 2); }
@@ -1390,7 +1319,6 @@ static void q4k_skinny_multi_mul_mat_launch_t(const q4k_skinny_multi_params & p,
 }
 
 #undef Q4K_SKINNY_MULTI_LAUNCH
-#undef Q4K_SKINNY_MULTI_LAUNCH_PF
 
 static void q4k_skinny_multi_mul_mat_launch(ggml_type type, const q4k_skinny_multi_params & p,
                                             cudaStream_t stream) {
@@ -1407,11 +1335,11 @@ static void q4k_skinny_multi_mul_mat_launch(ggml_type type, const q4k_skinny_mul
 
 // Same split-K/accumulator-chain table as the single-weight kernel, so a projection is
 // bit-exact with its own q4k_skinny_kernel launch.
-template <ggml_type T, int SplitK, int NAcc, bool M1Only, int RowTiles, bool PrefetchCodes = false>
+template <ggml_type T, int SplitK, int NAcc, bool M1Only, int RowTiles>
 static void q4k_skinny_gated_launch(const uint8_t * gate_codes, const uint8_t * up_codes,
                                     const half * input, float * output, int n, int k, int m,
                                     cudaStream_t stream) {
-    q4k_skinny_gated_kernel<T, SplitK, NAcc, M1Only, RowTiles, PrefetchCodes>
+    q4k_skinny_gated_kernel<T, SplitK, NAcc, M1Only, RowTiles>
         <<<n / 32, 32 * SplitK, 0, stream>>>(gate_codes, up_codes, input, output, n, k, m);
 }
 
@@ -1425,34 +1353,12 @@ static void q4k_skinny_gated_launch(const uint8_t * gate_codes, const uint8_t * 
         }                                                                                      \
     } while (0)
 
-// MERGE-CODEC+PERF
-#define Q4K_SKINNY_GATED_LAUNCH_PF(NAcc, M1Only, RowTiles)                                     \
-    do {                                                                                       \
-        switch (config.split_k) {                                                              \
-            case 16: q4k_skinny_gated_launch<T, 16, NAcc, M1Only, RowTiles,                    \
-                         true>(gate_codes, up_codes, input, output, n, k, m, stream); break;  \
-            default: q4k_skinny_gated_launch<T, 8, NAcc, M1Only, RowTiles,                     \
-                         true>(gate_codes, up_codes, input, output, n, k, m, stream); break;  \
-        }                                                                                      \
-    } while (0)
-
-// MERGE-CODEC: the launch table is instantiated per codec type
+// the launch table is instantiated per codec type
 template <ggml_type T>
 static void q4k_skinny_gated_mul_mat_launch_t(const uint8_t * gate_codes, const uint8_t * up_codes,
                                               const half * input, float * output, int n, int k, int m,
                                               cudaStream_t stream) {
     const q4k_skinny_config config = q4k_skinny_config_for(k);
-    if (config.prefetch) {
-        if (config.n_acc == 2) {
-            if (m == 1) { Q4K_SKINNY_GATED_LAUNCH_PF(2, true, 1); } else if (m <= 8) { Q4K_SKINNY_GATED_LAUNCH_PF(2, false, 1); }
-            else { Q4K_SKINNY_GATED_LAUNCH_PF(2, false, 2); }
-        } else {
-            if (m == 1) { Q4K_SKINNY_GATED_LAUNCH_PF(1, true, 1); } else if (m <= 8) { Q4K_SKINNY_GATED_LAUNCH_PF(1, false, 1); }
-            else { Q4K_SKINNY_GATED_LAUNCH_PF(1, false, 2); }
-        }
-        CUDA_CHECK(cudaGetLastError());
-        return;
-    }
     if (config.n_acc == 2) {
         if (m == 1) { Q4K_SKINNY_GATED_LAUNCH(2, true, 1); } else if (m <= 8) { Q4K_SKINNY_GATED_LAUNCH(2, false, 1); }
         else { Q4K_SKINNY_GATED_LAUNCH(2, false, 2); }
@@ -1463,7 +1369,6 @@ static void q4k_skinny_gated_mul_mat_launch_t(const uint8_t * gate_codes, const 
 }
 
 #undef Q4K_SKINNY_GATED_LAUNCH
-#undef Q4K_SKINNY_GATED_LAUNCH_PF
 
 static void q4k_skinny_gated_mul_mat_launch(ggml_type type, const uint8_t * gate_codes,
                                             const uint8_t * up_codes, const half * input,
@@ -1509,7 +1414,7 @@ __global__ void q4k_skinny_m32_kernel(
     const int sub_blocks_per_warp = sub_blocks / SplitK;
     const typename codec::record_t * code_ptr = reinterpret_cast<const typename codec::record_t *>(codes) +
                                                 (size_t) tile * groups_k16 * 32 + lane;
-    // MERGE-CODEC: meta stride and offset are per codec type
+    // meta stride and offset are per codec type
     const uint8_t * meta_ptr = codes + codec::codes_bytes(n, k) +
                                (size_t) codec::meta_bytes * (tile * 32 + lane);
 
@@ -1540,7 +1445,7 @@ __global__ void q4k_skinny_m32_kernel(
             }
 
             const int group = sub_block << 1;
-            const qskinny_code records[2] = { // MERGE-CODEC: record load per codec type
+            const qskinny_code records[2] = { // record load per codec type
                 codec::load_record(code_ptr + (size_t) (group + 0) * 32),
                 codec::load_record(code_ptr + (size_t) (group + 1) * 32),
             };
@@ -1656,7 +1561,7 @@ static bool q4k_skinny_mul_mat_dispatch_t(const uint8_t * codes, const half * in
     return true;
 }
 
-// MERGE-CODEC: the dispatch is instantiated per codec type
+// the dispatch is instantiated per codec type
 static bool q4k_skinny_mul_mat_dispatch(ggml_type type, const uint8_t * codes, const half * input,
                                         float * output, int n, int k, int m, cudaStream_t stream) {
     switch (type) {
@@ -1696,7 +1601,7 @@ bool ggml_cuda_q4k_skinny_mul_mat_gated(ggml_backend_cuda_context & ctx, const g
     if (!ggml_cuda_q4k_skinny_is_repacked(gate_w) || !ggml_cuda_q4k_skinny_is_repacked(up_w)) {
         return false;
     }
-    // MERGE-CODEC: the gated kernel runs one codec type for both projections
+    // the gated kernel runs one codec type for both projections
     if (gate_w->type != up_w->type) {
         return false;
     }
@@ -1708,7 +1613,12 @@ bool ggml_cuda_q4k_skinny_mul_mat_gated(ggml_backend_cuda_context & ctx, const g
             !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst) ||
             src1->ne[2] != 1 || src1->ne[3] != 1 ||
             dst->ne[0] != n || dst->ne[1] != m || dst->ne[2] != 1 || dst->ne[3] != 1 ||
-            m < 1 || m > 64) { // MERGE-PERF: M=32 kernel
+            m < 1 || m > 64) { // M=32 kernel
+        return false;
+    }
+    // M = 17..64 uses the two-phase M=32 kernel, which only exists for split-16 shapes;
+    // return false before any allocation so the caller can fall back
+    if (m > 16 && q4k_skinny_config_for(k).split_k != 16) {
         return false;
     }
 
@@ -1718,20 +1628,20 @@ bool ggml_cuda_q4k_skinny_mul_mat_gated(ggml_backend_cuda_context & ctx, const g
     to_fp16(src1->data, input.get(), m * k, ctx.stream());
 
     if (m <= 16) {
-        q4k_skinny_gated_mul_mat_launch(gate_w->type, (const uint8_t *) gate_w->data, // MERGE-CODEC
+        q4k_skinny_gated_mul_mat_launch(gate_w->type, (const uint8_t *) gate_w->data,
                                         (const uint8_t *) up_w->data, input.get(), (float *) dst->data,
                                         (int) n, (int) k, (int) m, ctx.stream());
         return true;
     }
 
-    // MERGE-PERF: M = 17..64 runs both projections with the M=32 kernel, then the SwiGLU
-    // epilogue, with the same silu formula as the fused kernel
+    // M = 17..64 runs both projections with the M=32 kernel, then the SwiGLU epilogue, with
+    // the same silu formula as the fused kernel
     float * gate = (float *) dst->data;
     ggml_cuda_pool_alloc<float> up(ctx.pool(), n * m);
-    q4k_skinny_mul_mat_dispatch(gate_w->type, (const uint8_t *) gate_w->data, input.get(), gate,
-                                (int) n, (int) k, (int) m, ctx.stream());
-    q4k_skinny_mul_mat_dispatch(up_w->type, (const uint8_t *) up_w->data, input.get(), up.get(),
-                                (int) n, (int) k, (int) m, ctx.stream());
+    GGML_ASSERT(q4k_skinny_mul_mat_dispatch(gate_w->type, (const uint8_t *) gate_w->data, input.get(), gate,
+                                            (int) n, (int) k, (int) m, ctx.stream()));
+    GGML_ASSERT(q4k_skinny_mul_mat_dispatch(up_w->type, (const uint8_t *) up_w->data, input.get(), up.get(),
+                                            (int) n, (int) k, (int) m, ctx.stream()));
 
     const int count = (int) (n * m);
     q4k_skinny_swiglu_kernel<<<(count + 255) / 256, 256, 0, ctx.stream()>>>(gate, up.get(), count);
@@ -1748,7 +1658,12 @@ bool ggml_cuda_q4k_skinny_mul_mat_multi(ggml_backend_cuda_context & ctx,
     const int64_t k = src0s[0]->ne[0];
     const int64_t m = src1->ne[1];
     if (src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) ||
-            src1->ne[2] != 1 || src1->ne[3] != 1 || m < 1 || m > 64) { // MERGE-PERF: M=32 kernel
+            src1->ne[2] != 1 || src1->ne[3] != 1 || m < 1 || m > 64) { // M=32 kernel
+        return false;
+    }
+    // M = 17..64 uses the two-phase M=32 kernel, which only exists for split-16 shapes;
+    // return false before any allocation so the caller can fall back
+    if (m > 16 && q4k_skinny_config_for(k).split_k != 16) {
         return false;
     }
 
@@ -1761,7 +1676,7 @@ bool ggml_cuda_q4k_skinny_mul_mat_multi(ggml_backend_cuda_context & ctx,
         ggml_tensor * dst = dsts[i];
         const int64_t n = w->ne[1];
         if (!ggml_cuda_q4k_skinny_is_repacked(w) ||
-                // MERGE-CODEC: the multi kernel runs one codec type for all segments
+                // the multi kernel runs one codec type for all segments
                 w->type != src0s[0]->type ||
                 w->ne[0] != k || w->ne[2] != 1 || w->ne[3] != 1 || !ggml_is_contiguous(w) ||
                 dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
@@ -1785,16 +1700,16 @@ bool ggml_cuda_q4k_skinny_mul_mat_multi(ggml_backend_cuda_context & ctx,
     p.input = input.get();
 
     if (m <= 16) {
-        q4k_skinny_multi_mul_mat_launch(src0s[0]->type, p, ctx.stream()); // MERGE-CODEC
+        q4k_skinny_multi_mul_mat_launch(src0s[0]->type, p, ctx.stream());
         return true;
     }
 
-    // MERGE-PERF: M = 17..64 has no segment dispatch in the M=32 kernel, so each repacked
-    // weight gets its own launch from the one converted input (the group is homogeneous)
+    // M = 17..64 has no segment dispatch in the M=32 kernel, so each repacked weight gets
+    // its own launch from the one converted input (the group is homogeneous)
     for (int s = 0; s < p.n_seg; ++s) {
         const q4k_skinny_seg & seg = p.seg[s];
-        q4k_skinny_mul_mat_dispatch(src0s[s]->type, seg.codes, p.input, seg.dst, seg.n, p.k, (int) m,
-                                    ctx.stream());
+        GGML_ASSERT(q4k_skinny_mul_mat_dispatch(src0s[s]->type, seg.codes, p.input, seg.dst, seg.n,
+                                                p.k, (int) m, ctx.stream()));
     }
     return true;
 }
@@ -1810,7 +1725,7 @@ bool ggml_cuda_q4k_skinny_can_repack(const ggml_tensor * t) {
     GGML_UNUSED(t);
     return false;
 #else
-    // MERGE-CODEC: the codec family serves Q2_K/Q3_K/Q4_K/Q5_K/Q6_K (see qskinny_codec) and all
+    // the codec family serves Q2_K/Q3_K/Q4_K/Q5_K/Q6_K (see qskinny_codec) and all
     // five are repacked at runtime. Their compute moves from the MMVQ q8_1 path to F16, which
     // changes greedy tokens at ulp level; that is the intended cost of covering the mixed types.
     switch (t->type) {
@@ -1849,7 +1764,7 @@ bool ggml_cuda_q4k_skinny_can_repack(const ggml_tensor * t) {
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
-// MERGE-CODEC: the repack kernel is instantiated per codec type
+// the repack kernel is instantiated per codec type
 template <ggml_type T>
 static void q4k_skinny_repack_tiles(const void * staging, uint8_t * codes, uint8_t * meta,
                                     int n, int k, int t0, int t1, cudaStream_t stream) {
@@ -1998,7 +1913,7 @@ void ggml_cuda_q4k_skinny_to_f16(const ggml_tensor * src0, half * dst, cudaStrea
     const int k = (int) src0->ne[0];
     const uint8_t * data = (const uint8_t *) src0->data;
     const dim3 grid((unsigned) (k / 256), (unsigned) (n / 32), 1);
-    // MERGE-CODEC: the dequantize kernel is instantiated per codec type
+    // the dequantize kernel is instantiated per codec type
     switch (src0->type) {
         case GGML_TYPE_Q2_K: qskinny_to_f16_kernel<GGML_TYPE_Q2_K><<<grid, 256, 0, stream>>>(dst, data, n, k); break;
         case GGML_TYPE_Q3_K: qskinny_to_f16_kernel<GGML_TYPE_Q3_K><<<grid, 256, 0, stream>>>(dst, data, n, k); break;

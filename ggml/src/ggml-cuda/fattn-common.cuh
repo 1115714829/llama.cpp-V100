@@ -194,8 +194,8 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q4_1(
         const int shift = k_KQ & (QI8_1/2);
 
         int v;
-        // 18 B blocks leave qs 2 B aligned, so two 16 bit loads instead of one 32 bit load
-        // (a misaligned dword load faults on sm_70).
+        // block_q4_1 is 20 B and the KV row stride only keeps qs 2 B aligned, so two 16 bit
+        // loads instead of one 32 bit load (a misaligned dword load faults on sm_70).
         ggml_cuda_memcpy_1<sizeof(int), 2>(&v, K_q4_1[ib].qs + sizeof(int)*iqs4);
         v = (v >> shift) & 0x0F0F0F0F;
         const int u = Q_q8[k_KQ_0/nthreads];
@@ -464,8 +464,8 @@ static __device__ __forceinline__ void dequantize_V_q4_1(const void * __restrict
 
     int q;
     static_assert(ne == 2 || ne == 4, "bad ne");
-    // 18 B blocks leave qs 2 B aligned, so two 16 bit loads instead of one 32 bit load
-    // (a misaligned dword load faults on sm_70).
+    // block_q4_1 is 20 B and the KV row stride only keeps qs 2 B aligned, so two 16 bit
+    // loads instead of one 32 bit load (a misaligned dword load faults on sm_70).
     ggml_cuda_memcpy_1<ne, 2>(&q, x[ib].qs + iqs);
     q >>= 4*shift;
     q &= 0x0F0F0F0F;

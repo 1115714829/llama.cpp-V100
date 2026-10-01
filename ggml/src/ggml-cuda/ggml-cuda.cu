@@ -4704,7 +4704,7 @@ static int ggml_cuda_match_mul_mat_multi(const ggml_cgraph * cgraph, int node_id
             break;
         }
         if (q4k) {
-            // MERGE-CODEC: the skinny multi kernel reads repacked segments only, one codec type per launch
+            // the skinny multi kernel reads repacked segments only, one codec type per launch
             if (!ggml_cuda_q4k_skinny_is_repacked(w) || w->type != first->src[0]->type) {
                 break;
             }
@@ -4770,9 +4770,9 @@ static int ggml_cuda_match_mul_mat_multi_large(const ggml_cgraph * cgraph, int n
     return n >= 2 ? n : 0;
 }
 
-// MERGE-F32: two consecutive MUL_MAT nodes that share one src1 and read two narrow F32
-// weights (qwen35 linear attention ssm_alpha/ssm_beta). The pair runs in one launch with
-// one read of the input, see ggml_cuda_f32_pair_mul_mat().
+// Two consecutive MUL_MAT nodes that share one src1 and read two narrow F32 weights
+// (qwen35 linear attention ssm_alpha/ssm_beta). The pair runs in one launch with one read
+// of the input, see ggml_cuda_f32_pair_mul_mat().
 static bool ggml_cuda_match_mul_mat_f32_pair(const ggml_cgraph * cgraph, int node_idx,
                                              const ggml_tensor ** w_a, ggml_tensor ** dst_a,
                                              const ggml_tensor ** w_b, ggml_tensor ** dst_b) {
@@ -4793,14 +4793,18 @@ static bool ggml_cuda_match_mul_mat_f32_pair(const ggml_cgraph * cgraph, int nod
     }
     // the pair kernel copies the mmvf F32 path, which is only used for up to 3 rows;
     // above that the regular path runs cuBLAS and the fusion must not change its results
+    // the kernel loads float2, so the base pointers of src1 and both weights must be 8-byte
+    // aligned (the strides are checked below)
     if (src1->type != GGML_TYPE_F32 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
-            src1->ne[1] < 1 || src1->ne[1] > 3 || (src1->ne[0] & 1)) {
+            src1->ne[1] < 1 || src1->ne[1] > 3 || (src1->ne[0] & 1) ||
+            ((uintptr_t) src1->data & 7) != 0) {
         return false;
     }
     for (ggml_tensor * node : { a, b }) {
         const ggml_tensor * w = node->src[0];
         if (w->type != GGML_TYPE_F32 || w->ne[0] != src1->ne[0] || w->ne[2] != 1 || w->ne[3] != 1 ||
-                w->ne[1] < 1 || w->ne[1] > 256 || w->nb[0] != sizeof(float) || (w->nb[1] & 7) != 0) {
+                w->ne[1] < 1 || w->ne[1] > 256 || w->nb[0] != sizeof(float) ||
+                (w->nb[1] & 7) != 0 || ((uintptr_t) w->data & 7) != 0) {
             return false;
         }
         if (node->type != GGML_TYPE_F32 || !ggml_is_contiguous(node)) {
@@ -5527,8 +5531,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    // MERGE-F32: a pair of narrow F32 weights that share one src1 (ssm_alpha/ssm_beta)
-    // runs as one pair GEMV kernel instead of two mul_mat launches.
+    // a pair of narrow F32 weights that share one src1 (ssm_alpha/ssm_beta) runs as one
+    // pair GEMV kernel instead of two mul_mat launches.
     if (node->op == GGML_OP_MUL_MAT) {
         const ggml_tensor * w_a;
         const ggml_tensor * w_b;

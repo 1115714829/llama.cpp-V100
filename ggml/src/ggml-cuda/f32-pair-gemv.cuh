@@ -1,4 +1,4 @@
-// F32 pair GEMV (MERGE-F32): two narrow F32 weights that share one src1 (qwen35 linear
+// F32 pair GEMV: two narrow F32 weights that share one src1 (qwen35 linear
 // attention ssm_alpha/ssm_beta) computed in one launch. Each CTA computes one output
 // column of both weights and streams the input once per step through registers.
 //

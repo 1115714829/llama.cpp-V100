@@ -1,5 +1,22 @@
 #include "f32-pair-gemv.cuh"
 
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+
+bool ggml_cuda_f32_pair_mul_mat(ggml_backend_cuda_context & ctx,
+                                const ggml_tensor * w_a, ggml_tensor * dst_a,
+                                const ggml_tensor * w_b, ggml_tensor * dst_b,
+                                const ggml_tensor * src1) {
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(w_a);
+    GGML_UNUSED(dst_a);
+    GGML_UNUSED(w_b);
+    GGML_UNUSED(dst_b);
+    GGML_UNUSED(src1);
+    return false;
+}
+
+#else // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+
 // One CTA computes one output column of both weights for all M tokens of the shared src1.
 // Each loop step reads the input once and feeds both accumulators, so the input vector is
 // streamed from global memory once per column pair. The per-thread accumulation and the
@@ -176,3 +193,5 @@ bool ggml_cuda_f32_pair_mul_mat(ggml_backend_cuda_context & ctx,
 
     return true;
 }
+
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)

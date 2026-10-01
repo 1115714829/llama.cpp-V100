@@ -11038,38 +11038,91 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, 5120, {1, 1}, {1, 1}));
 
-    // Q4_K skinny GEMM (repacked codes + raw super-block meta, sm_70): M <= 16 runs the
-    // single-stage kernel, M = 17..64 the two-phase M=32 kernel (split-16 shapes), M > 64
-    // expands the repacked weights to F16 and uses the regular dense path. The kernel rounds
-    // d*sc and dmin*m to F16 once per 32 values, a relative error of <= 2^-11 on a constant per
-    // sub-block, so the default 5e-4 NMSE of test_mul_mat covers it.
+    // Q2_K/Q3_K/Q4_K/Q5_K/Q6_K skinny GEMM (repacked codes + raw super-block meta, sm_70):
+    // M <= 16 runs the single-stage kernel, M = 17..64 the two-phase M=32 kernel (split-16
+    // shapes), M > 64 expands the repacked weights to F16 and uses the regular dense path. The
+    // kernel rounds d*sc and dmin*m to F16 once per 32 values, a relative error of <= 2^-11 on
+    // a constant per sub-block, so the default 5e-4 NMSE of test_mul_mat covers it.
+    const std::vector<ggml_type> q4_k_skinny_types = {
+        GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
+    };
     const std::vector<std::pair<int64_t, int64_t>> q4_k_skinny_shapes = {
         { 4096, 5120}, { 5120, 4096}, { 256, 5120},
     };
-    for (const auto & [n_out, k_red] : q4_k_skinny_shapes) {
-        for (int64_t n_tokens : {1, 2, 8, 16, 17, 32, 64}) {
-            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, n_out, n_tokens, k_red, {1, 1}, {1, 1}));
+    for (ggml_type type : q4_k_skinny_types) {
+        for (const auto & [n_out, k_red] : q4_k_skinny_shapes) {
+            for (int64_t n_tokens : {1, 2, 8, 9, 16, 17, 32, 33, 64, 65}) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, n_out, n_tokens, k_red, {1, 1}, {1, 1}));
+            }
         }
     }
     // M = 17..64 on the DFlash2 verify shapes, K = 5120 and the 2/4-card N splits
     const std::vector<std::pair<int64_t, int64_t>> q4_k_skinny_m32_shapes = {
         { 4352, 5120}, { 8704, 5120}, { 1536, 5120}, { 3072, 5120},
     };
-    for (const auto & [n_out, k_red] : q4_k_skinny_m32_shapes) {
-        for (int64_t n_tokens : {17, 24, 32, 48, 64}) {
-            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, n_out, n_tokens, k_red, {1, 1}, {1, 1}));
+    for (ggml_type type : q4_k_skinny_types) {
+        for (const auto & [n_out, k_red] : q4_k_skinny_m32_shapes) {
+            for (int64_t n_tokens : {17, 24, 32, 48, 64}) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, n_out, n_tokens, k_red, {1, 1}, {1, 1}));
+            }
         }
     }
-    // smallest repackable Q4_K shape: one 32-row tile and one 256-value super-block, so a single
+    // smallest repackable shape: one 32-row tile and one 256-value super-block, so a single
     // split-K=8 launch (M = 1) or one to_f16 tile (M = 17)
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 32,  1, 256, {1, 1}, {1, 1}));
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 32, 17, 256, {1, 1}, {1, 1}));
+    for (ggml_type type : q4_k_skinny_types) {
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 32,  1, 256, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 32, 17, 256, {1, 1}, {1, 1}));
+    }
+
+    // Q2_K~Q6_K skinny gated pair: both matmuls and the SWIGLU in one kernel on sm_70 for
+    // M <= 16, two M=32 two-phase kernels plus the elementwise SWIGLU for M = 17..64
+    for (ggml_type type : q4_k_skinny_types) {
+        for (int64_t n_tokens : {1, 8, 16}) {
+            for (int64_t n_out : {4352, 8704}) {
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n_tokens, n_out, 5120,
+                    false, 1, 1, false, false, true, false, {1, 1}));
+            }
+        }
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 32, 4352, 5120,
+            false, 1, 1, false, false, true, false, {1, 1}));
+        // K = 4864 is a multiple of 256 but not of 512: M = 17..64 has no M=32 kernel and must
+        // fall back to the regular path instead of running with split-K 8
+        for (int64_t n_tokens : {17, 24, 32}) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n_tokens, 4352, 4864,
+                false, 1, 1, false, false, true, false, {1, 1}));
+        }
+    }
 
     // Q8_0 skinny gated pair: both matmuls and the SWIGLU in one kernel on sm_70, M > 16 as two
     // M=32 kernels plus the elementwise SWIGLU
     for (int64_t n_tokens : {1, 8, 16, 24, 32, 48, 64}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0, GGML_GLU_OP_SWIGLU, n_tokens, 4352, 5120,
             false, 1, 1, false, false, true, false, {1, 1}));
+    }
+
+    // multiple repacked Q2_K~Q6_K matmuls sharing one input: the multi-weight kernel for
+    // M <= 16, one M=32 two-phase launch per weight for M = 17..64. The N columns follow the
+    // per-card qkv/z and q/k/v shapes of the 4-card (2560/1536, 3072/256/256) and 2-card
+    // (5120/3072, 6144/512/512) tensor splits; all weights use K = 5120 so they share one src1.
+    for (ggml_type type : q4_k_skinny_types) {
+        for (int64_t n_tokens : {1, 8, 16}) {
+            test_cases.emplace_back(new test_mul_mat_multi({2560, 1536}, n_tokens, 5120, type));
+            test_cases.emplace_back(new test_mul_mat_multi({3072, 256, 256}, n_tokens, 5120, type));
+            test_cases.emplace_back(new test_mul_mat_multi({5120, 3072}, n_tokens, 5120, type));
+            test_cases.emplace_back(new test_mul_mat_multi({6144, 512, 512}, n_tokens, 5120, type));
+        }
+        test_cases.emplace_back(new test_mul_mat_multi({3072, 256, 256}, 32, 5120, type));
+        // K = 4864 is a multiple of 256 but not of 512: M = 17..64 must fall back to the
+        // shared-input F16 path instead of the M=32 kernel
+        for (int64_t n_tokens : {17, 24, 32}) {
+            test_cases.emplace_back(new test_mul_mat_multi({2560, 1536}, n_tokens, 4864, type));
+        }
+    }
+
+    // F32 pair GEMV: two narrow F32 weights sharing one input run as one kernel for M <= 3;
+    // M = 4 stays on the regular path
+    for (int64_t n_tokens : {1, 2, 3, 4}) {
+        test_cases.emplace_back(new test_mul_mat_multi({48, 48}, n_tokens, 5120, GGML_TYPE_F32));
     }
 
     // multiple Q8_0 matmuls sharing one input: one input conversion and one multi-weight kernel
