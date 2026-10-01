@@ -37,16 +37,21 @@ constexpr int SM70_D256_D       = 256;
 #define SM70_D256_KV_WINDOW 131072
 static_assert(SM70_D256_KV_WINDOW % SM70_D256_BLOCK_M == 0, "window is not a multiple of the q block");
 
-// SplitKV2: when the CTAs of one KV window do not fill the device (one CTA
-// per SM, the kernel is register-bound), the window is split along KV into
-// this many segments and both run in one launch. The partial buffers are
-// always sized for this many slices; one segment must hold at least
-// SM70_D256_SPLIT_MIN_BLOCKS KV blocks or the window is left unsplit (the
+// SplitKV2: when the CTAs of one KV window (or of the dense launch) do not
+// fill the device (one CTA per SM, the kernel is register-bound), the KV range
+// is split into this many segments and all run in one launch. The partial
+// buffers are always sized for this many slices; one segment must hold at
+// least SM70_D256_SPLIT_MIN_BLOCKS KV blocks or the range is left unsplit (the
 // fixed merge cost is not worth it for short tails). The windowed path only
 // ever sees a short last window: the first window is always
 // SM70_D256_KV_WINDOW rows.
 constexpr int SM70_D256_KV_SPLITS = 2;
 constexpr int SM70_D256_SPLIT_MIN_BLOCKS = 32;
+
+// All CC 7.0 devices (GV100) have 80 SMs. The split predicate needs the SM
+// count at alloc_size time, which has no device id, so both the scratch layout
+// and the launcher use this constant and can not diverge.
+constexpr int SM70_D256_NSM = 80;
 
 // Q f32 -> f16 staging. grid = (q_pad, batch*hkv, gqa), block = 128 threads
 // (one float2 of the 256-wide row each). Qs layout, which is what the kernel
@@ -299,7 +304,7 @@ __global__ void sm70_d256_range_bounds_kernel(
 //   [mask bounds int2: one per (batch, q block)]
 //   PAD(., 128)
 //   [kv_limit int: upper bound of the KV rows the bounds allow]
-// windowed only:
+// windowed or split dense only:
 //   [p_out f32: SM70_D256_KV_SPLITS slices of Qs shape]
 //   [p_max f32: SM70_D256_KV_SPLITS slices of one f32 per row]
 //   [p_sum f32: same]
@@ -315,16 +320,17 @@ struct sm70_d256_scratch {
     size_t os_offset;
     size_t bounds_offset;
     size_t kv_limit_offset;
-    size_t p_out_offset;     // windowed only
-    size_t acc_max_offset;   // windowed only
-    size_t acc_sum_offset;   // windowed only
-    size_t p_max_offset;     // windowed only
-    size_t p_sum_offset;     // windowed only
+    size_t p_out_offset;     // partial only
+    size_t acc_max_offset;   // partial only
+    size_t acc_sum_offset;   // partial only
+    size_t p_max_offset;     // partial only
+    size_t p_sum_offset;     // partial only
     size_t n_q;              // Qs/Os elements per buffer
     size_t rows;             // n_q / D: rows of the per-row partial buffers
     int q_pad;
     int n_q_blocks;          // q_pad / SM70_D256_BLOCK_M
     bool windowed;
+    bool partial;            // launcher takes the Partial kernel (windowed or split dense)
     bool need_f16_k;
     bool need_f16_v;
     bool v_is_k_view;
@@ -347,8 +353,24 @@ static sm70_d256_scratch sm70_d256_get_scratch(const ggml_tensor * dst) {
         && (K->type == GGML_TYPE_Q8_0 || K->type == GGML_TYPE_Q4_0)
         && K->ne[1] > SM70_D256_KV_WINDOW;
 
+    // The dense path (no fixed-size mirror) takes the same KV split when one
+    // launch would not fill the device. kv_len follows the launcher: a range
+    // mask spans the whole K/V view, an explicit mask only its own columns.
+    const int q_pad = (int) GGML_PAD(Q->ne[1], SM70_D256_BLOCK_M);
+    const int64_t kv_len = mask == nullptr ? 0
+        : (mask->type == GGML_TYPE_I32 ? K->ne[1] : mask->ne[0]);
+    const int64_t launch_ctas =
+        (int64_t) (q_pad / SM70_D256_BLOCK_M) * Q->ne[3] * Q->ne[2];
+    const int64_t kv_blocks =
+        (kv_len + SM70_D256_MASK_BLOCK_N - 1) / SM70_D256_MASK_BLOCK_N;
+    const bool split_dense = !windowed
+        && launch_ctas < 4 * SM70_D256_NSM
+        && kv_blocks >= 2 * SM70_D256_SPLIT_MIN_BLOCKS;
+    const bool partial = windowed || split_dense;
+
     sm70_d256_scratch s = {};
     s.windowed = windowed;
+    s.partial = partial;
     s.need_f16_k = need_f16_k;
     s.need_f16_v = need_f16_v;
     s.v_is_k_view = v_is_k_view;
@@ -380,7 +402,7 @@ static sm70_d256_scratch sm70_d256_get_scratch(const ggml_tensor * dst) {
     }
 
     const size_t f16_bytes = GGML_PAD((size_t) (s.f16_extra.end - (uintptr_t) base), 128);
-    s.q_pad = (int) GGML_PAD(Q->ne[1], SM70_D256_BLOCK_M);
+    s.q_pad = q_pad;
     s.n_q = (size_t) Q->ne[2] * s.q_pad * SM70_D256_D * Q->ne[3];
     s.rows = s.n_q / SM70_D256_D;
     s.qs_offset = f16_bytes;
@@ -388,7 +410,7 @@ static sm70_d256_scratch sm70_d256_get_scratch(const ggml_tensor * dst) {
     s.n_q_blocks = s.q_pad / SM70_D256_BLOCK_M;
     s.bounds_offset = GGML_PAD(s.os_offset + s.n_q * sizeof(float), 128);
     s.kv_limit_offset = GGML_PAD(s.bounds_offset + (size_t) Q->ne[3] * s.n_q_blocks * sizeof(int2), 128);
-    if (windowed) {
+    if (partial) {
         s.p_out_offset   = GGML_PAD(s.kv_limit_offset + sizeof(int), 128);
         s.p_max_offset   = GGML_PAD(s.p_out_offset + SM70_D256_KV_SPLITS * s.n_q * sizeof(float), 128);
         s.p_sum_offset   = GGML_PAD(s.p_max_offset + SM70_D256_KV_SPLITS * s.rows * sizeof(float), 128);
@@ -635,11 +657,12 @@ bool ggml_cuda_sm70_d256_supported(int cc, const ggml_tensor * dst) {
 // q_pad >= q_len_real and q_pad % 64 == 0. mask_scale = 1/scale (the mask is
 // added to the raw QK domain, see the kernel). mask/mask_bounds may be null (no
 // mask). With mask_is_range the mask strides are in int2 units, else in halfs.
-// Partial selects the windowed variant, which walks only the KV blocks
+// Partial selects the partial variant, which walks only the KV blocks
 // [win_block_lo, win_block_hi) and writes raw max/sum + unnormalized O to the
 // partial buffers. kv_splits > 1 (Partial only) splits that block range into
 // kv_splits equal segments, one per grid.y slice; each segment writes its own
-// partial slice. The public wrapper below always uses the dense variant.
+// partial slice. The public wrapper below uses the dense variant only when the
+// launch is not split.
 template <bool Partial>
 static void sm70_d256_launch_dense(
         const void * q, const void * k, const void * v, void * out,
@@ -785,8 +808,7 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
         // the point where the tail wave stops dominating).
         const int m_blocks = q_pad / SM70_D256_BLOCK_M;
         const int window_ctas = m_blocks * batch * heads_q;
-        const int n_sms = ggml_cuda_info().devices[ctx.device].nsm;
-        const bool split_window = window_ctas < 4 * n_sms;
+        const bool split_window = window_ctas < 4 * SM70_D256_NSM;
 
         const int n_win = (int) ((K->ne[1] + SM70_D256_KV_WINDOW - 1) / SM70_D256_KV_WINDOW);
         for (int w = 0; w < n_win; ++w) {
@@ -990,27 +1012,68 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
             CUDA_CHECK(cudaGetLastError());
         }
 
-        ggml_cuda_sm70_d256_launch_raw(
-            Qs, K_h2, V_h2, Os, mask->data, mask_bounds,
-            /*q_batch_stride */ (int64_t) heads_q * q_pad * SM70_D256_D,
-            /*q_row_stride   */ SM70_D256_D,
-            /*q_head_stride  */ (int64_t) q_pad * SM70_D256_D,
-            k_outer_stride, k_row_stride, k_head_stride,
-            v_outer_stride, v_row_stride, v_head_stride,
-            /*mask_row_stride  */ mask_range ? mask->nb[1] / sizeof(int2)   : mask->nb[1] / sizeof(half),
-            /*mask_batch_stride*/ mask->ne[3] == 1 ? 0 : (int64_t) mask->nb[3] / (mask_range ? sizeof(int2) : sizeof(half)),
-            mask_range,
-            q_pad, kv_len, heads_q, hkv, batch, kv_offset,
-            scale, 1.0f / scale, stream);
+        if (scratch.partial) {
+            // Dense SplitKV2: the whole KV range is one window, split in two.
+            // Uses the same partial buffers and merge as the windowed path;
+            // slice 0 initializes the accumulator, slice 1 merges into it.
+            float * const p_out   = (float *) (base + scratch.p_out_offset);
+            float * const p_max   = (float *) (base + scratch.p_max_offset);
+            float * const p_sum   = (float *) (base + scratch.p_sum_offset);
+            float * const acc_max = (float *) (base + scratch.acc_max_offset);
+            float * const acc_sum = (float *) (base + scratch.acc_sum_offset);
+
+            sm70_d256_launch_dense<true>(
+                Qs, K_h2, V_h2, Os, mask->data, mask_bounds,
+                /*q_batch_stride */ (int64_t) heads_q * q_pad * SM70_D256_D,
+                /*q_row_stride   */ SM70_D256_D,
+                /*q_head_stride  */ (int64_t) q_pad * SM70_D256_D,
+                k_outer_stride, k_row_stride, k_head_stride,
+                v_outer_stride, v_row_stride, v_head_stride,
+                /*mask_row_stride  */ mask_range ? mask->nb[1] / sizeof(int2)   : mask->nb[1] / sizeof(half),
+                /*mask_batch_stride*/ mask->ne[3] == 1 ? 0 : (int64_t) mask->nb[3] / (mask_range ? sizeof(int2) : sizeof(half)),
+                mask_range,
+                q_pad, kv_len, heads_q, hkv, batch, kv_offset,
+                scale, 1.0f / scale,
+                /*win_block_lo*/ 0, /*win_block_hi*/ INT_MAX,
+                SM70_D256_KV_SPLITS,
+                p_out, p_max, p_sum,
+                stream);
+
+            const unsigned n_merge = (unsigned) ((scratch.rows
+                + FLASH_NAMESPACE::kWindowMergeRowsPerCta - 1)
+                / FLASH_NAMESPACE::kWindowMergeRowsPerCta);
+            const int64_t slice_out = (int64_t) scratch.rows * SM70_D256_D;
+            FLASH_NAMESPACE::sm70_d256_window_merge_kernel<<<n_merge, 256, 0, stream>>>(
+                Os, acc_max, acc_sum, p_out, p_max, p_sum,
+                (int64_t) scratch.rows, true, scale * float(M_LOG2E));
+            FLASH_NAMESPACE::sm70_d256_window_merge_kernel<<<n_merge, 256, 0, stream>>>(
+                Os, acc_max, acc_sum,
+                p_out + slice_out, p_max + scratch.rows, p_sum + scratch.rows,
+                (int64_t) scratch.rows, false, scale * float(M_LOG2E));
+            CUDA_CHECK(cudaGetLastError());
+        } else {
+            ggml_cuda_sm70_d256_launch_raw(
+                Qs, K_h2, V_h2, Os, mask->data, mask_bounds,
+                /*q_batch_stride */ (int64_t) heads_q * q_pad * SM70_D256_D,
+                /*q_row_stride   */ SM70_D256_D,
+                /*q_head_stride  */ (int64_t) q_pad * SM70_D256_D,
+                k_outer_stride, k_row_stride, k_head_stride,
+                v_outer_stride, v_row_stride, v_head_stride,
+                /*mask_row_stride  */ mask_range ? mask->nb[1] / sizeof(int2)   : mask->nb[1] / sizeof(half),
+                /*mask_batch_stride*/ mask->ne[3] == 1 ? 0 : (int64_t) mask->nb[3] / (mask_range ? sizeof(int2) : sizeof(half)),
+                mask_range,
+                q_pad, kv_len, heads_q, hkv, batch, kv_offset,
+                scale, 1.0f / scale, stream);
+        }
     }
 
     // dst is the FA output (D, heads_q, q_len, batch) f32; the strides below
     // are its token/head/batch strides in float2 units.
     {
         const dim3 grid(q_len, batch * heads_q);
-        if (scratch.windowed) {
-            // The windowed path normalizes the accumulator here, in place of
-            // the separate finalize pass.
+        if (scratch.partial) {
+            // The partial paths (windowed or split dense) normalize the
+            // accumulator here, in place of the separate finalize pass.
             sm70_d256_scatter_kernel<true><<<grid, SM70_D256_D/2, 0, stream>>>(
                 (const float2 *) Os, (float2 *) dst->data,
                 (const float *) (base + scratch.acc_sum_offset),
