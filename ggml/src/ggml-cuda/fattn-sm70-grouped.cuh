@@ -253,15 +253,21 @@ __device__ __forceinline__ __half2 grouped_verify_q8_pair_half2(const uint32_t p
     return __hmul2(d2, q);
 }
 
-// Unpack one q4_0 value pair (two code bytes in the low half of packed) and scale it by d,
-// all in half precision. q4_0 packs values 0..15 into the low nibbles of qs[0..15] and
-// 16..31 into the high nibbles.
-__device__ __forceinline__ __half2 grouped_verify_q4_pair_half2(const uint32_t packed, const bool hi_half, const __half2 d2) {
-    const int shift = hi_half ? 4 : 0;
-    const __half2 q = __halves2half2(
-        __short2half_rn((int) ((packed >> shift) & 0xf) - 8),
-        __short2half_rn((int) ((packed >> (8 + shift)) & 0xf) - 8));
-    return __hmul2(d2, q);
+// Unpack four q4_0 code bytes into two scaled half2 pairs in value order. q4_0 packs values
+// 0..15 into the low nibbles of qs[0..15] and 16..31 into the high nibbles. A nibble n becomes
+// the value n - 8: the f16 bit pattern 0x6400 | n is exactly 1024 + n, and subtracting 1032
+// gives n - 8 without rounding, so each value matches __short2half_rn exactly.
+__device__ __forceinline__ void grouped_verify_q4_quad_half2(
+        const uint32_t packed, const bool hi_half, const __half2 d2, __half2 out[2]) {
+    const uint32_t nib = hi_half ? ((packed >> 4) & 0x0F0F0F0F) : (packed & 0x0F0F0F0F);
+    const unsigned bias_bits = 0x64086408u; // f16 1032, 1032
+    const __half2 bias = *reinterpret_cast<const __half2 *>(&bias_bits);
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        // bytes (2i, 2i+1) into the two half slots with 1024 + n folded into the f16 bits
+        const unsigned packed_pair = __byte_perm(nib, 0, 0x4140u + 0x0202u*i) | 0x64006400u;
+        out[i] = __hmul2(d2, __hsub2(*reinterpret_cast<const __half2 *>(&packed_pair), bias));
+    }
 }
 
 __device__ __forceinline__ uint32_t grouped_verify_half2_uint(const __half2 h) {
@@ -362,10 +368,13 @@ __device__ __forceinline__ void flash_attn_sm70_grouped_dequant_kv(
             const uint32_t w1 = (uint32_t) *reinterpret_cast<const uint16_t *>(codes + 4)
                               | (uint32_t) *reinterpret_cast<const uint16_t *>(codes + 6) << 16;
             const bool hi_half = (c % 32) >= 16;
-            out.x = grouped_verify_half2_uint(grouped_verify_q4_pair_half2(w0,      hi_half, d2));
-            out.y = grouped_verify_half2_uint(grouped_verify_q4_pair_half2(w0 >> 16, hi_half, d2));
-            out.z = grouped_verify_half2_uint(grouped_verify_q4_pair_half2(w1,      hi_half, d2));
-            out.w = grouped_verify_half2_uint(grouped_verify_q4_pair_half2(w1 >> 16, hi_half, d2));
+            __half2 q4_pairs[2];
+            grouped_verify_q4_quad_half2(w0, hi_half, d2, q4_pairs);
+            out.x = grouped_verify_half2_uint(q4_pairs[0]);
+            out.y = grouped_verify_half2_uint(q4_pairs[1]);
+            grouped_verify_q4_quad_half2(w1, hi_half, d2, q4_pairs);
+            out.z = grouped_verify_half2_uint(q4_pairs[0]);
+            out.w = grouped_verify_half2_uint(q4_pairs[1]);
         } else {
             // 8 columns = 16 B, and base + 2 + (c % 32) is even, so use u16 loads and one uint4 store.
             const uint16_t * packed = reinterpret_cast<const uint16_t *>(kv_stage + base + 2 + (c % 32));
