@@ -597,14 +597,15 @@ __device__ __forceinline__ void sm70_d256_clamp_visit_rows(
 // writes only the per-row raw max/sum and the unnormalized numerator, but at
 // split 0 with gridDim.y = kv_splits * batch and one flat [row][D] partial
 // buffer per KV segment (row = (batch*query_len + query_row)*heads_q + head_q,
-// slice s at s * (gridDim.y/kv_splits)*query_len*heads_q rows). kv_splits is 1
-// or 2: the launcher splits one KV window in two when the window alone cannot
-// fill the device. The caller merges the segment slices (and then the windows)
-// with sm70_d256_window_merge_kernel; the output scatter applies the row
-// normalization. A row that sees no KV block in its segment writes max -inf,
-// sum 0 and leaves O unread (the merge skips -inf rows of p_max).
+// slice s at s * (gridDim.y/kv_splits)*query_len*heads_q rows). KV_SPLITS is a
+// template parameter (1 or 2): the launcher splits one KV window in two when
+// the window alone cannot fill the device. KV_SPLITS == 1 keeps the unsplit
+// kernel unchanged. The caller merges the segment slices (and then the
+// windows) with sm70_d256_window_merge_kernel; the output scatter applies the
+// row normalization. A row that sees no KV block in its segment writes max
+// -inf, sum 0 and leaves O unread (the merge skips -inf rows of p_max).
 template <typename TraitsT, typename Element, typename ElementOut = Element,
-          bool SplitKV3 = false, bool Partial = false>
+          bool SplitKV3 = false, bool Partial = false, int KV_SPLITS = 1>
 __global__ __launch_bounds__(256, 1)
 void sm70_d256_splitd_dense_kernel(
     const Element *__restrict__ q,
@@ -637,11 +638,12 @@ void sm70_d256_splitd_dense_kernel(
     float *__restrict__ partial_sum,
     int win_block_lo,
     int win_block_hi,
-    int kv_splits,
     const int * __restrict__ visit_lo,
     const int * __restrict__ visit_hi) {
     static_assert(!(SplitKV3 && Partial), "SplitKV3 and Partial are mutually exclusive");
+    static_assert(KV_SPLITS >= 1, "invalid KV split count");
     using Traits = TraitsT;
+    constexpr int kv_splits = KV_SPLITS;
     constexpr int kBlockM = Traits::kBlockM;
     constexpr int kBlockN = Traits::kBlockN;
     constexpr int kDChunk = Traits::kDChunk;

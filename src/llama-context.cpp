@@ -3153,6 +3153,28 @@ llm_graph_params llama_context::graph_params(
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype,
                              size_t        token_offset) const {
+    // the 6-card FA assist shares the KV tail with the idle devices, but with a range mask the
+    // marked FA view always spans the whole cache: gate on the KV length the batch really uses
+    bool fa_assist = false;
+    // decode-sized batches never take the assist path (meta gate on the Q rows), keep them unmarked
+    // so their graphs are not rebuilt when a conversation crosses the threshold
+    if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && model.get_split_state_ud.n_devices == 6 && ubatch.n_seqs == 1 &&
+            ubatch.n_tokens >= GGML_BACKEND_META_ASSIST_MIN_Q) {
+        uint32_t n_kv = 0;
+        if (memory && ubatch.n_seqs_unq > 0) {
+            const llama_pos pos_max = memory->seq_pos_max(ubatch.seq_id_unq[0]);
+            if (pos_max >= 0) {
+                n_kv = uint32_t(pos_max) + 1;
+            }
+        }
+        if (ubatch.pos != nullptr) {
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                n_kv = std::max(n_kv, uint32_t(ubatch.pos[i*ubatch.n_pos]) + 1);
+            }
+        }
+        fa_assist = n_kv >= GGML_BACKEND_META_ASSIST_MIN_KV;
+    }
+
     return {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
@@ -3174,6 +3196,7 @@ llm_graph_params llama_context::graph_params(
         /*.t_embd_src            =*/ embd_src_enable ? t_embd_src_sink : nullptr,
         /*.layer_inp_sink_layers =*/ layer_inp_sink_layers,
         /*.token_offset          =*/ t_layer_inp_sink != nullptr ? token_offset : 0,
+        /*.fa_assist             =*/ fa_assist,
     };
 }
 

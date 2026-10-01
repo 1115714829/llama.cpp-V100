@@ -831,6 +831,10 @@ struct llm_graph_params {
     std::vector<uint32_t> layer_inp_sink_layers; // target: row order within the sink
     size_t token_offset = 0;                     // target: first sink column written by this ubatch
 
+    // 6-card FA assist: whether this ubatch marks the FA nodes as shareable (see qwen35). The
+    // marked/unmarked nodes are different graphs, so reuse must not cross this flag
+    bool fa_assist = false;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -905,6 +909,7 @@ struct llm_graph_params {
             t_layer_inp_sink      == other.t_layer_inp_sink      &&
             t_embd_src            == other.t_embd_src            &&
             token_offset          == other.token_offset          &&
+            fa_assist             == other.fa_assist             &&
             layer_inp_sink_layers == other.layer_inp_sink_layers;
     }
 };
@@ -1070,6 +1075,7 @@ struct llm_graph_context {
     ggml_tensor * const t_embd_src;          // draft: staging sink read by the injection graph
     const std::vector<uint32_t> layer_inp_sink_layers;
     const size_t token_offset;               // target: first sink column written by this ubatch
+    const bool fa_assist;                    // mark the FA nodes for the 6-card assist path
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;

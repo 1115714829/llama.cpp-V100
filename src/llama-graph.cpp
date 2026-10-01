@@ -1493,6 +1493,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     t_embd_src       (params.t_embd_src),
     layer_inp_sink_layers(params.layer_inp_sink_layers),
     token_offset     (params.token_offset),
+    fa_assist        (params.fa_assist),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);

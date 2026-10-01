@@ -716,23 +716,42 @@ static void sm70_d256_launch_dense(
         GGML_ASSERT(kv_splits == 1);
     }
 
-    auto kernel = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<Traits, El, float, false, Partial>;
-    CUDA_SET_SHARED_MEMORY_LIMIT((const void *) kernel, Traits::kSmemBytes);
-
     const dim3 block(Traits::kNThreads);
     const dim3 grid(q_pad / Traits::kBlockM, batch * kv_splits, heads_q);
-    kernel<<<grid, block, Traits::kSmemBytes, stream>>>(
-        (const El *) q, (const El *) k, (const El *) v, (float *) out,
-        (const __half *) mask,
-        (int) q_batch_stride, (int) q_row_stride, (int) q_head_stride,
-        (int) k_outer_stride, (int) k_row_stride, (int) k_head_stride,
-        (int) v_outer_stride, (int) v_row_stride, (int) v_head_stride,
-        mask_row_stride, mask_batch_stride, mask_is_range, (const int2 *) mask_bounds,
-        q_pad, kv_len, heads_q, heads_kv, kv_offset,
-        softmax_scale * float(M_LOG2E), mask_scale,
-        partial_out, partial_max, partial_sum,
-        win_block_lo, win_block_hi, kv_splits,
-        visit_lo, visit_hi);
+
+    // KV_SPLITS is a template parameter so that an unsplit launch keeps the exact
+    // pre-SplitKV2 kernel: no runtime divide/modulo and no per-slice offsets.
+    if (kv_splits > 1) {
+        auto kernel_split = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<Traits, El, float, false, Partial, SM70_D256_KV_SPLITS>;
+        CUDA_SET_SHARED_MEMORY_LIMIT((const void *) kernel_split, Traits::kSmemBytes);
+        kernel_split<<<grid, block, Traits::kSmemBytes, stream>>>(
+            (const El *) q, (const El *) k, (const El *) v, (float *) out,
+            (const __half *) mask,
+            (int) q_batch_stride, (int) q_row_stride, (int) q_head_stride,
+            (int) k_outer_stride, (int) k_row_stride, (int) k_head_stride,
+            (int) v_outer_stride, (int) v_row_stride, (int) v_head_stride,
+            mask_row_stride, mask_batch_stride, mask_is_range, (const int2 *) mask_bounds,
+            q_pad, kv_len, heads_q, heads_kv, kv_offset,
+            softmax_scale * float(M_LOG2E), mask_scale,
+            partial_out, partial_max, partial_sum,
+            win_block_lo, win_block_hi,
+            visit_lo, visit_hi);
+    } else {
+        auto kernel_plain = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<Traits, El, float, false, Partial, 1>;
+        CUDA_SET_SHARED_MEMORY_LIMIT((const void *) kernel_plain, Traits::kSmemBytes);
+        kernel_plain<<<grid, block, Traits::kSmemBytes, stream>>>(
+            (const El *) q, (const El *) k, (const El *) v, (float *) out,
+            (const __half *) mask,
+            (int) q_batch_stride, (int) q_row_stride, (int) q_head_stride,
+            (int) k_outer_stride, (int) k_row_stride, (int) k_head_stride,
+            (int) v_outer_stride, (int) v_row_stride, (int) v_head_stride,
+            mask_row_stride, mask_batch_stride, mask_is_range, (const int2 *) mask_bounds,
+            q_pad, kv_len, heads_q, heads_kv, kv_offset,
+            softmax_scale * float(M_LOG2E), mask_scale,
+            partial_out, partial_max, partial_sum,
+            win_block_lo, win_block_hi,
+            visit_lo, visit_hi);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

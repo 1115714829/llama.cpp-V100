@@ -453,8 +453,9 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
 
         // 6-card attention load balancing: allow the meta backend to hand the KV tail of this
-        // layer to the idle devices; other card counts and concurrent batches keep the plain node
-        if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && model.get_split_state_ud.n_devices == 6 && ubatch.n_seqs == 1) {
+        // layer to the idle devices; the host-side gate in graph_params keeps the plain node
+        // until the batch really spans the assist threshold
+        if (fa_assist) {
             const auto & fused = res->get_fused_nodes();
             for (size_t i = n_fused; i < fused.size(); i++) {
                 if (fused[i].op == LLM_FUSED_OP_FLASH_ATTN) {
