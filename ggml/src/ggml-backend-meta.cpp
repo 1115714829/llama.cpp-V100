@@ -4368,7 +4368,19 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     backend_ctx->plan_clear(plan_other);
                 }
             }
-            backend_ctx->max_subgraphs = std::max(backend_ctx->max_subgraphs, n_subgraphs);
+            // leave room for the assist boundaries: a graph whose FA nodes are marked shareable may be
+            // rebuilt as an assist plan (prefill) with extra subgraphs, which must not discard the
+            // plans of the decode graphs built before it
+            size_t n_subgraphs_reserve = n_subgraphs;
+            if (backend_ctx->assist_set != nullptr) {
+                for (int i = 0; i < cgraph->n_nodes; i++) {
+                    const ggml_tensor * node = cgraph->nodes[i];
+                    if (node->op == GGML_OP_FLASH_ATTN_EXT && ggml_flash_attn_ext_get_assist_capable(node)) {
+                        n_subgraphs_reserve += 2;
+                    }
+                }
+            }
+            backend_ctx->max_subgraphs = std::max(backend_ctx->max_subgraphs, n_subgraphs_reserve);
             const size_t n_nodes_per_device = 3 * backend_ctx->n_reduce_steps; // tmp + ADD (+zeroing) graph per step and device
             const size_t n_cgraphs_per_device = 2 * backend_ctx->n_reduce_steps; // ADD ( + zeroing) graph per step and device
             const size_t mem_per_device_graphs_main = GGML_META_N_PLANS*backend_ctx->max_subgraphs*ggml_graph_overhead_custom(backend_ctx->max_nnodes, cgraph->grads); // one cgraph per subgraph and plan
