@@ -648,21 +648,6 @@ ggml_tensor * clip_graph::build_ffn(
         ffn_op_type type_op,
         int il) const {
 
-    // large images and videos: run the FFN over slices of the tokens, so the compute buffer holds
-    // the [n_ff, n_tokens] intermediates of one slice instead of all tokens (each device holding
-    // vision layers reserves its own buffer for this peak)
-    constexpr int64_t ffn_chunk = 4096;
-    if (cur->ne[1] > ffn_chunk && cur->ne[2] == 1 && cur->ne[3] == 1 && ggml_is_contiguous(cur)) {
-        ggml_tensor * out = nullptr;
-        for (int64_t i1 = 0; i1 < cur->ne[1]; i1 += ffn_chunk) {
-            const int64_t n = std::min(ffn_chunk, cur->ne[1] - i1);
-            ggml_tensor * part = ggml_view_2d(ctx0, cur, cur->ne[0], n, cur->nb[1], i1*cur->nb[1]);
-            part = build_ffn(part, up, up_b, gate, gate_b, down, down_b, type_op, il);
-            out = out ? ggml_concat(ctx0, out, part, 1) : part;
-        }
-        return out;
-    }
-
     ggml_tensor * tmp = up ? build_mm(up, cur) : cur;
     cb(tmp, "ffn_up", il);
 
