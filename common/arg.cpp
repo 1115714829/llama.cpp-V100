@@ -2616,7 +2616,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         // note: "-mmdev" must sort after "--rpc" in the preset map, else RPC devices are not registered yet
         {"-mmdev", "--mmproj-device"}, "DEVICE",
-        "device to use for multimodal projector (none = don't offload, default: follows --device)\n"
+        "device to use for multimodal projector (none = don't offload; default: split across the main model's GPUs)\n"
         "use --list-devices to see a list of available devices",
         [](common_params & params, const std::string & value) {
             if (value == "none") {
@@ -2631,6 +2631,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.mmproj_use_gpu = true;
             params.mmproj_device  = devices.front();
+            params.mmproj_device_explicit = true;
         }
     ).set_examples(mmproj_examples).set_env("MTMD_BACKEND_DEVICE")); // no LLAMA_ARG_ prefix for backward compatibility reason
     add_opt(common_arg(
