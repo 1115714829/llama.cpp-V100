@@ -2,19 +2,18 @@
 
 [简体中文](README.md) | **English**
 
-A modified version of llama.cpp for the NVIDIA V100 (SM70). Current version **1.0.8**; see [CHANGELOG.md](CHANGELOG.md) for the changes in each release.
+A modified version of llama.cpp for the NVIDIA V100 (SM70). Current version **1.0.9**; see [CHANGELOG.md](CHANGELOG.md) for the changes in each release.
 
 ---
 
-## What's new in 1.0.8
+## What's new in 1.0.9
 
-1.0.8 speeds up long-context prefill (idle GPUs share the attention on 6 GPUs; prefill attention kernel improvements) and spreads the vision module across all GPUs layer by layer so that VRAM is balanced. 4/6-GPU T=0 output is word-for-word identical to 1.0.7; all numbers below were measured alternately with 1.0.7 in the same session.
+1.0.9 speeds up the Q4 configuration (mixed-quantization models such as UD-Q4_K_M). Output and speed of the Q8 configuration are the same as 1.0.8 (4/6-GPU T=0 output word-for-word identical); all numbers below were measured alternately with 1.0.8 in the same session.
 
-- **6-GPU long-context prefill**: with 6 GPUs, 2 GPUs get no attention heads in every full-attention layer. Once the context reaches 32768, these 2 GPUs read the tail of the KV directly from the neighbouring GPUs (no KV copy), compute partial attention and merge it online. 6 GPUs, 524288 (YaRN), synthetic 209715 prefill 1800 -> 2091 tok/s (+16%, time to first token 116.4 -> 100.3 s), 419430 prefill 1200 -> 1490 tok/s (+24%, 349.4 -> 281.5 s); decoding unchanged or slightly faster. About 300 MiB more VRAM per GPU (assist workspace).
-- **Prefill attention kernel**: Split-D gets K double buffering back; when the GPU is not fully occupied, each KV window is computed as two segments in parallel. 4-GPU 200K synthetic prefill 1637 -> 1759 tok/s (+7.4%, 128.1 -> 119.3 s), real 16K 2551 -> 2578 tok/s (+1.0%), 3-GPU Q8 100K 1946 -> 1971 tok/s.
-- **Speculative verification attention**: small kernel improvements, 4-GPU 200K decoding 278.4 -> 281.2 tok/s.
-- **Balanced vision-module VRAM**: the layers of the vision module (mmproj) are assigned contiguously to all GPUs used by the main model (2-6 GPUs) according to the VRAM each GPU has left after loading; previously the whole module was on the first GPU. Peak VRAM of the busiest GPU: 6 GPUs 12220 -> 11788 MiB, 4 GPUs 14151 -> 13547 MiB (5 and 2 GPUs drop as well), with at most 170 MiB between GPUs; image and video processing time and output unchanged.
-- **Baseline**: 2-GPU Q4 100K prefill 1415 -> 1419 tok/s, 3-GPU Q4 100K 1881 -> 1902 tok/s, 6-GPU 16K prefill unchanged; multi-request time to first token equal to or faster than 1.0.7.
+- **Small-batch matrix multiplication for mixed Q4 quantization**: the Q4_K small-batch kernels are extended to Q2_K, Q3_K, Q5_K and Q6_K. Weights such as the Q5_K/Q6_K tensors in UD-Q4_K_M used to go through the generic path; they are now repacked in place at load time and use the small-batch kernels like Q4_K, and gate/up fusion and multi-weight fusion are enabled for the Q4 configuration. 2-GPU Q4 (synthetic 102400, 256 output tokens) decoding 193.0 -> 212.2 tok/s (+10%, time per speculative round 41.3 -> 37.6 ms), prefill 1419 -> 1438 tok/s; 3-GPU Q4 decoding 220.1 -> 240.9 tok/s (+9.5%), prefill 1902 -> 1929 tok/s.
+- **Real content** (2-GPU Q4, 8 prompts): time per token T=0 11.58 -> 10.31 ms, T=0.6 11.07 -> 10.43 ms; perplexity unchanged (2.4097 -> 2.4057). Output differs slightly from 1.0.8 (Q5_K/Q6_K are now computed in f16).
+- **q4_0 KV cache**: vectorized dequantization, about +1% long-context decoding; fix for misaligned reads (crash) of the q4_1 / q5_1 KV cache on SM70.
+- The Q4 kernels and fusions in this release were contributed by ATIVX928 ([PR #2](https://github.com/1115714829/llama.cpp-v100/pull/2)).
 
 ---
 
@@ -197,7 +196,7 @@ The draft model is DFlash2 F16 by default; for 2 GPUs with Q4 to run 262144, use
 
 - On 2 GPUs use the Q4 configuration: the Q8_0 target model is about 29 GB and does not fit on two 16 GB GPUs.
 - 3 GPUs with Q8 cannot fit 262144 in VRAM (not even with the Q4_K_M draft); the maximum is 131072.
-- Decode with the Q4 configuration is still slower than with Q8: the Q4_K small-batch kernel covers a single matrix multiplication (M=17-64 included from 1.0.7); gate/up fusion and multi-weight fusion showed no gain and still go through the generic path.
+- Decode with the Q4 configuration is still slower than with Q8; from 1.0.9 Q2_K-Q6_K all use the small-batch kernels with gate/up and multi-weight fusion, about 10% faster Q4 decoding (see "What's new"; the Q4 rows in the table were measured on earlier versions).
 - From 1.0.7 the attention load is balanced on 3 GPUs with Q8 (the table was measured on 1.0.6); from 1.0.8 6-GPU long-context prefill is faster: the 6-GPU Q8 long synthetic input is measured on 1.0.8, the 6-GPU Q4 row on an earlier version.
 
 **Two concurrent requests** (`-np 2`, context per request = context / 2; a single 16K request and two concurrent requests of 16K each, 1024 output tokens):
@@ -440,7 +439,6 @@ Sampling: when `top_k ≤ 64` and only top-k, top-p, min-p, and temperature are 
 
 ## Next steps
 
-- **1.0.9 (in progress)**: faster Q4 configuration. The Q4_K small-batch matrix multiplication kernels are extended to Q2_K, Q3_K, Q5_K and Q6_K, covering every weight type in mixed-quantization models such as UD-Q4_K_M; gate/up fusion and multi-weight fusion are enabled for the Q4 configuration; vectorized dequantization of the q4_0 KV cache; fix for misaligned reads of the q4_1 / q5_1 KV cache on SM70. Contributed by ATIVX928 ([PR #2](https://github.com/1115714829/llama.cpp-v100/pull/2)).
 - **Multi-GPU splitting**: the load is already balanced on 3 GPUs in 1.0.7; with 6 GPUs and long context (above 32768) the 2 idle GPUs now share the attention (1.0.8); on 5 GPUs, and on 6 GPUs with short context, 1-2 GPUs are still idle in each attention layer, to be continued.
 - **Long context**: the prefill K/V copy is now windowed (1.0.7); next are long-context decode (the speculative verification attention kernel) and the speed of appending to the prefill.
 - **Concurrent requests**: the total throughput of concurrent requests is still about the same as processing them one after another. Future work will improve the time per round when multiple requests decode at the same time, and prefix cache reuse between concurrent requests.
@@ -461,7 +459,7 @@ Scan the QR code below to add the author on WeChat and join the discussion group
 - **Claude** (Anthropic, Claude Opus 5.5, via Claude Code): solution design, measurement and analysis, compilation, testing and stress testing on the server, code review, commits and documentation.
 - **DeepSeek V4.1 Flash**: since the evening of 2026-09-26, took on most of the code implementation, as well as source research, design drafts, and diagnostic scripts, about 170 tasks.
 - **Xiaomi MiMo v2.6-pro**: code research and the first implementation at the start of the project (2026-09-26), as well as later in-depth research and solution design, about 33 tasks.
-- **[ATIVX928](https://github.com/ATIVX928)** (external contributor): SM70 attention kernel support for the q4_0 KV cache, 2-GPU internal all-reduce fix ([PR #1](https://github.com/1115714829/llama.cpp-v100/pull/1), merged in 1.0.5).
+- **[ATIVX928](https://github.com/ATIVX928)** (external contributor): SM70 attention kernel support for the q4_0 KV cache, 2-GPU internal all-reduce fix ([PR #1](https://github.com/1115714829/llama.cpp-v100/pull/1), merged in 1.0.5); Q2_K-Q6_K small-batch matrix multiplication, Q4 gate/up and multi-weight fusion, q4_0 KV dequantization vectorization and q4_1 misalignment fix ([PR #2](https://github.com/1115714829/llama.cpp-v100/pull/2), merged in 1.0.9).
 
 Thanks to all the projects and participants above.
 
