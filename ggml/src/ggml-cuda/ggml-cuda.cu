@@ -2986,7 +2986,17 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
-    if (cgraph->uid != 0 &&
+    // a capture made under another assist descriptor writes to that descriptor's buffers, which the
+    // meta backend may already have freed (6-card two-slot servers rebuild them on every switch)
+    const ggml_backend_meta_assist_rank * assist = cuda_ctx->assist;
+    if ((assist != nullptr) != graph->has_assist ||
+            (assist != nullptr && memcmp(assist, &graph->assist, sizeof(*assist)) != 0)) {
+        graph->has_assist = assist != nullptr;
+        graph->assist = assist != nullptr ? *assist : ggml_backend_meta_assist_rank{};
+        res = true;
+    }
+
+    if (!res && cgraph->uid != 0 &&
         cgraph->uid == graph->uid) {
         GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
         GGML_ASSERT((int)graph->node_props.size() == cgraph->n_nodes);

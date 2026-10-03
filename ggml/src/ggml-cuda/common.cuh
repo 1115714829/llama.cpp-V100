@@ -1277,6 +1277,12 @@ struct ggml_cuda_graph {
     bool warmup_complete = false;
     uint64_t uid = 0;
     int64_t last_used_time = 0;
+    // The owner side of a meta assist runs inside the captured FA launch and bakes the buffers of
+    // the mounted descriptor (split point, epochs, partial slot) into the capture. The meta backend
+    // rebuilds those buffers whenever it rebuilds a plan, while the subgraph tensors stay the same,
+    // so the descriptor the capture was made with is part of what has to match for a replay.
+    bool has_assist = false;
+    ggml_backend_meta_assist_rank assist = {};
     struct node_properties {
         ggml_tensor node;
         void *   node_src_data_ptrs[GGML_MAX_SRC];
