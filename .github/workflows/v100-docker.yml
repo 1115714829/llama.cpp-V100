@@ -40,8 +40,11 @@ jobs:
 
       - name: Smoke test (no GPU on the runner)
         run: |
-          docker run --rm --entrypoint /app/llama-server "llama.cpp-v100:server-${{ inputs.version }}-amd64" --version
-          docker run --rm --entrypoint ffmpeg "llama.cpp-v100:server-${{ inputs.version }}-amd64" -version | head -1
+          img="llama.cpp-v100:server-${{ inputs.version }}-amd64"
+          # libcuda.so.1 comes from the host driver at run time; every other library must resolve in the image
+          missing=$(docker run --rm --entrypoint bash "$img" -c 'ldd /app/llama-server /app/libggml-cuda.so | grep "not found" | grep -v "libcuda.so.1" || true')
+          [ -z "$missing" ] || { echo "missing libraries: $missing"; exit 1; }
+          docker run --rm --entrypoint ffmpeg "$img" -version | head -1
 
       - name: Save
         run: |
